@@ -80,7 +80,7 @@ function makeArrowGeometry(): BufferGeometry {
 	return g;
 }
 
-// Surface-adhering ring cursor (interior only): a flat ring laid on the point
+// Surface-adhering ring cursor: a flat ring laid on the point
 // under the native cursor, oriented to the hit surface's normal so it sits flush
 // on floors / walls / objects (and foreshortens with them), plus a direction arrow
 // whenever the click's movement can be drawn on that surface (see above). Drawn

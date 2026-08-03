@@ -26,7 +26,13 @@ export default function PctReadout({
 
 	return (
 		<div
-			className={`pointer-events-none absolute bottom-[clamp(10px,1.6vh,26px)] z-20 flex flex-col gap-0.5 ${
+			// LIFTED CLEAR OF THE VOTE BAR. The bar floats over the scenes now rather
+			// than sitting in a strip below them, and once a vote lands its two halves
+			// open outward into exactly these corners — so a number parked at the
+			// bottom of the panel ended up sliced in half by the card that came to
+			// meet it. This is that bar's own offset plus its height, which is the
+			// least it can be raised and still clear it.
+			className={`pointer-events-none absolute bottom-[clamp(92px,13.5vh,168px)] z-20 flex flex-col gap-0.5 ${
 				align === "left"
 					? "left-[clamp(18px,1.8vw,34px)] items-start"
 					: "right-[clamp(18px,1.8vw,34px)] items-end"
@@ -37,7 +43,11 @@ export default function PctReadout({
 				VOTERS PICKED THIS
 			</span>
 			<span
-				className="font-display font-light leading-[0.86] tracking-[-0.045em] text-foreground tabular-nums"
+				// Archivo at its heaviest. It used to be the display face light, which
+				// now resolves to Anton — one weight, and a condensed poster face that
+				// would set a two-digit number as a monument. The number is big
+				// already; it does not also need to be loud in its letterforms.
+				className="font-sans font-black leading-[0.86] tracking-[-0.045em] text-foreground tabular-nums"
 				style={{
 					fontSize: "var(--arena-pct, 64px)",
 					textShadow: "0 4px 26px rgba(0,0,0,0.55)",

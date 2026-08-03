@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous">
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Instrument+Serif:ital@0;1&family=Archivo:wght@500;700;800;900&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    html,body{margin:0;padding:0;background:#000;}
+    a{color:#ffffff;text-decoration:none;} a:hover{color:#8f8f8f;}
+    @keyframes sb-flip{from{transform:rotateX(62deg) translateY(30px);opacity:0;}to{transform:rotateX(0deg) translateY(0px);opacity:1;}}
+    @keyframes sb-bar{from{transform:scaleX(0);}to{transform:scaleX(1);}}
+    @keyframes sb-blink{0%,100%{opacity:1;}50%{opacity:.1;}}
+  </style>
+</helmet>
+<div data-screen-label="SceneBench Arena" style="position:fixed;inset:0;background:#000;color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none;{{inkVar}}">
+  <div style="position:absolute;top:0;left:0;right:0;z-index:20;display:flex;justify-content:space-between;align-items:flex-start;padding:16px 26px;pointer-events:none">
+    <div style="display:flex;align-items:center;gap:13px;pointer-events:auto">
+      <div style="width:40px;height:40px;border-radius:50%;background:#ffffff"></div>
+      <div style="display:flex;flex-direction:column;justify-content:center;gap:4px">
+        <div style="font-family:'Anton',sans-serif;font-size:20px;font-weight:400;letter-spacing:0.08em;line-height:1">SCENEBENCH</div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:700;letter-spacing:0.18em;color:#6f6f6f;line-height:1">BY STARSHOT LABS</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:22px;margin-left:22px">
+        <a href="#about" style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.18em;color:#7a7a7a;transition:color .15s ease" style-hover="color:var(--ink,#ffffff)">ABOUT</a>
+        <a href="#faq" style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.18em;color:#7a7a7a;transition:color .15s ease" style-hover="color:var(--ink,#ffffff)">FAQ</a>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:28px;pointer-events:auto">
+      <button style="background:none;border:none;color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;font-size:14px;font-weight:900;letter-spacing:0.05em;padding:10px 2px;cursor:pointer;box-shadow:inset 0 -3px 0 rgba(255,255,255,0);transition:box-shadow .18s ease" style-hover="box-shadow:inset 0 -3px 0 var(--ink,#ffffff)">LEADERBOARD</button>
+      <button style="background:var(--ink,#ffffff);color:#000000;border:none;font-family:'Archivo',sans-serif;font-size:14px;font-weight:900;letter-spacing:0.04em;padding:14px 22px;cursor:pointer;transition:transform .16s cubic-bezier(.2,.9,.2,1),background .16s ease" style-hover="transform:translateY(-2px);background:#e5342b;color:#ffffff" style-active="transform:translateY(0px) scale(0.96)">GENERATE YOUR OWN</button>
+    </div>
+  </div>
+  <div style="position:absolute;top:0;left:50%;transform:translateX(-50%);z-index:6;pointer-events:none;width:clamp(380px,calc(230px + 17vw),570px)">
+    <div style="position:relative">
+      <svg viewBox="0 0 680 132" style="display:block;width:100%;height:auto">
+        <path d="M 0 0 L 680 0 A 510 510 0 0 1 0 0 Z" style="fill:var(--ink,#ffffff)"></path>
+        <text x="340" y="28" fill="#000000" style="font-family:'IBM Plex Mono',monospace;font-size:13.5px;letter-spacing:0.24em;text-anchor:middle">WHO BUILT IT BETTER?</text>
+      </svg>
+      {{promptArc}}
+    </div>
+  </div>
+  <div style="position:absolute;top:110px;bottom:0;left:0;right:0;display:flex;box-sizing:border-box;{{scenesDyn}}">
+    <div style="position:relative;flex:1;overflow:hidden">
+      <div ref="{{refA}}" style="position:absolute;inset:0;transition:opacity .26s ease,transform .26s ease;{{sceneDyn}}"></div>
+      <div style="position:absolute;bottom:10px;left:34px;font-size:clamp(80px,8.5vw,140px);font-weight:900;line-height:0.8;letter-spacing:-0.04em;color:var(--ink,#ffffff);pointer-events:none;z-index:8">A</div>
+      <sc-if value="{{isReveal}}" hint-placeholder-val="{{false}}">
+        <div style="position:absolute;left:0;right:0;bottom:100px;display:flex;flex-direction:column;align-items:center;pointer-events:none;perspective:800px;z-index:12">
+          <div style="transform-origin:50% 100%;animation:sb-flip .5s cubic-bezier(.16,1,.3,1) both;display:flex;flex-direction:column;align-items:center">
+            <div style="font-size:116px;font-weight:900;line-height:0.85;letter-spacing:-0.03em;font-variant-numeric:tabular-nums;color:{{colA}}">{{dispA}}<span style="font-size:0.38em;font-weight:800">%</span></div>
+            <div style="margin-top:10px;font-size:22px;font-weight:800;letter-spacing:0.04em;text-transform:uppercase;color:{{colA}}">{{nameA}}</div>
+            <sc-if value="{{crowdA}}" hint-placeholder-val="{{false}}">
+              <div style="background:var(--ink,#ffffff);color:#000000;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.22em;padding:5px 10px;margin-top:14px">CROWD PICK</div>
+            </sc-if>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+    <div style="position:relative;flex:1;overflow:hidden">
+      <div ref="{{refB}}" style="position:absolute;inset:0;transition:opacity .26s ease,transform .26s ease;{{sceneDyn}}"></div>
+      <div style="position:absolute;bottom:10px;right:34px;font-size:clamp(80px,8.5vw,140px);font-weight:900;line-height:0.8;letter-spacing:-0.04em;color:var(--ink,#ffffff);pointer-events:none;z-index:8">B</div>
+      <sc-if value="{{isReveal}}" hint-placeholder-val="{{false}}">
+        <div style="position:absolute;left:0;right:0;bottom:100px;display:flex;flex-direction:column;align-items:center;pointer-events:none;perspective:800px;z-index:12">
+          <div style="transform-origin:50% 100%;animation:sb-flip .5s cubic-bezier(.16,1,.3,1) .07s both;display:flex;flex-direction:column;align-items:center">
+            <div style="font-size:116px;font-weight:900;line-height:0.85;letter-spacing:-0.03em;font-variant-numeric:tabular-nums;color:{{colB}}">{{dispB}}<span style="font-size:0.38em;font-weight:800">%</span></div>
+            <div style="margin-top:10px;font-size:22px;font-weight:800;letter-spacing:0.04em;text-transform:uppercase;color:{{colB}}">{{nameB}}</div>
+            <sc-if value="{{crowdB}}" hint-placeholder-val="{{false}}">
+              <div style="background:var(--ink,#ffffff);color:#000000;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.22em;padding:5px 10px;margin-top:14px">CROWD PICK</div>
+            </sc-if>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+  </div>
+  <sc-if value="{{centerLine}}" hint-placeholder-val="{{false}}">
+    <div style="position:absolute;left:50%;top:0;bottom:0;width:4px;transform:translateX(-50%);background:var(--ink,#ffffff);z-index:5;pointer-events:none"></div>
+  </sc-if>
+  <div style="position:absolute;bottom:26px;left:50%;z-index:16;transform:translateX(-50%)">
+    <div style="display:flex;align-items:stretch;transition:opacity .22s ease,transform .28s cubic-bezier(.16,1,.3,1);{{voteDyn}}">
+      <button onClick="{{voteA}}" style="background:var(--ink,#ffffff);color:#000000;border:none;font-family:'Archivo',sans-serif;font-size:19px;font-weight:900;letter-spacing:0.06em;padding:18px 42px;cursor:pointer;transition:letter-spacing .15s cubic-bezier(.2,.9,.2,1)" style-hover="letter-spacing:0.12em" style-active="letter-spacing:0.02em">A WINS</button>
+      <button onClick="{{voteTie}}" style="background:#000000;border:none;color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;font-size:19px;font-weight:900;letter-spacing:0.06em;padding:18px 24px;cursor:pointer;transition:letter-spacing .15s cubic-bezier(.2,.9,.2,1)" style-hover="letter-spacing:0.12em" style-active="letter-spacing:0.02em">TIE</button>
+      <button onClick="{{voteB}}" style="background:var(--ink,#ffffff);color:#000000;border:none;font-family:'Archivo',sans-serif;font-size:19px;font-weight:900;letter-spacing:0.06em;padding:18px 42px;cursor:pointer;transition:letter-spacing .15s cubic-bezier(.2,.9,.2,1)" style-hover="letter-spacing:0.12em" style-active="letter-spacing:0.02em">B WINS</button>
+    </div>
+  </div>
+  <sc-if value="{{isReveal}}" hint-placeholder-val="{{false}}">
+    <div style="position:absolute;bottom:40px;left:50%;z-index:16">
+      <div style="transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:10px">
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.26em;color:#5a5a5a">PUBLIC VOTE</div>
+        <div style="width:190px;height:2px;background:#1e1e1e"><div style="height:100%;background:var(--ink,#ffffff);transform-origin:0 50%;animation:sb-bar {{holdS}} linear both"></div></div>
+      </div>
+    </div>
+  </sc-if>
+  <sc-if value="{{isBoot}}" hint-placeholder-val="{{true}}">
+    <div style="position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;gap:12px;pointer-events:none">
+      <div style="width:8px;height:8px;background:var(--ink,#ffffff);animation:sb-blink 1s infinite"></div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.3em;color:#8a8a8a">COMPILING SCENES</div>
+    </div>
+  </sc-if>
+  <sc-if value="{{isError}}" hint-placeholder-val="{{false}}">
+    <div style="position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;pointer-events:none">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.3em;color:#8a8a8a">WEBGL UNAVAILABLE — SCENES CANNOT RENDER</div>
+    </div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;whiteTone&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#f2f1ed&quot;,&quot;options&quot;:[&quot;#ffffff&quot;,&quot;#f2f1ed&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;sceneLayout&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;full-fade&quot;,&quot;options&quot;:[&quot;current&quot;,&quot;divider&quot;,&quot;full&quot;,&quot;full-fade&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;centerLine&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;orbitSpeed&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:0.14,&quot;min&quot;:0,&quot;max&quot;:0.6,&quot;step&quot;:0.02,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Motion&quot;},&quot;revealHoldMs&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:2600,&quot;min&quot;:1200,&quot;max&quot;:6000,&quot;step&quot;:100,&quot;unit&quot;:&quot;ms&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Motion&quot;},&quot;shadows&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Quality&quot;}}">
+class Component extends DCLogic {
+  state = { phase: 'boot', idx: 0, dispA: 0, dispB: 0 };
+  MODELS = ['Claude Opus 4.5', 'GPT-5.2', 'Gemini 3 Pro', 'Grok 4.1', 'Llama 4', 'DeepSeek V4'];
+  PAIRS = [[0,1],[2,3],[4,5],[0,2],[3,1],[5,0],[2,4],[1,5],[4,0],[3,2],[5,4],[1,3]];
+  PROMPTS = [
+    ['A cozy alpine village at dusk', 0],
+    ['A neon-drenched cyber alley', 1],
+    ['A floating island temple', 2],
+    ['A modern desert house', 3],
+    ['A candy-bright platform level', 4],
+  ];
+  refA = React.createRef();
+  refB = React.createRef();
+
+  rng32(a) { return function() { a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+  num(k, d) { const v = parseFloat(this.props[k]); return isNaN(v) ? d : v; }
+
+  battle(i) {
+    const rng = this.rng32(i * 7349 + 29);
+    let [a, b] = this.PAIRS[i % this.PAIRS.length];
+    if (rng() < .5) [a, b] = [b, a];
+    const win = 54 + Math.floor(rng() * 33);
+    const aWins = rng() < .5;
+    const p = this.PROMPTS[i % this.PROMPTS.length];
+    return { prompt: p[0], recipe: p[1], mA: this.MODELS[a], mB: this.MODELS[b],
+      pctA: aWins ? win : 100 - win, pctB: aWins ? 100 - win : win,
+      seedA: i * 211 + 17, seedB: i * 977 + 71 };
+  }
+
+  async componentDidMount() {
+    try {
+      const S = this.S = await import('./scenes.js');
+      const sp = this.num('orbitSpeed', .14), sh = this.props.shadows ?? true;
+      this.vpA = new S.Viewport(this.refA.current, { orbitSpeed: sp, shadows: sh, az0: -0.7 });
+      this.vpB = new S.Viewport(this.refB.current, { orbitSpeed: sp * 1.12, shadows: sh, az0: 0.55 });
+      this._stop = S.startLoop([this.vpA, this.vpB]);
+      this.loadBattle(0);
+      this.setState({ phase: 'vote' });
+    } catch (e) { console.error(e); this.setState({ phase: 'error' }); }
+  }
+  componentDidUpdate() {
+    if (this.vpA && this.refA.current && !this.refA.current.firstChild) {
+      this._stop && this._stop();
+      this.vpA.dispose(); this.vpB.dispose();
+      const S = this.S, sp = this.num('orbitSpeed', .14), sh = this.props.shadows ?? true;
+      this.vpA = new S.Viewport(this.refA.current, { orbitSpeed: sp, shadows: sh, az0: -0.7 });
+      this.vpB = new S.Viewport(this.refB.current, { orbitSpeed: sp * 1.12, shadows: sh, az0: 0.55 });
+      this._stop = S.startLoop([this.vpA, this.vpB]);
+      this.loadBattle(this.state.idx);
+    }
+  }
+  componentWillUnmount() {
+    this._stop && this._stop(); clearTimeout(this._adv); cancelAnimationFrame(this._cnt);
+    this.vpA && this.vpA.dispose(); this.vpB && this.vpB.dispose();
+  }
+
+  loadBattle(i) {
+    const b = this.cur = this.battle(i);
+    this.vpA.load(b.recipe, b.seedA, 0);
+    this.vpB.load(b.recipe, b.seedB, 1);
+  }
+  vote = () => {
+    if (this.state.phase !== 'vote') return;
+    const b = this.cur;
+    this.vpA.swing(); this.vpB.swing();
+    (b.pctA >= b.pctB ? this.vpA : this.vpB).pulse();
+    this.setState({ phase: 'reveal', dispA: 0, dispB: 0 });
+    this.count();
+    this._adv = setTimeout(() => this.advance(), this.num('revealHoldMs', 2600));
+  };
+  count() {
+    cancelAnimationFrame(this._cnt);
+    const b = this.cur, t0 = performance.now();
+    const tick = (t) => {
+      const p = Math.min(1, (t - t0) / 700), e = 1 - Math.pow(1 - p, 3);
+      this.setState({ dispA: Math.round(b.pctA * e), dispB: Math.round(b.pctB * e) });
+      if (p < 1) this._cnt = requestAnimationFrame(tick);
+    };
+    this._cnt = requestAnimationFrame(tick);
+  }
+  advance() {
+    this.setState({ phase: 'switch' });
+    setTimeout(() => {
+      const i = this.state.idx + 1;
+      this.loadBattle(i);
+      this.setState({ idx: i, phase: 'vote' });
+    }, 280);
+  }
+
+  renderVals() {
+    const st = this.state, b = this.cur ?? this.battle(0);
+    if (this.vpA) {
+      const sp = this.num('orbitSpeed', .14), sh = this.props.shadows ?? true;
+      this.vpA.autoSpeed = sp; this.vpB.autoSpeed = sp * 1.12;
+      this.vpA.setShadows(sh); this.vpB.setShadows(sh);
+    }
+    const reveal = st.phase === 'reveal', aWin = b.pctA >= b.pctB, sw = st.phase === 'switch';
+    const ink = this.props.whiteTone || '#ffffff';
+    const fs = Math.min(33, Math.floor(660 / (b.prompt.length * .56)));
+    const promptArc = React.createElement('svg',
+      { viewBox: '0 0 680 132', style: { position: 'absolute', inset: 0, width: '100%', height: '100%', transition: 'opacity .22s ease', opacity: sw ? 0 : 1 } },
+      React.createElement('path', { id: 'sbArc', d: 'M 55 6 A 480 480 0 0 0 625 6', fill: 'none' }),
+      React.createElement('text', { fill: '#000', style: { fontFamily: "'Instrument Serif',serif", fontStyle: 'italic', fontWeight: 400, fontSize: (fs + 4) + 'px', letterSpacing: '.01em' } },
+        React.createElement('textPath', { href: '#sbArc', startOffset: '50%', textAnchor: 'middle' }, b.prompt)));
+    return {
+      promptArc,
+      refA: this.refA, refB: this.refB,
+      voteA: this.vote, voteB: this.vote, voteTie: this.vote,
+      isBoot: st.phase === 'boot', isError: st.phase === 'error', isReveal: reveal,
+      nameA: b.mA, nameB: b.mB, dispA: st.dispA, dispB: st.dispB,
+      colA: aWin ? ink : '#4a4a4a', colB: aWin ? '#4a4a4a' : ink,
+      inkVar: '--ink:' + ink,
+      crowdA: reveal && aWin, crowdB: reveal && !aWin,
+      holdS: (this.num('revealHoldMs', 2600) / 1000) + 's',
+      centerLine: !!this.props.centerLine,
+      scenesDyn: ({ divider: 'top:97px;border-top:1px solid #2a2a2a', full: 'top:0px',
+        'full-fade': 'top:0px;-webkit-mask-image:linear-gradient(to bottom,transparent 0px,#000000 160px);mask-image:linear-gradient(to bottom,transparent 0px,#000000 160px)' })[this.props.sceneLayout] || 'top:110px',
+      voteDyn: st.phase === 'vote' ? 'opacity:1;transform:translateY(0px);pointer-events:auto' : 'opacity:0;transform:translateY(30px);pointer-events:none',
+      sceneDyn: sw ? 'opacity:0;transform:scale(0.985)' : 'opacity:1;transform:scale(1)',
+    };
+  }
+}
+</script>
+</body>
+</html>

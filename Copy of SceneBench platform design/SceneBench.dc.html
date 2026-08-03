@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Space+Grotesk:wght@400;500;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  a { color: #f2f1ed; } a:hover { color: #fff; }
+  ::selection { background: #f2f1ed; color: #000; }
+  input::placeholder { color: #7d7d7d; font-style: italic; }
+  ::-webkit-scrollbar { width: 8px; } ::-webkit-scrollbar-thumb { background: #222; }
+  @keyframes sbPulse { 0%, 100% { opacity: .3; } 50% { opacity: 1; } }
+  @keyframes sbUp { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+  @keyframes sbSpin { to { transform: rotate(360deg); } }
+  @keyframes sbBob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1.6px); } }
+  @keyframes sbBlink { 0%, 52% { opacity: 1; } 53%, 100% { opacity: 0; } }
+  @keyframes sbGrain { 0% { background-position: 0 0; } 20% { background-position: -64px 44px; } 40% { background-position: 42px -54px; } 60% { background-position: -28px -70px; } 80% { background-position: 72px 24px; } 100% { background-position: 0 0; } }
+</style>
+</helmet>
+<div data-screen-label="Arena" style="position:fixed;inset:0;background:#000;color:#f2f1ed;font-family:'Space Grotesk',sans-serif;overflow:hidden">
+
+  <div ref="{{ wrapA }}" style="position:absolute;left:0;top:0;bottom:0;width:{{ paneAW }};transition:width .55s cubic-bezier(.7,0,.2,1);overflow:hidden">
+    <canvas ref="{{ cvA }}" style="position:absolute;inset:0;width:100%;height:100%;display:block"></canvas>
+  </div>
+  <div ref="{{ wrapB }}" style="position:absolute;right:0;top:0;bottom:0;width:{{ paneBW }};opacity:{{ paneBOp }};transition:width .55s cubic-bezier(.7,0,.2,1),opacity .4s ease;overflow:hidden">
+    <canvas ref="{{ cvB }}" style="position:absolute;inset:0;width:100%;height:100%;display:block"></canvas>
+  </div>
+
+  <sc-if value="{{ showStatus }}" hint-placeholder-val="{{ false }}">
+    <div style="position:absolute;left:50%;top:52%;transform:translate(-50%,-50%);z-index:12;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.3em;color:#575757;animation:sbPulse 1.7s infinite;pointer-events:none;white-space:nowrap">{{ statusText }}</div>
+  </sc-if>
+
+  <header style="position:absolute;top:0;left:0;right:0;z-index:30;display:flex;align-items:flex-start;gap:20px;padding:0 26px;pointer-events:none">
+    <div style="flex:1 1 0;min-width:max-content;display:flex;align-items:center;gap:13px;padding-top:18px;pointer-events:auto;opacity:{{ hOp }};transform:translateY({{ hTy }});transition:opacity .45s ease .05s,transform .5s cubic-bezier(.28,1.4,.42,1) .05s">
+      <div style="position:relative;width:38px;height:38px">
+        <div style="width:38px;height:38px;border-radius:50%;background:#f2f1ed"></div>
+        <div style="position:absolute;inset:-7px;animation:sbSpin 7s linear infinite">
+          <div style="position:absolute;left:50%;top:0;width:4px;height:4px;margin-left:-2px;border-radius:50%;background:#f2f1ed"></div>
+        </div>
+      </div>
+      <div>
+        <div style="font-family:'Anton',sans-serif;font-size:20px;font-weight:400;letter-spacing:.09em;line-height:1;text-transform:uppercase">SceneBench</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.24em;color:#8a8a8a;margin-top:5px">BY STARSHOT LABS</div>
+      </div>
+    </div>
+    <div ref="{{ moonRef }}" style="flex:0 1 520px;min-width:260px;pointer-events:none;position:relative;container-type:inline-size;transform:translateY({{ moonTy }});transition:transform .6s cubic-bezier(.3,1.3,.45,1)">
+      <svg viewBox="0 0 760 150" style="display:block;width:100%">
+        <path d="M0,0 L760,0 A556.3,556.3 0 0 1 0,0 Z" fill="#f2f1ed"></path>
+      </svg>
+      <div style="position:absolute;left:50%;top:8%;transform:translateX(-50%);font-family:'JetBrains Mono',monospace;font-size:1.71cqw;letter-spacing:.32em;color:#191919;white-space:nowrap">{{ moonSub }}<span style="display:inline-block;margin-left:2px;animation:sbBlink 1.1s steps(1) infinite">▍</span></div>
+      <div style="position:absolute;inset:0;font-family:'Instrument Serif',serif;font-style:italic;font-size:{{ promptCqw }}cqw;color:#0e0e0e">
+        <sc-for list="{{ promptChars }}" as="ch" hint-placeholder-count="0">
+          <span style="position:absolute;left:{{ ch.x }}%;top:{{ ch.y }}%;transform:{{ ch.tf }};opacity:{{ pcOp }};transition:transform .34s cubic-bezier(.3,1.6,.45,1) {{ ch.dl }},opacity .2s ease {{ ch.dl }};line-height:1"><span style="display:inline-block;animation:sbBob 3.4s ease-in-out infinite;animation-delay:{{ ch.wd }}">{{ ch.c }}</span></span>
+        </sc-for>
+      </div>
+    </div>
+    <div style="flex:1 1 0;min-width:max-content;display:flex;flex-direction:column;align-items:flex-end;gap:9px;padding-top:18px;pointer-events:auto;opacity:{{ hOp }};transform:translateY({{ hTy }});transition:opacity .45s ease .16s,transform .5s cubic-bezier(.28,1.4,.42,1) .16s">
+      <div style="display:flex;align-items:center;gap:14px">
+        <button onClick="{{ openLb }}" style="background:none;border:0;cursor:pointer;font-family:inherit;color:#f2f1ed;font-size:15px;font-weight:700;letter-spacing:.12em;padding:12px 16px;transition:background .12s,color .12s" style-hover="background:#f2f1ed;color:#000" style-active="transform:scale(.96)">LEADERBOARD</button>
+        <button onClick="{{ openGen }}" style="background:#f2f1ed;border:0;cursor:pointer;font-family:inherit;color:#000;font-size:15px;font-weight:700;letter-spacing:.12em;padding:13px 22px;transition:background .12s,transform .08s" style-hover="background:#fff" style-active="transform:scale(.96)">GENERATE YOUR OWN</button>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button onClick="{{ openAbout }}" style="background:none;border:0;cursor:pointer;font-family:inherit;color:#7d7d7d;font-size:12.5px;letter-spacing:.04em;padding:4px 8px;transition:color .12s" style-hover="color:#fff">About</button>
+        <button onClick="{{ openFaq }}" style="background:none;border:0;cursor:pointer;font-family:inherit;color:#7d7d7d;font-size:12.5px;letter-spacing:.04em;padding:4px 8px;transition:color .12s" style-hover="color:#fff">FAQ</button>
+      </div>
+    </div>
+  </header>
+
+  <div style="position:absolute;left:0;right:0;bottom:0;height:180px;z-index:20;pointer-events:none">
+    <sc-if value="{{ isVote }}" hint-placeholder-val="{{ true }}">
+      <div style="position:absolute;left:50%;bottom:64px;transform:translate(-50%,{{ barTy }});opacity:{{ barOp }};transition:transform .5s cubic-bezier(.28,1.35,.4,1) {{ barDl }},opacity .35s ease {{ barDl }};display:flex;gap:2px;pointer-events:{{ barPE }}">
+        <button onClick="{{ voteA }}" onMouseEnter="{{ prevA }}" onMouseLeave="{{ prevOff }}" style="display:flex;align-items:center;gap:12px;background:{{ sA.bg }};border:0;cursor:pointer;font-family:inherit;color:{{ sA.col }};padding:17px 30px;opacity:{{ sA.op }};transform:{{ sA.tr }};transition:{{ sA.ts }}" style-hover="background:#000;color:#f2f1ed;transform:scale(1.06) translateY(-3px)" style-active="transform:scale(.95)">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a8a8a">←</span>
+          <span style="font-size:16px;font-weight:700;letter-spacing:.12em">SCENE A</span>
+        </button>
+        <button onClick="{{ voteTie }}" onMouseEnter="{{ prevT }}" onMouseLeave="{{ prevOff }}" style="display:flex;align-items:center;background:{{ sT.bg }};border:0;cursor:pointer;font-family:inherit;color:{{ sT.col }};padding:17px 22px;opacity:{{ sT.op }};transform:{{ sT.tr }};transition:{{ sT.ts }}" style-hover="background:#000;color:#f2f1ed;transform:scale(1.06) translateY(-3px)" style-active="transform:scale(.95)">
+          <span style="font-size:12px;font-weight:700;letter-spacing:.14em">TIE</span>
+        </button>
+        <button onClick="{{ voteB }}" onMouseEnter="{{ prevB }}" onMouseLeave="{{ prevOff }}" style="display:flex;align-items:center;gap:12px;background:{{ sB.bg }};border:0;cursor:pointer;font-family:inherit;color:{{ sB.col }};padding:17px 30px;opacity:{{ sB.op }};transform:{{ sB.tr }};transition:{{ sB.ts }}" style-hover="background:#000;color:#f2f1ed;transform:scale(1.06) translateY(-3px)" style-active="transform:scale(.95)">
+          <span style="font-size:16px;font-weight:700;letter-spacing:.12em">SCENE B</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a8a8a">→</span>
+        </button>
+      </div>
+    </sc-if>
+    <sc-if value="{{ isReveal }}" hint-placeholder-val="{{ false }}">
+      <div>
+        <div style="position:absolute;left:25%;bottom:34px;transform:translateX(-50%) {{ scA }};opacity:{{ stA }};filter:{{ blA }};transition:opacity .22s ease,transform .48s cubic-bezier(.26,1.5,.4,1),filter .3s ease;text-align:center">
+          <div style="opacity:{{ aOp }};transition:opacity .5s ease .55s">
+            <div style="font-size:29px;font-weight:700;letter-spacing:-.01em;white-space:nowrap">{{ nameA }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:.14em;color:#9a9a9a;margin-top:9px;opacity:{{ mOp }};transform:translateY({{ mTy }});transition:opacity .3s ease .14s,transform .42s cubic-bezier(.26,1.5,.4,1) .14s">{{ orgA }} — {{ pA }}%</div>
+            <div style="display:flex;gap:10px;justify-content:center;align-items:center;margin-top:11px;height:20px;opacity:{{ mOp }};transform:translateY({{ mTy }});transition:opacity .3s ease .26s,transform .42s cubic-bezier(.26,1.5,.4,1) .26s">
+              <sc-if value="{{ aComm }}" hint-placeholder-val="{{ false }}"><span style="background:#f2f1ed;color:#000;font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.18em;padding:4px 9px">COMMUNITY PICK</span></sc-if>
+              <sc-if value="{{ aYou }}" hint-placeholder-val="{{ false }}"><span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.18em;color:#7d7d7d">YOUR PICK</span></sc-if>
+            </div>
+          </div>
+        </div>
+        <div style="position:absolute;left:75%;bottom:34px;transform:translateX(-50%) {{ scB }};opacity:{{ stB }};filter:{{ blB }};transition:opacity .22s ease .08s,transform .48s cubic-bezier(.26,1.5,.4,1) .08s,filter .3s ease .08s;text-align:center">
+          <div style="opacity:{{ bOp }};transition:opacity .5s ease .55s">
+            <div style="font-size:29px;font-weight:700;letter-spacing:-.01em;white-space:nowrap">{{ nameB }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:.14em;color:#9a9a9a;margin-top:9px;opacity:{{ mOp }};transform:translateY({{ mTy }});transition:opacity .3s ease .22s,transform .42s cubic-bezier(.26,1.5,.4,1) .22s">{{ orgB }} — {{ pB }}%</div>
+            <div style="display:flex;gap:10px;justify-content:center;align-items:center;margin-top:11px;height:20px;opacity:{{ mOp }};transform:translateY({{ mTy }});transition:opacity .3s ease .34s,transform .42s cubic-bezier(.26,1.5,.4,1) .34s">
+              <sc-if value="{{ bComm }}" hint-placeholder-val="{{ false }}"><span style="background:#f2f1ed;color:#000;font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.18em;padding:4px 9px">COMMUNITY PICK</span></sc-if>
+              <sc-if value="{{ bYou }}" hint-placeholder-val="{{ false }}"><span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.18em;color:#7d7d7d">YOUR PICK</span></sc-if>
+            </div>
+          </div>
+        </div>
+        <div style="position:absolute;left:50%;bottom:52px;transform:translateX(-50%) translateY({{ cTy }});text-align:center;opacity:{{ opC }};transition:opacity .35s ease .3s,transform .45s cubic-bezier(.26,1.5,.4,1) .3s">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#5c5c5c">{{ tieLine }}</div>
+          <div style="width:150px;height:2px;background:rgba(255,255,255,.13);margin:14px auto 0">
+            <div style="width:100%;height:100%;background:#f2f1ed;transform-origin:left;transform:scaleX({{ prog }});transition:transform .12s linear"></div>
+          </div>
+        </div>
+      </div>
+    </sc-if>
+    <sc-if value="{{ isGen }}" hint-placeholder-val="{{ false }}">
+      <button onClick="{{ backToArena }}" style="position:absolute;left:50%;bottom:76px;transform:translateX(-50%);background:none;border:0;cursor:pointer;font-family:'JetBrains Mono',monospace;color:#8a8a8a;font-size:11px;letter-spacing:.18em;padding:10px 18px;pointer-events:auto;white-space:nowrap;transition:background .12s,color .12s" style-hover="background:#f2f1ed;color:#000" style-active="transform:translateX(-50%) scale(.96)">← BACK TO THE ARENA</button>
+    </sc-if>
+    <sc-if value="{{ compOn }}" hint-placeholder-val="{{ true }}">
+      <div style="position:absolute;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;pointer-events:none">
+        <div style="display:flex;gap:20px;align-items:baseline;opacity:{{ sugOp }};transform:translateY({{ sugTy }});transition:opacity .35s ease .1s,transform .45s cubic-bezier(.28,1.4,.42,1) .1s;pointer-events:{{ focPE }}">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.22em;color:#4a4a4a">TRY</span>
+          <sc-for list="{{ sugs }}" as="s" hint-placeholder-count="3">
+            <button onClick="{{ s.go }}" tabIndex="-1" style="background:none;border:0;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.06em;color:#777;padding:4px 2px;transition:color .12s,transform .25s cubic-bezier(.3,1.6,.4,1)" style-hover="color:#fff;transform:translateY(-2px)">{{ s.label }}</button>
+          </sc-for>
+        </div>
+        <div style="position:relative;display:flex;align-items:center;margin-top:14px;padding-bottom:{{ compPad }}px;transition:padding .5s cubic-bezier(.28,1.35,.42,1),opacity .3s ease,transform .45s cubic-bezier(.28,1.4,.42,1);pointer-events:{{ compPE }};opacity:{{ compOp }};transform:translateY({{ compTy }})">
+          <input ref="{{ genInput }}" value="{{ genText }}" onChange="{{ genChange }}" onKeyDown="{{ genKeyDown }}" onFocus="{{ compFoc }}" onBlur="{{ compBlur }}" placeholder="{{ compPh }}" spellcheck="false" style="display:block;width:{{ compW }};background:transparent;border:0;border-bottom:1.5px solid {{ compLine }};outline:none;font-family:'Instrument Serif',serif;font-style:italic;font-size:{{ compFs }}px;text-align:center;color:#f2f1ed;padding:4px 10px 9px;caret-color:#f2f1ed;transition:width .5s cubic-bezier(.28,1.35,.42,1),font-size .5s cubic-bezier(.28,1.35,.42,1),border-color .3s ease">
+          <button onClick="{{ genGo }}" tabIndex="-1" style="position:absolute;left:100%;top:50%;margin:-8px 0 0 16px;transform:translateY(-50%) scale({{ genBtnSc }});background:#f2f1ed;border:0;cursor:{{ genCur }};font-family:inherit;color:#000;font-size:13px;font-weight:700;letter-spacing:.12em;padding:13px 22px;opacity:{{ genBtnOp }};transition:background .12s,opacity .3s ease,transform .4s cubic-bezier(.3,1.5,.4,1);pointer-events:{{ focPE }}" style-hover="background:#fff" style-active="transform:translateY(-50%) scale(.94)">GENERATE</button>
+        </div>
+      </div>
+    </sc-if>
+  </div>
+
+  <sc-if value="{{ lbOpen }}" hint-placeholder-val="{{ false }}">
+    <div data-screen-label="Leaderboard" style="position:fixed;inset:0;background:#000;z-index:40;overflow-y:auto">
+      <button onClick="{{ close }}" style="position:fixed;top:20px;right:28px;background:none;border:0;cursor:pointer;font-family:inherit;color:#8a8a8a;font-size:20px;padding:10px 16px;transition:background .12s,color .12s,transform .28s cubic-bezier(.3,1.5,.4,1);z-index:41" style-hover="background:#f2f1ed;color:#000;transform:rotate(90deg)">✕</button>
+      <div style="max-width:860px;margin:0 auto;padding:11vh 40px 70px">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.28em;color:#666;animation:sbUp .4s cubic-bezier(.25,1.35,.4,1) both">BLIND PAIRWISE ELO — ALL PROMPTS</div>
+        <h1 style="font-size:46px;font-weight:700;letter-spacing:-.02em;margin:14px 0 44px;animation:sbUp .45s cubic-bezier(.25,1.35,.4,1) .05s both">Leaderboard</h1>
+        <div style="display:flex;gap:18px;font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#4a4a4a;padding-bottom:14px;animation:sbUp .45s cubic-bezier(.25,1.35,.4,1) .1s both">
+          <span style="width:34px">#</span><span>MODEL</span><span style="flex:1"></span><span style="width:84px;text-align:right">WIN RATE</span><span style="width:80px;text-align:right">ELO</span>
+        </div>
+        <sc-for list="{{ lbRows }}" as="row" hint-placeholder-count="8">
+          <div style="display:flex;align-items:baseline;gap:18px;padding:11px 0;opacity:{{ row.op }};transition:transform .3s cubic-bezier(.3,1.6,.4,1);animation:sbUp .5s cubic-bezier(.25,1.35,.4,1) both;animation-delay:{{ row.d }}" style-hover="transform:translateX(10px)">
+            <span style="width:34px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#555">{{ row.rank }}</span>
+            <span style="font-weight:700;line-height:1;font-size:{{ row.size }}px;letter-spacing:-.01em">{{ row.name }}</span>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.12em;color:#6a6a6a">{{ row.org }}</span>
+            <span style="flex:1"></span>
+            <span style="width:84px;text-align:right;font-family:'JetBrains Mono',monospace;font-size:12px;color:#7d7d7d">{{ row.wr }}</span>
+            <span style="width:80px;text-align:right;font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:600;color:#f2f1ed">{{ row.elo }}</span>
+          </div>
+        </sc-for>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.18em;color:#4a4a4a;margin-top:52px;animation:sbUp .5s cubic-bezier(.25,1.35,.4,1) .55s both">TIES COUNT AS HALF A WIN · RATINGS UPDATE HOURLY</div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ aboutOpen }}" hint-placeholder-val="{{ false }}">
+    <div data-screen-label="About" style="position:fixed;inset:0;background:#000;z-index:40;overflow-y:auto">
+      <button onClick="{{ close }}" style="position:fixed;top:20px;right:28px;background:none;border:0;cursor:pointer;font-family:inherit;color:#8a8a8a;font-size:20px;padding:10px 16px;transition:background .12s,color .12s,transform .28s cubic-bezier(.3,1.5,.4,1);z-index:41" style-hover="background:#f2f1ed;color:#000;transform:rotate(90deg)">✕</button>
+      <div style="max-width:760px;margin:0 auto;padding:14vh 40px 70px">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.28em;color:#666;animation:sbUp .4s cubic-bezier(.25,1.35,.4,1) both">STARSHOT LABS</div>
+        <h1 style="font-size:46px;font-weight:700;letter-spacing:-.02em;margin:14px 0 30px;animation:sbUp .45s cubic-bezier(.25,1.35,.4,1) .05s both">Every object you see is real.</h1>
+        <p style="font-size:17px;line-height:1.7;color:#b3b3b3;max-width:620px;margin:0 0 22px;animation:sbUp .5s cubic-bezier(.25,1.35,.4,1) .12s both">SceneBench is a public evaluation from Starshot Labs, the research lab behind <span style="color:#f2f1ed">multi-object scene diffusion</span> — a generative model that diffuses an entire 3D region into discrete, game-ready objects instead of a single fused mesh.</p>
+        <p style="font-size:17px;line-height:1.7;color:#b3b3b3;max-width:620px;margin:0;animation:sbUp .5s cubic-bezier(.25,1.35,.4,1) .19s both">A language model reads the prompt, plans the scene, and orchestrates many diffusion canvases into one cohesive world. SceneBench puts those plans head-to-head: two models, one prompt, blind. Your votes rank the frontier.</p>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.18em;color:#4a4a4a;margin-top:56px;animation:sbUp .5s cubic-bezier(.25,1.35,.4,1) .3s both">STARSHOT LABS — 2026</div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ faqOpen }}" hint-placeholder-val="{{ false }}">
+    <div data-screen-label="FAQ" style="position:fixed;inset:0;background:#000;z-index:40;overflow-y:auto">
+      <button onClick="{{ close }}" style="position:fixed;top:20px;right:28px;background:none;border:0;cursor:pointer;font-family:inherit;color:#8a8a8a;font-size:20px;padding:10px 16px;transition:background .12s,color .12s,transform .28s cubic-bezier(.3,1.5,.4,1);z-index:41" style-hover="background:#f2f1ed;color:#000;transform:rotate(90deg)">✕</button>
+      <div style="max-width:760px;margin:0 auto;padding:12vh 40px 70px">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.28em;color:#666;animation:sbUp .4s cubic-bezier(.25,1.35,.4,1) both">SCENEBENCH</div>
+        <h1 style="font-size:46px;font-weight:700;letter-spacing:-.02em;margin:14px 0 46px;animation:sbUp .45s cubic-bezier(.25,1.35,.4,1) .05s both">FAQ</h1>
+        <sc-for list="{{ faqItems }}" as="f" hint-placeholder-count="4">
+          <div style="margin-bottom:36px;animation:sbUp .5s cubic-bezier(.25,1.35,.4,1) both;animation-delay:{{ f.d }}">
+            <div style="font-size:19px;font-weight:700;margin-bottom:9px">{{ f.q }}</div>
+            <div style="font-size:15.5px;line-height:1.65;color:#a3a3a3;max-width:620px">{{ f.a }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ grainOn }}" hint-placeholder-val="{{ true }}">
+    <div style="position:fixed;inset:0;z-index:50;pointer-events:none;opacity:.05;background-image:url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23n)'/%3E%3C/svg%3E&quot;);background-size:240px 240px;animation:sbGrain .5s steps(1) infinite"></div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;orbitSpeed&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:0.05,&quot;min&quot;:0,&quot;max&quot;:0.15,&quot;step&quot;:0.005,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Arena&quot;},&quot;revealHoldSec&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:2.8,&quot;min&quot;:1,&quot;max&quot;:6,&quot;step&quot;:0.2,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Arena&quot;},&quot;grain&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Arena&quot;}}">
+class Component extends DCLogic {
+  wrapA = React.createRef(); wrapB = React.createRef(); moonRef = React.createRef();
+  cvA = React.createRef(); cvB = React.createRef(); genInput = React.createRef();
+  state = { phase: 'boot', round: 0, prompt: '', promptOp: 0, pA: 0, pB: 0, you: null, overlay: null, gen: false, genText: '', status: 'INITIALIZING RENDERER', moonSub: 'WHO BUILT IT BETTER?', revOn: false, prog: 0, moonW: 760, booted: false, barOn: false, chosen: null, compFocus: false };
+  ROUNDS = [
+    { prompt: 'A modern house with a pool', a: { model: 'Claude Opus 4.5', org: 'ANTHROPIC', scene: 'house_a' }, b: { model: 'GPT-5.2', org: 'OPENAI', scene: 'house_b' }, pa: 61, pb: 33, pt: 6 },
+    { prompt: 'A floating island platformer level', a: { model: 'Grok 4.1', org: 'XAI', scene: 'plat_a' }, b: { model: 'Gemini 3 Pro', org: 'GOOGLE DEEPMIND', scene: 'plat_b' }, pa: 27, pb: 65, pt: 8 },
+    { prompt: 'A tiny ramen shop at night', a: { model: 'DeepSeek V4', org: 'DEEPSEEK', scene: 'ramen_a' }, b: { model: 'Claude Opus 4.5', org: 'ANTHROPIC', scene: 'ramen_b' }, pa: 47, pb: 46, pt: 7 },
+  ];
+  LB = [
+    [1, 'Claude Opus 4.5', 'ANTHROPIC', 1589, '71.2%'], [2, 'GPT-5.2', 'OPENAI', 1560, '66.5%'],
+    [3, 'Gemini 3 Pro', 'GOOGLE DEEPMIND', 1547, '63.8%'], [4, 'Grok 4.1', 'XAI', 1509, '55.1%'],
+    [5, 'Claude Sonnet 4.5', 'ANTHROPIC', 1494, '52.4%'], [6, 'DeepSeek V4', 'DEEPSEEK', 1471, '47.9%'],
+    [7, 'Kimi K2.5', 'MOONSHOT AI', 1436, '41.3%'], [8, 'Llama 4 Maverick', 'META AI', 1402, '35.6%'],
+  ];
+  FAQ = [
+    { q: 'What am I looking at?', a: 'Two 3D scenes generated from the same prompt by two different LLMs. Each model plans the scene and orchestrates a set of multi-object diffusion canvases — every object you see is a discrete, game-ready asset. Models stay hidden until you vote.' },
+    { q: 'Why do LLMs matter here?', a: 'Multi-object scene diffusion generates the objects, but a language model decides what to place, where, and in what style. Scene quality is a planning problem — that is what SceneBench measures.' },
+    { q: 'Are the objects really game-ready?', a: 'Yes. Every object is generated as a separate mesh with its own materials, so scenes drop straight into a game engine — no segmentation, no cleanup.' },
+    { q: 'How is the leaderboard scored?', a: 'Blind pairwise votes are converted to Elo. Ties count as half a win for each model. Prompts are sampled from public submissions.' },
+  ];
+  SUGS = ['a cliffside villa at dusk', 'a sky-island temple world', 'a neon noodle alley'];
+  cur() { return this.ROUNDS[this.state.round % this.ROUNDS.length]; }
+  _measure(c) {
+    this._mc = this._mc || document.createElement('canvas').getContext('2d');
+    this._mc.font = 'italic 100px "Instrument Serif", serif';
+    return this._mc.measureText(c).width;
+  }
+  arcChars(text, fsU) {
+    if (!text) return { chars: [], fscale: 1 };
+    // perfect circular arc: chord 760, sagitta 150 → R = (380² + 150²/... ) = 556.3
+    const R = 556.3, Rt = R - 36, cx = 380, cy = 150 - R;
+    const A = Math.acos((10 - cy) / Rt); // half-angle where baseline nears the top edge
+    const L = 2 * A * Rt;
+    const P = a => [cx + Rt * Math.sin(a), cy + Rt * Math.cos(a)];
+    const ws = [...text].map(c => this._measure(c) * fsU / 100);
+    let W = ws.reduce((a, b) => a + b, 0);
+    let scale = 1;
+    if (W > L * .92) { scale = L * .92 / W; W = L * .92; }
+    let s = (L - W) / 2; const out = [];
+    [...text].forEach((c, i) => {
+      const w = ws[i] * scale, a = -A + (s + w / 2) / Rt, p = P(a);
+      out.push({ c: c === ' ' ? '\u00a0' : c, x: Math.round(p[0] * 100 / 7.6) / 100, y: Math.round(p[1] * 100 / 1.5) / 100, r: Math.round(-a * 1800 / Math.PI) / 10 });
+      s += w;
+    });
+    return { chars: out, fscale: scale };
+  }
+  componentDidMount() {
+    this._key = e => this.onKey(e);
+    window.addEventListener('keydown', this._key);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { this._mc = null; this.forceUpdate(); });
+    setTimeout(() => this.setState({ booted: true }), 90);
+    (async () => {
+      try {
+        const eng = await import('./engine.js');
+        this.arena = eng.createArena(this.wrapA.current, this.wrapB.current, this.cvA.current, this.cvB.current);
+        this.arena.setSpeed(this.props.orbitSpeed ?? .05);
+        this.startRound(0);
+      } catch (err) {
+        console.error('engine failed', err);
+        this.setState({ status: 'RENDERER UNAVAILABLE — WEBGL REQUIRED' });
+      }
+    })();
+  }
+  componentDidUpdate(pp, ps) {
+    if (this.arena) this.arena.setSpeed(this.props.orbitSpeed ?? .05);
+  }
+  componentWillUnmount() {
+    window.removeEventListener('keydown', this._key);
+    clearTimeout(this._t); clearInterval(this._tick);
+    if (this.arena) this.arena.dispose();
+  }
+  startRound(i) {
+    const r = this.ROUNDS[i % this.ROUNDS.length];
+    this.arena.load(r.a.scene, r.b.scene);
+    this.setState({ round: i, phase: 'vote', prompt: r.prompt, promptOp: 0, pA: 0, pB: 0, you: null, status: null, chosen: null, barOn: false });
+    setTimeout(() => this.setState({ promptOp: 1, barOn: true }), 60);
+  }
+  vote(c) {
+    if (this.state.phase !== 'vote' || this.state.chosen || !this.arena) return;
+    const r = this.cur(), win = r.pa >= r.pb ? 'a' : 'b';
+    this.setState({ chosen: c });
+    this.arena.preview(null);
+    this.arena.reveal(win === 'b', win === 'a');
+    setTimeout(() => {
+      this.setState({ phase: 'reveal', you: c, revOn: false, prog: 0, pA: 0, pB: 0 });
+      setTimeout(() => this.setState({ revOn: true }), 30);
+      const hold = (this.props.revealHoldSec ?? 2.8) * 1000 + 1250, t0 = performance.now();
+      clearInterval(this._tick);
+      this._tick = setInterval(() => {
+        const el = performance.now() - t0;
+        const cp = Math.min(1, el / 750), e = 1 - Math.pow(1 - cp, 3);
+        this.setState({
+          pA: Math.round(r.pa * e), pB: Math.round(r.pb * e),
+          prog: Math.max(0, Math.min(1, (el - 800) / (hold - 900))),
+        });
+        if (el >= hold) { clearInterval(this._tick); this.advance(); }
+      }, 33);
+    }, 230);
+  }
+  preview(side) {
+    if (!this.arena || this.state.phase !== 'vote' || this.state.chosen) return;
+    this.arena.preview(side);
+  }
+  advance() {
+    this.setState({ promptOp: 0, revOn: false });
+    this.arena.out().then(() => this.startRound(this.state.round + 1));
+  }
+  pickScene(t) {
+    const s = t.toLowerCase();
+    const h = [...s].reduce((a, c) => a + c.charCodeAt(0), 0), v = h % 2 ? 'a' : 'b';
+    if (/house|home|villa|cabin|architect|building|mansion|cottage|pool/.test(s)) return 'house_' + v;
+    if (/island|float|platform|sky|level|cloud|game|temple|portal/.test(s)) return 'plat_' + v;
+    if (/ramen|noodle|shop|market|street|alley|night|neon|city|bar|cafe|café|store|town/.test(s)) return 'ramen_' + v;
+    return ['house_a', 'house_b', 'plat_a', 'plat_b', 'ramen_a', 'ramen_b'][h % 6];
+  }
+  runGen(txt) {
+    txt = (txt || '').trim();
+    if (!txt || !this.arena) return;
+    const key = this.pickScene(txt);
+    const disp = txt.length > 58 ? txt.slice(0, 55) + '…' : txt;
+    clearTimeout(this._t); clearInterval(this._tick);
+    if (this.genInput.current) this.genInput.current.blur();
+    this.setState({ overlay: null, gen: true, phase: 'genload', prompt: disp, promptOp: 0, moonSub: 'GENERATED WITH SCENE DIFFUSION', status: 'ORCHESTRATING OBJECTS', you: null, chosen: null, compFocus: false, genText: '' });
+    setTimeout(() => this.setState({ promptOp: 1 }), 80);
+    this.arena.out().then(() => {
+      setTimeout(() => {
+        this.arena.loadSingle(key);
+        this.setState({ phase: 'gen', status: null });
+      }, 620);
+    });
+  }
+  backToArena() {
+    if (!this.arena) return;
+    this.setState({ promptOp: 0, status: null, phase: 'boot' });
+    this.arena.out().then(() => {
+      this.setState({ gen: false, moonSub: 'WHO BUILT IT BETTER?' });
+      setTimeout(() => this.startRound(this.state.round + 1), 580);
+    });
+  }
+  exitComposer() {
+    if (this.genInput.current) this.genInput.current.blur();
+    this.unfocusComp({ genText: '' });
+  }
+  unfocusComp(extra) {
+    this.setState(Object.assign({ compFocus: false, barLock: true }, extra || {}));
+    clearTimeout(this._bl);
+    this._bl = setTimeout(() => this.setState({ barLock: false }), 480);
+  }
+  onKey(e) {
+    if (!e.isTrusted) return; // presenter/new-tab shells synthesize arrow keys from clicks — only real keyboard votes
+    if (e.key === 'Escape') {
+      if (this.state.overlay) this.setState({ overlay: null });
+      else if (this.state.compFocus) this.exitComposer();
+      else if (this.state.gen && this.state.phase === 'gen') this.backToArena();
+      return;
+    }
+    if (this.state.overlay || this.state.gen) return;
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (this.state.phase !== 'vote') return;
+    if (e.key === 'ArrowLeft') this.vote('a');
+    else if (e.key === 'ArrowRight') this.vote('b');
+    else if (e.key === 'ArrowDown' || e.key === 't' || e.key === 'T') this.vote('tie');
+  }
+  renderVals() {
+    const s = this.state, r = this.cur(), win = r.pa >= r.pb ? 'a' : 'b', reveal = s.phase === 'reveal';
+    const len = (s.prompt || '').length;
+    const fsU = Math.max(20, Math.min(37, 1150 / Math.max(22, len)));
+    const arc = this.arcChars(s.prompt || '', fsU);
+    const on = s.revOn, bt = s.booted, bo = s.barOn, ch = s.chosen, cf = s.compFocus;
+    const spring = 'cubic-bezier(.28,1.45,.42,1)';
+    const seg = (k, dl) => ch
+      ? (ch === k
+        ? { bg: '#000', col: '#f2f1ed', tr: 'scale(1.1)', op: 1, ts: 'transform .22s ' + spring + ',opacity .2s ease' }
+        : { bg: '#f2f1ed', col: k === 'tie' ? '#6e6e6e' : '#000', tr: 'scale(.86) translateY(14px)', op: 0, ts: 'transform .2s ease,opacity .16s ease' })
+      : { bg: '#f2f1ed', col: k === 'tie' ? '#6e6e6e' : '#000', tr: bo ? 'none' : 'translateY(16px) scale(.92)', op: bo ? 1 : 0, ts: 'background .08s,color .08s,transform .3s ' + spring + ',opacity .3s ease ' + dl };
+    const sizes = [40, 34, 29, 26, 23, 21, 19, 17.5], ops = [1, .95, .9, .85, .8, .75, .7, .65];
+    return {
+      wrapA: this.wrapA, wrapB: this.wrapB, cvA: this.cvA, cvB: this.cvB, genInput: this.genInput, moonRef: this.moonRef,
+      paneAW: s.gen ? '100%' : '50%', paneBW: s.gen ? '0%' : '50%', paneBOp: s.gen ? 0 : 1,
+      statusText: s.status, showStatus: !!s.status,
+      moonSub: s.moonSub, prompt: s.prompt, promptOp: s.promptOp, pcOp: s.promptOp,
+      promptChars: arc.chars.map((c, i) => ({
+        c: c.c, x: c.x, y: c.y,
+        tf: 'translate(-50%,-62%) rotate(' + c.r + 'deg)' + (s.promptOp ? ' scale(1)' : ' scale(.25) translateY(10px)'),
+        dl: (s.promptOp ? i * 16 : i * 5) + 'ms',
+        wd: (-i * .13).toFixed(2) + 's',
+      })),
+      promptCqw: Math.round(fsU * arc.fscale / 7.6 * 100) / 100,
+      isVote: s.phase === 'vote', isReveal: reveal, isGen: s.phase === 'gen',
+      voteA: () => this.vote('a'), voteTie: () => this.vote('tie'), voteB: () => this.vote('b'),
+      sA: seg('a', '0s'), sT: seg('tie', '.05s'), sB: seg('b', '.1s'),
+      prevA: () => this.preview('a'), prevT: () => this.preview('tie'), prevB: () => this.preview('b'), prevOff: () => this.preview(null),
+      hOp: bt ? 1 : 0, hTy: bt ? '0px' : '-12px', moonTy: bt ? '0%' : '-108%',
+      barTy: !bt ? '158px' : (cf ? '30px' : '0px'), barOp: !bt || cf ? 0 : 1, barPE: cf || s.barLock ? 'none' : 'auto', barDl: cf ? '0s' : '.25s',
+      compOn: s.phase === 'vote' || s.phase === 'reveal' || s.phase === 'gen',
+      compOp: !bt || ch ? 0 : 1, compTy: !bt || ch ? '30px' : '0px', compPE: !bt || ch ? 'none' : 'auto',
+      compPad: cf ? 30 : 15, compW: cf ? 'min(620px,58vw)' : '290px', compFs: cf ? 31 : 15.5,
+      compLine: cf ? '#f2f1ed' : '#3f3f3f',
+      compPh: cf ? 'describe any scene…' : 'want to generate your own?',
+      compFoc: () => this.setState({ compFocus: true }),
+      compBlur: () => { if (!this.state.genText.trim()) this.unfocusComp(); },
+      sugOp: cf ? 1 : 0, sugTy: cf ? '0px' : '14px', focPE: cf ? 'auto' : 'none',
+      genBtnOp: cf ? 1 : 0, genBtnSc: cf ? 1 : .6, genCur: cf ? 'pointer' : 'default',
+      nameA: r.a.model, nameB: r.b.model, orgA: r.a.org, orgB: r.b.org,
+      pA: s.pA, pB: s.pB,
+      aOp: reveal && win === 'b' ? .38 : 1, bOp: reveal && win === 'a' ? .38 : 1,
+      stA: on ? 1 : 0, stB: on ? 1 : 0, opC: on ? 1 : 0,
+      scA: on ? 'scale(1) translateY(0px)' : 'scale(.6) translateY(26px)',
+      scB: on ? 'scale(1) translateY(0px)' : 'scale(.6) translateY(26px)',
+      blA: on ? 'blur(0px)' : 'blur(12px)', blB: on ? 'blur(0px)' : 'blur(12px)',
+      mOp: on ? 1 : 0, mTy: on ? '0px' : '12px', cTy: on ? '0px' : '14px',
+      prog: s.prog,
+      aComm: win === 'a', bComm: win === 'b', aYou: s.you === 'a', bYou: s.you === 'b',
+      tieLine: r.pt + '% VOTED TIE',
+      openLb: () => this.setState({ overlay: 'leaderboard' }),
+      openAbout: () => this.setState({ overlay: 'about' }),
+      openFaq: () => this.setState({ overlay: 'faq' }),
+      openGen: () => { if (this.genInput.current) this.genInput.current.focus(); },
+      close: () => this.setState({ overlay: null }),
+      lbOpen: s.overlay === 'leaderboard', aboutOpen: s.overlay === 'about', faqOpen: s.overlay === 'faq',
+      lbRows: this.LB.map((x, i) => ({ rank: ('0' + x[0]).slice(-2), name: x[1], org: x[2], elo: x[3], wr: x[4], size: sizes[i], op: ops[i], d: (.14 + i * .045).toFixed(3) + 's' })),
+      faqItems: this.FAQ.map((f, i) => ({ q: f.q, a: f.a, d: (.1 + i * .07).toFixed(2) + 's' })),
+      sugs: this.SUGS.map((t, i) => ({ label: t, go: () => this.runGen(t), d: (.14 + i * .06).toFixed(2) + 's' })),
+      genText: s.genText,
+      genChange: e => this.setState({ genText: e.target.value }),
+      genKeyDown: e => { if (e.key === 'Enter') this.runGen(this.state.genText); },
+      genGo: () => this.runGen(this.state.genText),
+      backToArena: () => this.backToArena(),
+      grainOn: this.props.grain ?? true,
+    };
+  }
+}
+</script>
+</body>
+</html>

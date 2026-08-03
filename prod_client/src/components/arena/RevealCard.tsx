@@ -61,10 +61,16 @@ export default function RevealCard({
 			// sits at the outer edge of the screen and the rating toward the middle,
 			// so the two cards frame the control between them instead of floating in
 			// the gap. `align` is the side of the SCREEN this card is on.
+			// OPAQUE, both ways round. The bar floats over the scenes, and the winning
+			// scene is lit from its own edges — so a card you can see through is a card
+			// the winner's glow and the seam down the middle read straight across,
+			// which puts the light in front of the control instead of behind it. The
+			// loser's card still recedes; it does it by dropping its contrast, not by
+			// letting the picture through.
 			className={`flex w-full items-center justify-between gap-[clamp(12px,1.6vw,28px)] rounded-xs border px-[clamp(14px,1.8vw,30px)] py-[clamp(10px,1.3vh,18px)] transition-colors duration-500 ${
 				won
 					? "border-foreground bg-foreground text-background"
-					: "border-white/10 bg-transparent text-foreground/40"
+					: "border-white/10 bg-background text-foreground/40"
 			} ${align === "right" ? "flex-row-reverse" : ""}`}
 			style={{ animation: "arena-rise 320ms ease both" }}
 		>
@@ -72,7 +78,11 @@ export default function RevealCard({
 				<span className="font-sans text-[clamp(9px,0.7vw,12px)] font-medium tracking-[0.2em] opacity-60">
 					BUILT BY
 				</span>
-				<span className="truncate font-display text-[clamp(14px,1.35vw,24px)] font-semibold tracking-[-0.015em]">
+				{/* Archivo at its heaviest, NOT the display face: `font-display` is the
+				    wordmark's Anton, which has one weight and a poster's proportions —
+				    a model name set in it would announce itself louder than the site
+				    does. This is a result, so it is the interface face, set hard. */}
+				<span className="truncate font-sans text-[clamp(14px,1.35vw,24px)] font-extrabold tracking-[-0.015em] uppercase">
 					{model}
 				</span>
 			</div>

@@ -1,12 +1,17 @@
-// The cells the comparison canvas puts side by side, served straight out of
-// public/ rather than through the D1 catalog + R2.
+// The cells the comparison canvas puts side by side. A fixed pairing, so it is
+// not resolved from the D1 catalog the way a scene the user PICKS is
+// (lib/scenes.ts) — but it is assembled out of the same two places those assets
+// actually live.
 //
-// This is deliberately NOT the published path (lib/scenes.ts). That one resolves
-// every asset from a catalog row's stored keys through the /r2 proxy, which is
-// right for anything a user picks — but these two cells are a fixed experiment
-// checked into the repo, so they have no catalog row to resolve from and their
-// URLs are just paths under public/.
+// SPLIT BY WEIGHT, not by kind. What the page needs before it can show anything —
+// the dollhouse and the splat — is committed under public/ and served from our own
+// origin, so the comparison stands up with no catalog, no bucket and no
+// orchestrator running. The walkthrough's assets are the other 128 MB: 224 panos
+// across the two cells, plus their proxies and floor slices. Those are pulled from
+// the published bucket through the /r2 proxy, on demand, as the engine asks for
+// them — a pano at a time, only once someone points at it.
 import type { TourSource } from "./orbit/types";
+import { assetUrl, cfImageUrl } from "./r2";
 
 // A cell publishes its dollhouse and its splat; that pair is all the orbit engine
 // needs to stand a scene up.
@@ -16,26 +21,38 @@ import type { TourSource } from "./orbit/types";
 // "nothing to show for this scene" unless some real mesh arrived to be measured,
 // framed and addressed. The splat then replaces it as what you actually see
 // (`loadTour` sets splatView on any scene that ships one).
-function cellSource(dir: string): TourSource {
+//
+// `dir` is the folder under public/; `cell` is the published cell prefix
+// (run/slot/model) its tour hangs under in the bucket. The two are separate
+// arguments because they are separate facts — the same build can be checked in
+// under any name — and they have to be kept pointing at the SAME build by hand.
+function cellSource(dir: string, cell: string): TourSource {
 	const base = `/scenes/${dir}`;
+	// Every walkthrough asset is named by the manifest as a bare filename relative
+	// to tour.json, and publish.py puts the whole set under one prefix — so one
+	// resolver serves panos, proxy and minimap slices alike.
+	const tour = (file: string) => assetUrl(`${cell}/tour/${file}`);
 	return {
 		dollhouseUrl: `${base}/scene-lite.glb`,
-		// No tour manifest, on purpose. The panos for these two cells run to 128 MB
-		// together, which does not belong in the repo, and without a manifest the
-		// engine loads no panos, no minimap slices and no proxy and settles in
-		// orbit mode — an orbitable splat, which is the whole of what an A/B
-		// comparison needs. The walkthrough is simply not published here.
-		manifestUrl: null,
 		splatUrl: `${base}/trained.web.sog`,
-		// Unreachable while `manifestUrl` is null — every pano, slice and proxy
-		// filename comes off the manifest — but the shape has to be complete, and
-		// these are where those files would live if a tour were ever added.
+		// WITHOUT THIS THERE IS NO WALKTHROUGH. The manifest is what carries the
+		// capture points, and with none of them the scene has nowhere to put you:
+		// the dollhouse is inert, clicking it does nothing, and the cursor stands
+		// down rather than advertise a door that isn't there.
+		manifestUrl: tour("tour.json"),
 		resolvePano: (file) => ({
-			url: `${base}/tour/${file}`,
-			placeholderUrl: `${base}/tour/${file}`,
+			url: tour(file),
+			// The same blurred stand-in the catalog path uses, so a capture appears
+			// instantly and sharpens rather than arriving as a held blank. Falls back
+			// to the full image wherever the image-transform edge isn't there.
+			placeholderUrl: cfImageUrl(`${cell}/tour/${file}`, {
+				width: 640,
+				quality: 50,
+				blur: 16,
+			}),
 		}),
-		resolveProxy: (file) => `${base}/${file}`,
-		resolveMinimap: (file) => `${base}/tour/${file}`,
+		resolveProxy: (file) => tour(file),
+		resolveMinimap: (file) => tour(file),
 	};
 }
 
@@ -64,14 +81,24 @@ export const LOCAL_CELLS: readonly LocalCell[] = [
 		slot: "modern-house",
 		model: "Gemini Flash",
 		elo: 2091,
-		source: cellSource("modern-house-gemini-flash"),
+		// #TODO: the run id is pinned here, so re-running "ahhhhhhhh" under a new
+		// name silently costs both cells their walkthrough (the dollhouse and splat
+		// keep working, which is what makes it silent). The pairing should arrive
+		// from the server carrying its own cell keys — same #TODO as `elo`.
+		source: cellSource(
+			"modern-house-gemini-flash",
+			"ahhhhhhhh/modern-house/gemini-flash",
+		),
 	},
 	{
 		id: "platformer-level-opus-new",
 		slot: "platformer-level",
 		model: "Claude Opus",
 		elo: 2108,
-		source: cellSource("platformer-level-opus-new"),
+		source: cellSource(
+			"platformer-level-opus-new",
+			"ahhhhhhhh/platformer-level/opus-new",
+		),
 	},
 ];
 

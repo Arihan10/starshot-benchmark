@@ -9,6 +9,16 @@ export const easeExpo = (p: number) => (1 - Math.exp(-4.6 * p)) / (1 - Math.exp(
 export const easeOutCubic = (p: number) => 1 - (1 - p) ** 3;
 
 /**
+ * No easing at all — for a clock. A countdown that slowed as it ran would be
+ * lying about how much time was left.
+ *
+ * Module scope, like the others, and that matters: `useProgress` keys its effect
+ * on the ease it is handed, so an arrow function written at the call site is a new
+ * ease every render and restarts the ramp each time.
+ */
+export const linear = (p: number) => p;
+
+/**
  * A 0→1 ramp that starts when the component mounts.
  *
  * DELIBERATELY OWNED BY THE LEAF THAT DISPLAYS IT. Driving these from the page

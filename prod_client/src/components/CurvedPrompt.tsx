@@ -2,61 +2,71 @@
 
 import { useId, useLayoutEffect, useRef } from "react";
 
-// The prompt, set on an arc concentric with the moon behind it.
+// The prompt, set on a circle CONCENTRIC WITH THE MOON.
 //
 // SVG `textPath` rather than per-character transforms: the browser handles letter
 // spacing along the curve, kerning survives, and the whole thing stays one text
-// node for selection and screen readers. It is also what the Arena design uses for
-// the moon's own label, so the two curves are produced the same way.
+// node for selection and screen readers.
 //
-// EVERYTHING IS IN viewBox UNITS, and the SVG is sized in CSS. That is what makes
-// it responsive without measuring the viewport: scale the box and the arc, the
-// type and the bow all scale together, so the curvature stays matched to the moon
-// at every width instead of drifting as the disc grows.
-
-const VB_WIDTH = 1000;
-
-// Where the baseline starts and ends, and how far the middle of it drops below
-// them. SAGITTA is the whole curvature control — it is the depth of the arc's bow,
-// and the radius it implies is r = (a² + s²) / 2s for half-span a. Tuned so that
-// r, once scaled to CSS pixels, lands near the moon's own radius at the height the
-// text sits at; the eye reads "concentric", not "identical", so this does not have
-// to be exact and must not be recomputed per frame.
-const PATH_X0 = 90;
-const PATH_X1 = 910;
-const BASELINE = 88;
-const HALF_SPAN = (PATH_X1 - PATH_X0) / 2;
-
-// THE CURVATURE IS AN INPUT, NOT A CONSTANT. The caller passes the radius the arc
-// should sit on — measured off the moon, in the same viewBox units — and the bow
-// falls out of it: s = r − √(r² − a²). Hand-tuning a sagitta instead looks right at
-// exactly one viewport and one prompt length, and there is no way to tell from the
-// number whether it still matches the disc.
-const sagittaFor = (radius: number) =>
-	radius - Math.sqrt(Math.max(0, radius * radius - HALF_SPAN * HALF_SPAN));
-
-// THE SIZE RANGE, in viewBox units. The CSS width the caller gives the SVG divided
-// by VB_WIDTH is the scale factor, so rendered px = size * (cssWidth / 1000).
+// THE VIEWBOX IS THE MOON. It is square, 1000 units across, and the caller sizes
+// the SVG to the disc's own diameter and anchors it the same way the disc is
+// anchored — so viewBox (500,500) IS the moon's centre and 500 units IS its
+// radius, at every viewport, with no measuring. The baseline is then simply a
+// circle of radius 500 − INSET about that point: not approximately concentric,
+// not concentric at one width, but the same circle struck from the same centre.
 //
-// A short prompt gets FONT_MAX and stops there — without a ceiling, "A house"
-// would inflate to fill the arc and dwarf everything around it. A long one shrinks
-// to fit and stops at FONT_MIN, below which the prompt is no longer the thing you
-// read first and the masthead has lost its point; past that the tail clips, which
-// is the honest failure and better than type nobody can read.
-const FONT_MAX = 84;
-const FONT_MIN = 44;
+// This replaces a quadratic Bézier whose radius was tuned to match the disc's.
+// Matching the RADIUS is not enough — the arc hung from the top of the masthead
+// while the disc hung from the bottom, so the two curves were struck from
+// different centres and the line drifted away from the limb as it crossed the
+// middle. Anchoring both to the same box is what makes the two curves the same
+// curve.
+const VB = 1000;
+const CENTRE = VB / 2;
 
-// Leave the arc's last few percent empty at both ends. Text that runs to the very
-// tip sits where the curve is steepest and reads as falling off the edge.
-const FIT_MARGIN = 0.95;
+// How far inside the limb the baseline sits, in viewBox units — i.e. as a
+// fraction of the moon, so it holds at every size.
+//
+// SMALL ON PURPOSE. Every unit of inset lifts the line off the bottom of the disc
+// (a concentric circle's lowest point is exactly INSET above the disc's lowest
+// point), and the masthead band is only as tall as the navbar — so a generous
+// inset walks the prompt straight up into the label above it. This is a little
+// under 3% of the diameter: enough to clear the limb with the descenders, little
+// enough to leave the line sitting low on the disc where the moon is widest.
+const INSET = 29;
 
-// Breathing room left around the ink once the box is cropped to it.
-const INK_PAD = 6;
+// How much of the circle the line may use, each side of the bottom. The limit is
+// not the moon — it is the BAND: the disc is clipped to the masthead, so past
+// this the baseline climbs out of the visible cap and the ends of the prompt
+// would be set on black rather than on the moon.
+const HALF_SPAN_DEG = 30;
+
+// The size range, in viewBox units — so, as thousandths of the moon's diameter. A
+// short prompt gets FONT_MAX and stops there; without a ceiling "A house" would
+// inflate to fill the arc and dwarf everything around it. A long one shrinks to
+// FONT_MIN and no further, below which the prompt is no longer the thing you read
+// first; past that the tail clips, which is the honest failure and better than
+// type nobody can read.
+const FONT_MAX = 46;
+const FONT_MIN = 21;
+
+// Leave the arc's last few percent empty at both ends. Text run to the very tip
+// sits where the curve is steepest and reads as falling off the edge.
+const FIT_MARGIN = 0.94;
+
+const rad = (deg: number) => (deg * Math.PI) / 180;
+
+/** A point on the baseline circle, `deg` away from the bottom of the moon. */
+function at(radius: number, deg: number): [number, number] {
+	const a = rad(deg);
+	return [CENTRE + radius * Math.sin(a), CENTRE + radius * Math.cos(a)];
+}
 
 /**
- * `width` is a CSS length (clamp() is expected) and drives everything else — the
- * height follows from the viewBox's aspect ratio, so the caller only picks one
- * number.
+ * `diameter` is a CSS length and must be the SAME expression the moon is sized
+ * with; the caller is responsible for anchoring this box exactly as the disc is
+ * anchored (bottom edge on the bottom of the masthead, horizontally centred).
+ * Everything else follows from that.
  *
  * THE TYPE FITS ITSELF TO THE ARC. A path has a finite length and `textPath`
  * simply stops drawing at the end of it, so a prompt past a certain length would
@@ -68,27 +78,26 @@ const INK_PAD = 6;
  */
 export default function CurvedPrompt({
 	text,
-	width,
-	radius,
+	diameter,
 	className,
 }: {
 	text: string;
-	width: string;
-	/** Arc radius in viewBox units — see the caller for how it comes off the moon. */
-	radius: number;
+	/** The moon's diameter — the same CSS length the disc itself is given. */
+	diameter: string;
 	className?: string;
 }) {
-	const svgRef = useRef<SVGSVGElement>(null);
 	const pathRef = useRef<SVGPathElement>(null);
 	const textRef = useRef<SVGTextElement>(null);
 	const gaugeRef = useRef<SVGTextElement>(null);
-	const sagitta = sagittaFor(radius);
-	// A quadratic Bézier passes through the midpoint of its control offset, so the
-	// control sits at twice the sagitta to make the curve dip exactly that far.
-	const arc = `M ${PATH_X0},${BASELINE} Q ${VB_WIDTH / 2},${BASELINE + sagitta * 2} ${PATH_X1},${BASELINE}`;
-	// Only a starting box. The real one is cropped to the ink below, once the
-	// fitted size is known.
-	const initialHeight = BASELINE + sagitta + 30;
+
+	const radius = CENTRE - INSET;
+	const [x0, y0] = at(radius, -HALF_SPAN_DEG);
+	const [x1, y1] = at(radius, HALF_SPAN_DEG);
+	// A TRUE CIRCULAR ARC, not a Bézier approximating one. `sweep-flag` 0 runs it
+	// left to right along the BOTTOM of the circle, which is the direction the text
+	// reads and the side of the moon that is on screen.
+	const arc = `M ${x0.toFixed(2)},${y0.toFixed(2)} A ${radius},${radius} 0 0,0 ${x1.toFixed(2)},${y1.toFixed(2)}`;
+
 	// `useId`, not a random string: the id has to be identical on the server and
 	// the client or the href breaks on hydration, and two viewers on one page must
 	// not collide on it.
@@ -98,11 +107,10 @@ export default function CurvedPrompt({
 	// know the fitted size, and a state round-trip would repaint the whole masthead
 	// to change one attribute.
 	useLayoutEffect(() => {
-		const svg = svgRef.current;
 		const path = pathRef.current;
 		const target = textRef.current;
 		const gauge = gaugeRef.current;
-		if (!svg || !path || !target || !gauge) return;
+		if (!path || !target || !gauge) return;
 
 		const fit = () => {
 			// The gauge is held at FONT_MAX, so this is the width the prompt WANTS.
@@ -111,22 +119,6 @@ export default function CurvedPrompt({
 			const usable = path.getTotalLength() * FIT_MARGIN;
 			const wanted = FONT_MAX * (usable / needed);
 			target.style.fontSize = `${Math.max(FONT_MIN, Math.min(FONT_MAX, wanted))}px`;
-
-			// CROP THE BOX TO THE INK. A box sized for the arc's full extent is
-			// mostly empty: the ends of the curve carry no glyphs above them, and a
-			// prompt that fitted below FONT_MAX leaves the reserved cap height
-			// unused too. That emptiness is not free — the SVG is a flow element, so
-			// every unused unit becomes real space between the label and the prompt,
-			// and pushes the moon's limb (anchored to the band's bottom) further
-			// down the page. Measured AFTER the size settles, so it crops what is
-			// actually drawn rather than what might be.
-			const ink = target.getBBox();
-			if (ink.height > 0) {
-				svg.setAttribute(
-					"viewBox",
-					`0 ${ink.y - INK_PAD} ${VB_WIDTH} ${ink.height + INK_PAD * 2}`,
-				);
-			}
 		};
 
 		fit();
@@ -134,19 +126,26 @@ export default function CurvedPrompt({
 		// fallback face, whose widths differ enough to leave the fitted size visibly
 		// wrong — usually too small, since the fallback is wider.
 		document.fonts?.ready.then(fit).catch(() => {});
-	}, [text, radius]);
+	}, [text]);
 
+	// THE ONE SERIF ON THE PAGE, and italic. Everything else here is the product
+	// talking — grotesque for the interface, monospace for its labels — and this is
+	// the only line that came from a person, so it is set the way a person writes
+	// rather than the way a system reports.
 	const typeStyle = {
-		fontFamily: "var(--font-archivo)",
-		fontWeight: 600,
-		letterSpacing: "-0.02em",
+		fontFamily: "var(--font-instrument-serif), serif",
+		fontStyle: "italic",
+		fontWeight: 400,
+		letterSpacing: "0.01em",
 	} as const;
 
 	return (
 		<svg
-			ref={svgRef}
-			viewBox={`0 0 ${VB_WIDTH} ${initialHeight}`}
-			style={{ width, height: "auto", overflow: "visible" }}
+			viewBox={`0 0 ${VB} ${VB}`}
+			// Square, and sized to the moon. The box is mostly empty — only the strip
+			// near the bottom of the circle ever carries ink — but that is what buys
+			// the exact registration with the disc.
+			style={{ width: diameter, height: diameter, overflow: "visible" }}
 			className={className}
 			role="img"
 			aria-label={text}

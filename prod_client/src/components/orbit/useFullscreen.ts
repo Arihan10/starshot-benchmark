@@ -40,16 +40,28 @@ export function useFullscreen(ref: RefObject<HTMLElement | null>) {
 	);
 	const supported = useSyncExternalStore(subscribeNever, getSupported, serverSnapshot);
 
-	const toggle = useCallback(() => {
+	// Both calls reject rather than throw (a denied permission policy, a gesture the
+	// browser did not count). Nothing here can recover from that, and an unhandled
+	// rejection in the console is worse than a control that did nothing, so both are
+	// swallowed deliberately — the caller gets a promise that always resolves, and
+	// resolves only once the screen has actually changed hands.
+	const enter = useCallback(() => {
 		const el = ref.current;
-		if (!el) return;
-		// Both calls reject rather than throw (a denied permission policy, a gesture
-		// the browser did not count). Nothing here can recover from that, and an
-		// unhandled rejection in the console is worse than a button that did
-		// nothing, so both are swallowed deliberately.
-		if (document.fullscreenElement === el) void document.exitFullscreen().catch(() => {});
-		else void el.requestFullscreen().catch(() => {});
+		if (!el || document.fullscreenElement === el) return Promise.resolve();
+		return el.requestFullscreen().catch(() => {});
 	}, [ref]);
 
-	return { isFullscreen, supported, toggle };
+	// OUR element only. Whoever else may hold the screen put it there for their own
+	// reasons, and taking it back on their behalf is not this hook's business.
+	const exit = useCallback(() => {
+		if (!ref.current || document.fullscreenElement !== ref.current)
+			return Promise.resolve();
+		return document.exitFullscreen().catch(() => {});
+	}, [ref]);
+
+	const toggle = useCallback(() => {
+		void (document.fullscreenElement === ref.current ? exit() : enter());
+	}, [ref, enter, exit]);
+
+	return { isFullscreen, supported, enter, exit, toggle };
 }

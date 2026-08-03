@@ -5,8 +5,6 @@ import { OrbitEngine } from "@/lib/orbit/engine";
 import { INITIAL_ORBIT_STATE, type OrbitState, type TourSource } from "@/lib/orbit/types";
 import { tourSource, type Scene } from "@/lib/scenes";
 
-/** Modes in which the camera has left the orbit and is inside the scene. */
-const FOCUSED_MODES = new Set(["interior", "freefly", "transition", "peek"]);
 
 /**
  * Owns one OrbitEngine: its lifetime, the scene it is showing, and the state it
@@ -20,22 +18,27 @@ const FOCUSED_MODES = new Set(["interior", "freefly", "transition", "peek"]);
 export function useOrbitEngine({
 	scene = null,
 	source = null,
-	onFocusedChange,
 }: {
 	scene?: Scene | null;
 	source?: TourSource | null;
-	onFocusedChange?: (focused: boolean) => void;
 }) {
 	const hostRef = useRef<HTMLDivElement>(null);
 	const engineRef = useRef<OrbitEngine | null>(null);
 	const [state, setState] = useState<OrbitState>(INITIAL_ORBIT_STATE);
+	// Kept apart from `state` deliberately. Whether the camera is in the scene has
+	// to be known DURING a flight, and the state stream is frozen for exactly that
+	// stretch (OrbitEngine.emit returns early while transitioning), so reading it
+	// off `state.mode` could only ever report the two arrivals — which is a beat
+	// late at both ends. The engine reports this one the moment each journey
+	// starts.
+	const [inside, setInside] = useState(false);
 
 	// One engine per mount. Empty deps on purpose: a rebuilt engine would drop the
 	// loaded scene and the camera with it, so the scene is swapped below instead.
 	useEffect(() => {
 		const host = hostRef.current;
 		if (!host) return;
-		const engine = new OrbitEngine(host, setState);
+		const engine = new OrbitEngine(host, setState, undefined, setInside);
 		engineRef.current = engine;
 		return () => {
 			engine.dispose();
@@ -51,10 +54,9 @@ export function useOrbitEngine({
 		if (src) void engineRef.current?.loadTour(src);
 	}, [scene, source]);
 
-	const focused = FOCUSED_MODES.has(state.mode);
-	useEffect(() => {
-		onFocusedChange?.(focused);
-	}, [focused, onFocusedChange]);
-
-	return { hostRef, engineRef, state };
+	// `inside` is handed back rather than reported onward from here: going in and
+	// coming out have a running order now (the screen is taken after the panel has
+	// finished opening, and given back before it closes), and the component that
+	// owns the fullscreen controls is the one that can sequence it. See OrbitViewer.
+	return { hostRef, engineRef, state, inside };
 }

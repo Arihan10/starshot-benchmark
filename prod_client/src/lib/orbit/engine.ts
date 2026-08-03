@@ -472,6 +472,7 @@ const _flyDir = new Vector3();
 const _moveWish = new Vector3();
 const _prevClear = new Color();
 const _ghostFloor = new Vector3();
+const _ovTravel = new Vector3();
 const _wpDir = new Vector3();
 const _wpOut = new Vector3();
 const _wpEye = new Vector3();
@@ -583,6 +584,25 @@ export class OrbitEngine {
 	private readonly onState: (s: OrbitState) => void;
 	private readonly onHold?: (held: boolean) => void;
 
+	// --- "am I in the scene?" ---------------------------------------------------
+	// Reported on its OWN channel rather than through the state stream, because the
+	// state stream is deliberately frozen for the whole of a transition (see emit)
+	// — and a flight is exactly when this answer changes. Anything that has to move
+	// WITH the camera rather than after it reads this: the comparison page sizes its
+	// panels from it, so the panel opens as the fly-in starts instead of snapping
+	// open 1.1 seconds later, when the journey is already over.
+	//
+	// True from the moment a flight inward BEGINS until the moment a flight outward
+	// begins — not from the arrivals, which is the whole point.
+	private readonly onInside?: (inside: boolean) => void;
+	private inside = false;
+
+	private setInside(next: boolean) {
+		if (this.inside === next) return;
+		this.inside = next;
+		this.onInside?.(next);
+	}
+
 	private readonly renderer: WebGLRenderer;
 	private readonly canvas: HTMLCanvasElement;
 	// Pending `capture()` request, served at the end of the next drawn frame.
@@ -639,6 +659,24 @@ export class OrbitEngine {
 	private pointerClientX = 0;
 	private pointerClientY = 0;
 	private pointerInside = false;
+	// Whether a button is currently held. The overview reads it to stand its cursor
+	// down during an orbit-drag: the pointer is not aiming then, it is holding the
+	// scene, and a ring skating across the geometry as the model turns under a
+	// stationary hand reads as the cursor having come loose.
+	private pointerDown = false;
+
+	// --- the overview cursor ---------------------------------------------------
+	// What a click on the dollhouse would open, resolved once per frame from the
+	// surface under the pointer and reused by the click itself, so what is drawn and
+	// where you land cannot disagree. -1 = the pointer is not over the scene.
+	private overviewTarget = -1;
+	// The surface hit the ring is currently lying on, kept so a frame in which
+	// neither the pointer nor the camera moved can skip the raycast entirely.
+	private overviewHit: Intersection | null = null;
+	private overviewAimX = -1;
+	private overviewAimY = -1;
+	private readonly overviewCam = new Vector3();
+	private readonly overviewPivot = new Vector3();
 
 	private currentIndex = -1;
 	// The capture the fly-in is heading to, projected during enter() before the
@@ -812,10 +850,12 @@ export class OrbitEngine {
 		host: HTMLElement,
 		onState: (s: OrbitState) => void,
 		onHold?: (held: boolean) => void,
+		onInside?: (inside: boolean) => void,
 	) {
 		this.host = host;
 		this.onState = onState;
 		this.onHold = onHold;
+		this.onInside = onInside;
 
 		// `alpha` so this canvas can be drawn OVER the splat's: when the splat is
 		// showing, the scene background is dropped and everything three.js renders
@@ -952,7 +992,21 @@ export class OrbitEngine {
 		document.addEventListener("pointerlockchange", this.onPointerLockChange);
 		document.addEventListener("mousemove", this.onLockedMouseMove);
 
-		this.ro = new ResizeObserver(() => this.resize());
+		// NOTE THE FLAG. The observer records that the size changed; the TICK acts on
+		// it, at the top of the frame, before anything draws.
+		//
+		// Resizing straight from this callback is a frame too late, and the browser's
+		// frame order is why: animation callbacks run FIRST, then resize observations
+		// are delivered, then the page is painted. So a resize done here reallocated
+		// both backbuffers immediately after the frame had been drawn into them, and
+		// what got painted was the fresh, empty one. A single resize (a window drag,
+		// the old instant panel swap) lost one frame and nobody could see it. Give the
+		// panel an ANIMATED width and it happens every frame for the length of the
+		// animation: the scene goes black for the whole transition and reappears the
+		// moment the size settles.
+		this.ro = new ResizeObserver(() => {
+			this.resizePending = true;
+		});
 		this.ro.observe(host);
 		this.resize();
 		this.renderer.setAnimationLoop(this.tick);
@@ -1340,6 +1394,9 @@ export class OrbitEngine {
 		this.iris.style.opacity = "0";
 	}
 
+	// Set by the ResizeObserver, consumed at the top of the next tick.
+	private resizePending = false;
+
 	private resize() {
 		const w = this.host.clientWidth;
 		const h = this.host.clientHeight;
@@ -1382,6 +1439,7 @@ export class OrbitEngine {
 	};
 
 	private onPointerDown = (ev: PointerEvent) => {
+		this.pointerDown = true;
 		if (ev.button === 2) {
 			this.rcDownX = ev.clientX;
 			this.rcDownY = ev.clientY;
@@ -1427,10 +1485,12 @@ export class OrbitEngine {
 		this.pointerInside = true;
 		if (this.mode === "overview") {
 			if (ev.buttons !== 0) return;
-			// The whole dollhouse is the "enter" affordance now: clicking anywhere on
-			// it drops inside at the nearest capture point, so any hover over it reads
-			// as clickable. Object highlight (when enabled) still layers on top.
-			const overScene = !!this.raycastOverview(ev.clientX, ev.clientY);
+			// Whether the pointer is over the scene — and so whether this reads as
+			// clickable — is resolved once a frame in updateOverviewCursor, which has
+			// to run anyway because the model turns under a stationary pointer. Asking
+			// again here would be a second raycast through the dollhouse per mouse
+			// event to answer a question already on hand. Object highlight (when
+			// enabled) is genuinely pointer-driven and still layers on top.
 			const obj = this.highlightEnabled
 				? this.addressing.pickAt(
 						ev.clientX,
@@ -1438,7 +1498,6 @@ export class OrbitEngine {
 						this.activeObjectRoot(),
 					)
 				: null;
-			this.canvas.style.cursor = overScene ? "pointer" : "";
 			if (this.addressing.setHover(obj)) this.emit();
 			return;
 		}
@@ -1494,6 +1553,7 @@ export class OrbitEngine {
 	};
 
 	private onPointerUp = () => {
+		this.pointerDown = false;
 		if (!this.isLookMode) return;
 		this.dragging = false;
 		this.canvas.style.cursor = "";
@@ -1595,9 +1655,22 @@ export class OrbitEngine {
 		// Ignore the click that ends an orbit-drag; only a genuine tap enters.
 		if (Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY) > 6)
 			return;
-		const point = this.raycastOverview(ev.clientX, ev.clientY);
-		if (point) this.enter(this.nearestPanoTo(point));
+		// The destination the cursor already resolved this frame, so the click opens
+		// the capture the ring was standing on rather than re-deriving one that could
+		// differ. The fallback is for a pointer that never hovered — a touch tap,
+		// where there is no hover to have happened.
+		const target =
+			this.overviewTarget >= 0
+				? this.overviewTarget
+				: this.panoAtPointer(ev.clientX, ev.clientY);
+		if (target >= 0) this.enter(target);
 	};
+
+	/** The capture a click at this screen point would open; -1 over empty space. */
+	private panoAtPointer(clientX: number, clientY: number): number {
+		const hit = this.raycastOverview(clientX, clientY);
+		return hit ? this.nearestPanoTo(hit.point) : -1;
+	}
 
 	private onPointerLeave = () => {
 		this.pointerInside = false;
@@ -1605,7 +1678,13 @@ export class OrbitEngine {
 		// about whether it should be shown — updateCursorRing keeps owning it.
 		if (!CENTER_CURSOR) this.cursor.hide();
 	};
-	private onWindowPointerUp = () => this.peekUp();
+	// A release OUTSIDE the canvas ends the drag too — the button is up wherever it
+	// happened, and only tracking it on our own element leaves the overview cursor
+	// stood down until the next press.
+	private onWindowPointerUp = () => {
+		this.pointerDown = false;
+		this.peekUp();
+	};
 
 	private onKeyDown = (ev: KeyboardEvent) => {
 		// These listeners are on `window`, so a focused text field would otherwise have
@@ -1916,12 +1995,32 @@ export class OrbitEngine {
 		return this.raycastInteriorAll(clientX, clientY)[0] ?? null;
 	}
 
-	// The dollhouse surface point under a screen pixel (overview): raycast the
-	// visible scene root and return the first hit on a shown mesh, or null over
-	// empty space. Enter-on-click homes to the nearest capture point to this.
-	private raycastOverview(clientX: number, clientY: number): Vector3 | null {
+	// The dollhouse surface under a screen pixel (overview): raycast the scene root
+	// and return the first hit on a shown mesh, or null over empty space. Enter-on-
+	// click homes to the nearest capture point to it.
+	//
+	// The whole Intersection, not just the point: the cursor ring lies IN the
+	// surface, so it needs the face to orient against and the distance to size
+	// itself from — the same three things the interior's raycast hands back, so one
+	// SurfaceCursor can serve both.
+	//
+	// THE MESH IS RAYCAST EVEN WHEN IT IS INVISIBLE, on exactly the terms
+	// `hitIsPickable` uses inside the walkthrough: while a splat is providing the
+	// picture, `setOverviewView` hides the lite mesh under it — and that mesh is
+	// still the only thing in the scene that knows where the surfaces ARE. Honouring
+	// its visibility here meant every cell that ships a splat, which is every cell
+	// on the comparison page, answered "no geometry" to every hover and every click:
+	// the dollhouse looked solid and was not clickable anywhere.
+	private raycastOverview(
+		clientX: number,
+		clientY: number,
+	): Intersection | null {
 		const root = this.activeObjectRoot();
-		if (!root || !root.visible) return null;
+		if (!root) return null;
+		// Only the SPLAT earns the exemption. A root hidden for any other reason is
+		// hidden because nothing should be picking it.
+		const standingIn = this.splat.isActive;
+		if (!root.visible && !standingIn) return null;
 		const rect = this.canvas.getBoundingClientRect();
 		_cursorNdc.set(
 			((clientX - rect.left) / rect.width) * 2 - 1,
@@ -1931,12 +2030,15 @@ export class OrbitEngine {
 		this.cursorRay.setFromCamera(_cursorNdc, this.camera);
 		for (const h of this.cursorRay.intersectObject(root, true)) {
 			let visible = true;
-			for (let o: Object3D | null = h.object; o; o = o.parent)
+			// The walk STOPS AT the root, so a mesh hidden by the splat swap does not
+			// veto its own descendants — while anything the USER hid inside the scene
+			// still does, because that check sits below the root and runs as before.
+			for (let o: Object3D | null = h.object; o && o !== root; o = o.parent)
 				if (!o.visible) {
 					visible = false;
 					break;
 				}
-			if (visible) return h.point.clone();
+			if (visible) return h;
 		}
 		return null;
 	}
@@ -3174,8 +3276,16 @@ export class OrbitEngine {
 	// once the camera is parked exactly on the capture point, where the dollhouse
 	// render and the pano are the same view and can simply dissolve (tickCrossfade).
 	enter(index: number | null = null) {
-		if (this.mode !== "overview" || this.panos.length === 0) return;
+		// `this.move` is the flight already in progress: the mode stays "overview"
+		// for the whole fly-in, so without this a second click part-way there would
+		// start the journey again from wherever the camera had got to.
+		if (this.mode !== "overview" || this.move || this.panos.length === 0) return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
+		// Announced at the START of the journey, not on arrival. The camera is going
+		// inside from this moment, and anything sizing itself around that has 1.1
+		// seconds of flight to do it in — which is what makes the panel opening and
+		// the camera diving one movement rather than two.
+		this.setInside(true);
 		this.history = []; // a fresh interior session
 		// Requested HERE, inside the click or button press that asked to step inside,
 		// because that is the gesture the browser will honour — by the time the fly-in
@@ -3468,6 +3578,9 @@ export class OrbitEngine {
 	// the camera pulled away, then the dollhouse appeared underneath it.
 	exit() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
+		// Same moment, other direction: the way out starts here, so the row starts
+		// re-forming as the camera pulls back rather than once it has landed.
+		this.setInside(false);
 		// The overview is orbited and clicked, so it needs a cursor.
 		this.releaseLock();
 		this.director.abort();
@@ -3849,6 +3962,10 @@ export class OrbitEngine {
 
 	async loadTour(source: TourSource) {
 		this.mode = "loading";
+		// A new scene always starts outside it, and the swap can happen from
+		// anywhere — including from inside the old one, which would otherwise leave
+		// the layout held open around a scene that no longer exists.
+		this.setInside(false);
 		this.controls.enabled = false;
 		this.clearScene();
 		const token = this.loadToken;
@@ -4361,6 +4478,14 @@ export class OrbitEngine {
 			: 0;
 		this.lastFrame = time;
 
+		// FIRST, so both layers are drawn at the size they are about to be presented
+		// at. The observer only says THAT the panel changed size; this is where it
+		// gets acted on. See the ResizeObserver for what doing it there cost.
+		if (this.resizePending) {
+			this.resizePending = false;
+			this.resize();
+		}
+
 		if (this.transition) {
 			const tr = this.transition;
 			const t = Math.min(1, (now - tr.start) / tr.dur);
@@ -4748,7 +4873,85 @@ export class OrbitEngine {
 		this.sphereB.renderOrder = 1;
 	}
 
+	// The dollhouse's cursor: the same ring the walkthrough uses, laid on the mesh
+	// under the pointer, with its arrow pointing at the capture a click would open.
+	//
+	// PER FRAME, not per pointer event. The overview turns on its own (autoRotate)
+	// and under a drag, so the surface beneath a stationary pointer changes with no
+	// input to hang the work off — a hover resolved on pointermove alone would sit
+	// frozen on geometry that had rotated out from under it. The raycast is skipped
+	// on any frame where neither the pointer nor the camera has actually moved,
+	// which is most of them once the model settles.
+	private updateOverviewCursor() {
+		const aimX = this.pointerClientX;
+		const aimY = this.pointerClientY;
+		// A scene with no captures has nowhere to send a click, so it gets no cursor
+		// that says otherwise — and neither does one already being flown into
+		// (`this.move`), where the answer has been given and the ring would just ride
+		// the geometry down.
+		const active =
+			this.pointerInside &&
+			!this.pointerDown &&
+			!this.move &&
+			this.panos.length > 0;
+		if (!active) {
+			this.overviewHit = null;
+			this.overviewTarget = -1;
+			this.cursor.hide();
+			// The held pointer keeps whatever cursor it grabbed the scene with; a
+			// drag is not the moment to change what the hand looks like.
+			if (!this.pointerDown) this.canvas.style.cursor = "";
+			return;
+		}
+		const moved =
+			aimX !== this.overviewAimX ||
+			aimY !== this.overviewAimY ||
+			!this.overviewCam.equals(this.camera.position) ||
+			!this.overviewPivot.equals(this.controls.target);
+		if (moved) {
+			this.overviewAimX = aimX;
+			this.overviewAimY = aimY;
+			this.overviewCam.copy(this.camera.position);
+			this.overviewPivot.copy(this.controls.target);
+			this.overviewHit = this.raycastOverview(aimX, aimY);
+			this.overviewTarget = this.overviewHit
+				? this.nearestPanoTo(this.overviewHit.point)
+				: -1;
+		}
+		const hit = this.overviewHit;
+		// Aiming past the scene is not aiming at anything: no ring, and the plain
+		// cursor back, so the emptiness around the model reads as what it is rather
+		// than as somewhere that could be clicked.
+		this.canvas.style.cursor = hit ? "pointer" : "";
+		if (!hit) {
+			this.cursor.hide();
+			return;
+		}
+		// From the RING to the destination, not from the eye: the ring is the thing
+		// the arrow is drawn on, so "that way" has to be measured from where it lies.
+		// (The interior asks from the eye because there the two are a stride apart.)
+		// Straight down onto the capture under your feet leaves nothing in the
+		// surface to point along, and SurfaceCursor drops the arrow — correctly, that
+		// click does not move you across this surface, it moves you into it.
+		const travel =
+			this.overviewTarget >= 0
+				? _ovTravel
+						.fromArray(this.panos[this.overviewTarget].position)
+						.sub(hit.point)
+				: null;
+		this.cursor.setColor(CURSOR_CLEAR);
+		this.cursor.update(hit, this.camera, this.host.clientHeight, travel);
+	}
+
 	private updateCursorRing() {
+		// The overview is not a look mode and shares none of what follows — no
+		// reticle, no affordances, no floor scoping — so it is answered first and in
+		// full.
+		if (this.mode === "overview") {
+			this.updateOverviewCursor();
+			this.setReticle(false, false);
+			return;
+		}
 		const active =
 			this.isLookMode &&
 			!this.interiorBusy &&

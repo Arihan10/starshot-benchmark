@@ -11,10 +11,16 @@
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   /* Named for the ROLE, not the face: markup asks for `font-display` or
-     `font-sans` and the typefaces behind them can change here without touching a
-     single call site. These two are the whole system — there is no third. */
-  --font-display: var(--font-archivo);
-  --font-sans: var(--font-figtree);
+     `font-mono` and the typefaces behind them can change here without touching a
+     single call site.
+
+     `display` is the WORDMARK alone — Anton has one weight and no italic, so it
+     cannot carry a heading system even if something tried. Headings are Archivo
+     at a heavier cut, which is what `font-sans` already gives them. */
+  --font-display: var(--font-anton);
+  --font-sans: var(--font-archivo);
+  --font-mono: var(--font-plex-mono);
+  --font-serif: var(--font-instrument-serif);
 }
 
 /* No font-family here — the `font-sans` utility on <body> sets it, so the
