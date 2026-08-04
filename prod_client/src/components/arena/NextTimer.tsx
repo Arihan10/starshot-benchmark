@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { linear, useProgress } from "./useProgress";
 
 // The clock does not start with the reveal. The ratings are still counting for the
@@ -33,16 +33,32 @@ export default function NextTimer({
 }) {
 	const t = useProgress(RUN_MS, LEAD_MS, linear);
 
+	// ONCE PER ROUND, whichever gets there first.
+	//
+	// The clock and the button are two routes to the same single event, and both
+	// were live at the same time: pressing "next" a moment before the countdown
+	// ended asked for the next pair, and then the timeout — still pending, because
+	// it is only cleared when this unmounts, which is a beat after the change
+	// starts — asked for it AGAIN. Two advances land two rounds on, and with a
+	// short list that wraps straight back to the pair just left: the result clears,
+	// the moon turns, and the same two scenes are still sitting there.
+	const fired = useRef(false);
+	const advance = useCallback(() => {
+		if (fired.current) return;
+		fired.current = true;
+		onNext();
+	}, [onNext]);
+
 	useEffect(() => {
 		if (paused) return;
-		const timer = window.setTimeout(onNext, LEAD_MS + RUN_MS);
+		const timer = window.setTimeout(advance, LEAD_MS + RUN_MS);
 		return () => window.clearTimeout(timer);
-	}, [onNext, paused]);
+	}, [advance, paused]);
 
 	return (
 		<button
 			type="button"
-			onClick={onNext}
+			onClick={advance}
 			// Solid black, not a tint: everything in this bar has to be opaque or the
 			// winning scene's glow shines through the control that is supposed to be
 			// in front of it. Hovering lifts the border rather than the ground.

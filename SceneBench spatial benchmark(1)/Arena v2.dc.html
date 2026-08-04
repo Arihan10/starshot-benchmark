@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+<style>
+  html, body { height: 100%; }
+  body { margin: 0; background: #05060a; overflow-x: hidden; overflow-y: auto; }
+  a { color: #EDEDED; text-decoration: none; }
+  a:hover { color: #EDEDED; }
+  @keyframes sbFade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes sbDriftB { from { background-position: 0 0; } to { background-position: -260px 260px; } }
+</style>
+</helmet>
+<div onMouseEnter="{{ onEnter }}" onMouseLeave="{{ onLeave }}" style="width: 100%; height: 100dvh; min-height: 580px; display: flex; flex-direction: column; font-family: 'Figtree', 'Helvetica Neue', sans-serif; color: #EDEDED; position: relative; overflow: hidden; background-color: #000000">
+
+  <div style="position: absolute; inset: 0; z-index: 0; pointer-events: none; background: radial-gradient(115% 70% at 50% -22%, rgba(142,156,196,0.085), transparent 62%)"></div>
+  <div style="position: absolute; inset: 0; z-index: 0; pointer-events: none; opacity: 0.55; background-image: radial-gradient(1px 1px at 20px 30px, rgba(237,237,237,0.34), transparent 100%), radial-gradient(1px 1px at 120px 80px, rgba(237,237,237,0.24), transparent 100%), radial-gradient(1px 1px at 200px 40px, rgba(237,237,237,0.3), transparent 100%), radial-gradient(1px 1px at 60px 160px, rgba(237,237,237,0.2), transparent 100%), radial-gradient(1px 1px at 170px 210px, rgba(237,237,237,0.26), transparent 100%), radial-gradient(1px 1px at 240px 130px, rgba(237,237,237,0.18), transparent 100%); background-size: 300px 300px; animation: sbDriftB 300s linear infinite"></div>
+  <div style="position: absolute; inset: 0; z-index: 0; pointer-events: none; background: radial-gradient(100% 100% at 50% 45%, transparent 52%, rgba(0,0,0,0.55) 100%)"></div>
+
+  <a href="#generate" style="position: absolute; top: clamp(18px, 2.2vw, 40px); right: clamp(18px, 2.2vw, 40px); z-index: 4; width: clamp(206px, 21vw, 320px); height: clamp(66px, 7.4vh, 88px); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; background: #EDEDED; color: #05060a; border-radius: 3px; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(19px, 1.95vw, 26px); font-weight: 700; letter-spacing: 0.1em; text-decoration: none; transition: background 260ms ease" style-hover="background: #c9cbd1; color: #05060a">
+    <span>GENERATE</span>
+    <span style="font-size: clamp(10.5px, 0.92vw, 13px); font-weight: 500; letter-spacing: 0.16em; color: rgba(5,6,10,0.6)">YOUR OWN SCENE</span>
+  </a>
+
+  <nav style="position: relative; z-index: 2; height: clamp(96px, 11vh, 124px); flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 calc(clamp(206px, 21vw, 320px) + clamp(18px, 2.2vw, 40px) + clamp(16px, 1.8vw, 30px)) 0 clamp(24px, 3.2vw, 64px)">
+    <div style="display: flex; align-items: center; gap: clamp(12px, 1.5vw, 20px); flex: 0 1 auto; min-width: 0">
+      <div ref="{{ logoWrapRef }}" onMouseEnter="{{ logoEnter }}" onMouseLeave="{{ logoLeave }}" style="position: relative; width: clamp(74px, 6.4vw, 88px); height: clamp(74px, 6.4vw, 88px); flex: 0 0 clamp(74px, 6.4vw, 88px); cursor: pointer; transition: filter 620ms ease, transform 980ms cubic-bezier(0.35, 0, 0.25, 1)" style-hover="filter: drop-shadow(0 0 14px rgba(237,237,237,0.22)); transform: scale(1.035)">
+        <div style="position: absolute; inset: 0; background: url(&quot;./starshot_logo_jason_test_1-ms9c4s97-9dbm.png&quot;) center / contain no-repeat; filter: brightness(0) invert(1) brightness(0.929); transition: transform 980ms cubic-bezier(0.35, 0, 0.25, 1), filter 420ms ease" ref="{{ logoWhiteRef }}"></div>
+        <div ref="{{ logoColorRef }}" style="position: absolute; inset: 0; background: url(&quot;./starshot_logo_jason_test_1-ms9c4s97-9dbm.png&quot;) center / contain no-repeat"></div>
+        <div ref="{{ logoGleamRef }}" style="position: absolute; inset: 0; pointer-events: none; mix-blend-mode: screen; background-image: linear-gradient(50deg, rgba(237,237,237,0) 38%, rgba(237,237,237,0.16) 45%, rgba(237,237,237,0.95) 50%, rgba(237,237,237,0.16) 55%, rgba(237,237,237,0) 62%); background-size: 300% 300%; background-repeat: no-repeat; background-position: 100% 0%; transition: background-position 900ms cubic-bezier(0.35, 0, 0.25, 1)"></div>
+      </div><div style="display: flex; flex-direction: column; gap: 6px">
+        <span style="font-size: clamp(26px, 2.35vw, 32px); font-weight: 700; letter-spacing: 0.13em; line-height: 1; white-space: nowrap">SCENEBENCH</span>
+        <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(13.5px, 1.18vw, 16px); font-weight: 500; letter-spacing: 0.19em; color: rgba(237,237,237,0.6); white-space: nowrap">BY STARSHOT</span>
+      </div>
+      
+    </div>
+    <a href="#leaderboard" style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; position: absolute; left: 50%; transform: translateX(-50%); font-size: clamp(13px, 1.15vw, 15px); font-weight: 500; letter-spacing: 0.13em; color: rgba(237,237,237,0.7); padding: 14px 22px; white-space: nowrap" style-hover="color: #EDEDED">LEADERBOARD</a>
+
+    <div style="display: flex; align-items: center; gap: 4px; flex: 0 0 auto">
+      <a href="#about" style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(12.5px, 1.1vw, 14px); font-weight: 500; letter-spacing: 0.11em; color: rgba(237,237,237,0.64); padding: 13px clamp(12px, 1.4vw, 20px); white-space: nowrap" style-hover="color: #EDEDED">ABOUT</a>
+      <a href="#faq" style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(12.5px, 1.1vw, 14px); font-weight: 500; letter-spacing: 0.11em; color: rgba(237,237,237,0.64); padding: 13px clamp(12px, 1.4vw, 20px); white-space: nowrap" style-hover="color: #EDEDED">FAQ</a>
+    </div>
+  </nav>
+
+  
+
+  <main style="position: relative; z-index: 1; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; padding: clamp(18px, 2.6vh, 38px) clamp(26px, 3vw, 58px) clamp(14px, 2vh, 28px)">
+
+    <div style="flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: clamp(10px, 1.3vh, 18px); padding-bottom: clamp(18px, 2.8vh, 38px)">
+      <div style="display: flex; align-items: center; gap: 14px; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.72vw, 13px); letter-spacing: 0.24em; color: rgba(237,237,237,0.56)">
+        <span data-om-label="Prompt">WHO BUILT IT BETTER?</span>
+        
+        
+        
+        
+        
+        
+      </div>
+      <h1 style="margin: 0; font-size: clamp(40px, 4.1vw, 82px); font-weight: 500; letter-spacing: -0.025em; line-height: 1.02; text-align: center; text-wrap: pretty; color: #EDEDED">A modern house</h1>
+    </div>
+
+    <div ref="{{ rowRef }}" style="flex: 1 1 auto; min-height: 0; position: relative; display: grid; grid-template-columns: 1fr 1fr; gap: clamp(14px, 1.5vw, 28px)">
+
+      <div ref="{{ panelARef }}" style="position: relative; border: 1px solid rgba(237,237,237,0.10); border-radius: 3px; background: rgba(237,237,237,0.022); box-shadow: inset 0 1px 0 rgba(237,237,237,0.05); overflow: hidden">
+        <div ref="{{ mountARef }}" style="position: absolute; inset: 0"></div>
+        <div style="position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; padding: clamp(12px, 1.4vh, 18px) clamp(14px, 1.3vw, 22px); pointer-events: none">
+          <div style="display: flex; align-items: center; gap: 10px; pointer-events: none">
+            <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.74vw, 13px); font-weight: 500; letter-spacing: 0.2em; color: rgba(237,237,237,0.72)">BUILD A</span>
+            <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.7vw, 12.5px); letter-spacing: 0.16em; color: rgba(237,237,237,0.52)">{{ statusA }}</span>
+          </div>
+          <button ref="{{ expandARef }}" onClick="{{ expandA }}" title="Expand" style="pointer-events: auto; width: clamp(26px, 2.1vw, 34px); height: clamp(26px, 2.1vw, 34px); display: flex; align-items: center; justify-content: center; background: rgba(237,237,237,0.05); border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; color: rgba(237,237,237,0.6); font-size: clamp(12px, 0.95vw, 16px); line-height: 1; cursor: pointer; font-family: 'Figtree', 'Helvetica Neue', sans-serif" style-hover="background: rgba(237,237,237,0.14); color: #EDEDED">⤢</button>
+        </div>
+        <sc-if value="{{ hints }}" hint-placeholder-val="{{ true }}">
+          <div style="position: absolute; bottom: clamp(12px, 1.4vh, 18px); left: clamp(14px, 1.3vw, 22px); display: flex; gap: 14px; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.7vw, 12.5px); letter-spacing: 0.14em; color: rgba(237,237,237,0.52); pointer-events: none">
+            <span>DRAG ROTATE</span>
+            <span>SCROLL ZOOM</span>
+          </div>
+        </sc-if>
+      </div>
+
+      <div ref="{{ panelBRef }}" style="position: relative; border: 1px solid rgba(237,237,237,0.10); border-radius: 3px; background: rgba(237,237,237,0.022); box-shadow: inset 0 1px 0 rgba(237,237,237,0.05); overflow: hidden">
+        <div ref="{{ mountBRef }}" style="position: absolute; inset: 0"></div>
+        <div style="position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; padding: clamp(12px, 1.4vh, 18px) clamp(14px, 1.3vw, 22px); pointer-events: none">
+          <div style="display: flex; align-items: center; gap: 10px; pointer-events: none">
+            <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.74vw, 13px); font-weight: 500; letter-spacing: 0.2em; color: rgba(237,237,237,0.72)">BUILD B</span>
+            <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.7vw, 12.5px); letter-spacing: 0.16em; color: rgba(237,237,237,0.52)">{{ statusB }}</span>
+          </div>
+          <button ref="{{ expandBRef }}" onClick="{{ expandB }}" title="Expand" style="pointer-events: auto; width: clamp(26px, 2.1vw, 34px); height: clamp(26px, 2.1vw, 34px); display: flex; align-items: center; justify-content: center; background: rgba(237,237,237,0.05); border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; color: rgba(237,237,237,0.6); font-size: clamp(12px, 0.95vw, 16px); line-height: 1; cursor: pointer; font-family: 'Figtree', 'Helvetica Neue', sans-serif" style-hover="background: rgba(237,237,237,0.14); color: #EDEDED">⤢</button>
+        </div>
+        <sc-if value="{{ hints }}" hint-placeholder-val="{{ true }}">
+          <div style="position: absolute; bottom: clamp(12px, 1.4vh, 18px); left: clamp(14px, 1.3vw, 22px); display: flex; gap: 14px; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.7vw, 12.5px); letter-spacing: 0.14em; color: rgba(237,237,237,0.52); pointer-events: none">
+            <span>DRAG ROTATE</span>
+            <span>SCROLL ZOOM</span>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <div style="flex: 0 0 auto; min-height: clamp(84px, 11vh, 132px); display: flex; align-items: center; justify-content: center; padding-top: clamp(12px, 2.2vh, 30px)">
+
+      <sc-if value="{{ open }}" hint-placeholder-val="{{ true }}">
+        <div style="display: flex; align-items: center; gap: clamp(8px, 0.8vw, 14px)">
+          <button onClick="{{ voteA }}" style="display: flex; align-items: center; gap: 12px; padding: clamp(14px, 1.7vh, 20px) clamp(28px, 2.4vw, 44px); background: rgba(237,237,237,0.04); border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; color: #EDEDED; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(11px, 0.8vw, 14px); font-weight: 500; letter-spacing: 0.18em; cursor: pointer" style-hover="background: rgba(237,237,237,0.12); border-color: rgba(237,237,237,0.6)">
+            <span>A WINS</span>
+            <span style="font-size: clamp(9px, 0.6vw, 11px); letter-spacing: 0.1em; color: rgba(237,237,237,0.4); border: 1px solid rgba(237,237,237,0.16); border-radius: 2px; padding: 2px 6px">1</span>
+          </button>
+          <button onClick="{{ skip }}" style="display: flex; align-items: center; gap: 10px; padding: clamp(14px, 1.7vh, 20px) clamp(18px, 1.7vw, 30px); background: transparent; border: 1px solid rgba(237,237,237,0.10); border-radius: 2px; color: rgba(237,237,237,0.5); font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10.5px, 0.76vw, 13px); letter-spacing: 0.18em; cursor: pointer" style-hover="color: rgba(237,237,237,0.85); border-color: rgba(237,237,237,0.3)">
+            <span>SKIP</span>
+            <span style="font-size: clamp(9px, 0.6vw, 11px); color: rgba(237,237,237,0.34)">␣</span>
+          </button>
+          <button onClick="{{ voteTie }}" style="padding: clamp(14px, 1.7vh, 20px) clamp(20px, 1.8vw, 32px); background: transparent; border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; color: rgba(237,237,237,0.6); font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(11px, 0.8vw, 14px); letter-spacing: 0.18em; cursor: pointer" style-hover="color: #EDEDED; border-color: rgba(237,237,237,0.4)">TIE</button>
+          <button onClick="{{ voteBad }}" style="padding: clamp(14px, 1.7vh, 20px) clamp(18px, 1.7vw, 30px); background: transparent; border: 1px solid rgba(237,237,237,0.10); border-radius: 2px; color: rgba(237,237,237,0.5); font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10.5px, 0.76vw, 13px); letter-spacing: 0.18em; cursor: pointer" style-hover="color: rgba(237,237,237,0.85); border-color: rgba(237,237,237,0.3)">BOTH BAD</button>
+          <button onClick="{{ voteB }}" style="display: flex; align-items: center; gap: 12px; padding: clamp(14px, 1.7vh, 20px) clamp(28px, 2.4vw, 44px); background: rgba(237,237,237,0.04); border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; color: #EDEDED; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(11px, 0.8vw, 14px); font-weight: 500; letter-spacing: 0.18em; cursor: pointer" style-hover="background: rgba(237,237,237,0.12); border-color: rgba(237,237,237,0.6)">
+            <span>B WINS</span>
+            <span style="font-size: clamp(9px, 0.6vw, 11px); letter-spacing: 0.1em; color: rgba(237,237,237,0.4); border: 1px solid rgba(237,237,237,0.16); border-radius: 2px; padding: 2px 6px">2</span>
+          </button>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ revealed }}">
+        <div style="display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: clamp(16px, 1.6vw, 30px); width: 100%; max-width: clamp(1000px, 76vw, 1500px); animation: sbFade 260ms ease both">
+          <div style="display: flex; align-items: center; justify-content: flex-end; gap: 16px; padding: 12px 18px; border: 1px solid rgba(237,237,237,0.12); border-radius: 3px; background: rgba(237,237,237,0.03)">
+            <div style="display: flex; flex-direction: column; gap: 5px; align-items: flex-end">
+              <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.7vw, 12.5px); letter-spacing: 0.2em; color: rgba(237,237,237,0.56)">BUILD A</span>
+              <span style="font-size: clamp(17px, 1.35vw, 26px); font-weight: 500; letter-spacing: -0.01em">{{ nameA }}</span>
+            </div>
+            <sc-if value="{{ elo }}" hint-placeholder-val="{{ true }}">
+              <div style="display: flex; align-items: center; gap: 10px; padding-left: 16px; border-left: 1px solid rgba(237,237,237,0.1)">
+                <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(12px, 0.9vw, 15px); font-variant-numeric: tabular-nums; color: rgba(237,237,237,0.55)">{{ eloA }}</span>
+                <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(11px, 0.82vw, 14px); font-weight: 500; padding: 4px 8px; border-radius: 2px; background: rgba(237,237,237,0.08); color: #EDEDED">{{ deltaA }}</span>
+              </div>
+            </sc-if>
+          </div>
+
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 10px">
+            <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.72vw, 13px); letter-spacing: 0.22em; color: rgba(237,237,237,0.62)">{{ verdict }}</span>
+            <button onClick="{{ next }}" style="display: flex; align-items: center; gap: 10px; padding: clamp(13px, 1.6vh, 19px) clamp(26px, 2.2vw, 40px); background: #EDEDED; border: 1px solid #EDEDED; border-radius: 2px; color: #05060a; font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(11px, 0.8vw, 14px); font-weight: 500; letter-spacing: 0.18em; cursor: pointer" style-hover="background: #d8dae0">
+              <span>NEXT PAIR</span>
+              <span style="font-size: 9px; opacity: 0.55">␣</span>
+            </button>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: 16px; padding: 12px 18px; border: 1px solid rgba(237,237,237,0.12); border-radius: 3px; background: rgba(237,237,237,0.03)">
+            <sc-if value="{{ elo }}" hint-placeholder-val="{{ true }}">
+              <div style="display: flex; align-items: center; gap: 10px; padding-right: 16px; border-right: 1px solid rgba(237,237,237,0.1)">
+                <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(11px, 0.82vw, 14px); font-weight: 500; padding: 4px 8px; border-radius: 2px; background: rgba(237,237,237,0.08); color: #EDEDED">{{ deltaB }}</span>
+                <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(12px, 0.9vw, 15px); font-variant-numeric: tabular-nums; color: rgba(237,237,237,0.55)">{{ eloB }}</span>
+              </div>
+            </sc-if>
+            <div style="display: flex; flex-direction: column; gap: 5px">
+              <span style="font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.7vw, 12.5px); letter-spacing: 0.2em; color: rgba(237,237,237,0.56)">BUILD B</span>
+              <span style="font-size: clamp(17px, 1.35vw, 26px); font-weight: 500; letter-spacing: -0.01em">{{ nameB }}</span>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+  </main><footer style="position: relative; z-index: 1; height: clamp(52px, 5.6vh, 68px); flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; padding: 0 clamp(26px, 3vw, 58px); border-top: 1px solid rgba(237,237,237,0.08); font-family: 'Figtree', 'Helvetica Neue', sans-serif; font-size: clamp(10px, 0.68vw, 12.5px); letter-spacing: 0.16em; color: rgba(237,237,237,0.55)">
+    <div style="display: flex; align-items: center; gap: clamp(12px, 1.5vw, 20px); flex: 0 1 auto; min-width: 0">
+      <span>SCENEBENCH</span>
+      <span style="color: rgba(237,237,237,0.18)">/</span>
+      <span>SPATIAL REASONING BENCHMARK FOR LLMS</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 22px">
+      <span>{{ votes }} VOTES CAST</span>
+      <a href="#methodology" style="color: rgba(237,237,237,0.55); letter-spacing: 0.16em" style-hover="color: #EDEDED">METHODOLOGY</a>
+      <a href="#api" style="color: rgba(237,237,237,0.55); letter-spacing: 0.16em" style-hover="color: #EDEDED">API</a>
+      <a href="#github" style="color: rgba(237,237,237,0.55); letter-spacing: 0.16em" style-hover="color: #EDEDED">GITHUB</a>
+      <a href="#x" style="color: rgba(237,237,237,0.55); letter-spacing: 0.16em" style-hover="color: #EDEDED">X</a>
+    </div>
+  </footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;autoSpin&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Arena&quot;},&quot;showHints&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Arena&quot;},&quot;revealElo&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Arena&quot;}}">
+const ROUNDS = [
+  { a: { name: 'Gemini Flash 3.6', elo: 2091, variant: 'A' }, b: { name: 'Claude Opus 5', elo: 2108, variant: 'B' } },
+  { a: { name: 'Claude Opus 5', elo: 2108, variant: 'B' }, b: { name: 'GPT-5.4', elo: 2154, variant: 'A' } },
+  { a: { name: 'Llama 4.2 405B', elo: 1976, variant: 'A' }, b: { name: 'Gemini Flash 3.6', elo: 2091, variant: 'B' } },
+];
+const VERDICT = { a: 'YOUR VOTE — BUILD A', b: 'YOUR VOTE — BUILD B', tie: 'YOUR VOTE — TIE', bad: 'YOUR VOTE — BOTH BAD' };
+
+class Component extends DCLogic {
+  state = { round: 0, vote: null, votes: 12481, expanded: null };
+
+  constructor(p) {
+    super(p);
+    this.mountA = React.createRef();
+    this.mountB = React.createRef();
+    this.panelA = React.createRef();
+    this.panelB = React.createRef();
+    this.row = React.createRef();
+    this.expandABtn = React.createRef();
+    this.expandBBtn = React.createRef();
+    this.logoWrap = React.createRef();
+    this.logoColor = React.createRef();
+    this.logoWhite = React.createRef();
+    this.logoGleam = React.createRef();
+    this.hover = false;
+    this.inst = {};
+  }
+
+  async componentDidMount() {
+    document.addEventListener('keydown', this.onKey);
+    this.setupLogo();
+    try {
+      const mod = await import('./scene.js');
+      const r = ROUNDS[this.state.round];
+      this.inst.a = mod.mount(this.mountA.current, { variant: r.a.variant });
+      this.inst.b = mod.mount(this.mountB.current, { variant: r.b.variant });
+      const spin = this.props.autoSpin !== false;
+      this.inst.a.setSpin(spin); this.inst.b.setSpin(spin);
+      this.setState({ ready: true });
+    } catch (e) {
+      console.error('scene load failed', e);
+    }
+  }
+
+  componentWillUnmount() {
+    document.removeEventListener('keydown', this.onKey);
+    Object.values(this.inst).forEach(i => i && i.dispose());
+  }
+
+  setupLogo() {
+    const c = this.logoColor.current;
+    if (c) {
+      const m = 'linear-gradient(50deg, #000 0%, #000 42%, rgba(0,0,0,0) 60%, rgba(0,0,0,0) 100%)';
+      c.style.maskImage = m; c.style.webkitMaskImage = m;
+      c.style.maskSize = '220% 220%'; c.style.webkitMaskSize = '220% 220%';
+      c.style.maskRepeat = 'no-repeat'; c.style.webkitMaskRepeat = 'no-repeat';
+      c.style.maskPosition = '100% 0%'; c.style.webkitMaskPosition = '100% 0%';
+      c.style.transition = 'mask-position 980ms cubic-bezier(0.35, 0, 0.25, 1) 60ms, -webkit-mask-position 980ms cubic-bezier(0.35, 0, 0.25, 1) 60ms, transform 980ms cubic-bezier(0.35, 0, 0.25, 1)';
+    }
+    const g = this.logoGleam.current;
+    if (g) {
+      const gm = 'url("./starshot_logo_jason_test_1-ms9c4s97-9dbm.png")';
+      g.style.maskImage = gm; g.style.webkitMaskImage = gm;
+      g.style.maskSize = 'contain'; g.style.webkitMaskSize = 'contain';
+      g.style.maskPosition = 'center'; g.style.webkitMaskPosition = 'center';
+      g.style.maskRepeat = 'no-repeat'; g.style.webkitMaskRepeat = 'no-repeat';
+    }
+  }
+
+  sweepLogo(on) {
+    const p = on ? '0% 100%' : '100% 0%';
+    const c = this.logoColor.current;
+    if (c) {
+      c.style.maskPosition = p; c.style.webkitMaskPosition = p;
+      c.style.transform = on ? 'translate(2.4px, -2px)' : 'none';
+    }
+    const w = this.logoWhite.current;
+    if (w) {
+      w.style.transform = on ? 'translate(-1.2px, 1px)' : 'none';
+      // give screen-blend headroom so the band reads on the still-white half
+      w.style.filter = on ? 'brightness(0) invert(1) brightness(0.743)' : 'brightness(0) invert(1) brightness(0.929)';
+    }
+    const g = this.logoGleam.current;
+    if (g) g.style.backgroundPosition = p;
+  }
+
+  onKey = e => {
+    if (!this.hover) return;
+    const k = e.key.toLowerCase();
+    if (k === 'escape' && this.state.expanded) { this.toggle(this.state.expanded); return; }
+    if (k === 'r') { this.inst.a && this.inst.a.reset(); this.inst.b && this.inst.b.reset(); return; }
+    if (this.state.vote) {
+      if (e.key === ' ') { e.preventDefault(); this.next(); }
+      return;
+    }
+    if (k === '1') this.vote('a');
+    else if (k === '2') this.vote('b');
+    else if (k === 't') this.vote('tie');
+    else if (e.key === ' ') { e.preventDefault(); this.next(); }
+  };
+
+  vote(v) {
+    this.setState(s => ({ vote: v, votes: s.votes + 1 }));
+  }
+
+  next = () => {
+    const round = (this.state.round + 1) % ROUNDS.length;
+    const r = ROUNDS[round];
+    if (this.inst.a) this.inst.a.setVariant(r.a.variant);
+    if (this.inst.b) this.inst.b.setVariant(r.b.variant);
+    if (this.inst.a) this.inst.a.reset();
+    if (this.inst.b) this.inst.b.reset();
+    this.setState({ round, vote: null });
+  };
+
+  toggle(side) {
+    const on = this.state.expanded !== side;
+    const panel = side === 'a' ? this.panelA.current : this.panelB.current;
+    const other = side === 'a' ? this.panelB.current : this.panelA.current;
+    const btn = side === 'a' ? this.expandABtn.current : this.expandBBtn.current;
+    if (!panel || !other) return;
+    if (on) {
+      panel.style.position = 'absolute';
+      panel.style.inset = '0';
+      panel.style.zIndex = '5';
+      other.style.visibility = 'hidden';
+      if (btn) btn.textContent = '⤡';
+    } else {
+      panel.style.position = 'relative';
+      panel.style.inset = '';
+      panel.style.zIndex = '';
+      other.style.visibility = '';
+      if (btn) btn.textContent = '⤢';
+    }
+    this.setState({ expanded: on ? side : null });
+  }
+
+  renderVals() {
+    const r = ROUNDS[this.state.round];
+    const v = this.state.vote;
+    let da = 0, db = 0;
+    if (v === 'a') { da = 12; db = -12; }
+    else if (v === 'b') { da = -12; db = 12; }
+    else if (v === 'tie') { da = r.a.elo > r.b.elo ? -3 : 3; db = -da; }
+    const fmt = n => (n > 0 ? '+' + n : n < 0 ? String(n) : '±0');
+    return {
+      roundLabel: 'ROUND ' + String(this.state.round + 1).padStart(3, '0'),
+      votes: this.state.votes.toLocaleString('en-US'),
+      hints: this.props.showHints !== false,
+      elo: this.props.revealElo !== false,
+      open: !v,
+      revealed: !!v,
+      verdict: VERDICT[v] || '',
+      nameA: r.a.name,
+      nameB: r.b.name,
+      eloA: v ? r.a.elo + ' → ' + (r.a.elo + da) : '',
+      eloB: v ? r.b.elo + ' → ' + (r.b.elo + db) : '',
+      deltaA: fmt(da),
+      deltaB: fmt(db),
+      statusA: v ? r.a.name.toUpperCase() : 'ANONYMOUS',
+      statusB: v ? r.b.name.toUpperCase() : 'ANONYMOUS',
+      rowRef: this.row,
+      panelARef: this.panelA,
+      panelBRef: this.panelB,
+      mountARef: this.mountA,
+      mountBRef: this.mountB,
+      expandARef: this.expandABtn,
+      expandBRef: this.expandBBtn,
+      expandA: () => this.toggle('a'),
+      expandB: () => this.toggle('b'),
+      voteA: () => this.vote('a'),
+      voteB: () => this.vote('b'),
+      voteTie: () => this.vote('tie'),
+      voteBad: () => this.vote('bad'),
+      skip: this.next,
+      next: this.next,
+      logoWrapRef: this.logoWrap,
+      logoColorRef: this.logoColor,
+      logoWhiteRef: this.logoWhite,
+      logoGleamRef: this.logoGleam,
+      logoEnter: () => this.sweepLogo(true),
+      logoLeave: () => this.sweepLogo(false),
+      onEnter: () => { this.hover = true; },
+      onLeave: () => { this.hover = false; },
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous">
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Instrument+Serif:ital@0;1&family=Archivo:wght@500;700;800;900&family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    html,body{margin:0;padding:0;background:#000;}
+    a{color:#ffffff;text-decoration:none;} a:hover{color:#8f8f8f;}
+    input::placeholder{color:#4a4a4a;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.12em;}
+    @keyframes sb-bar{from{transform:scaleX(0);}to{transform:scaleX(1);}}
+    @keyframes sb-rise{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0px);}}
+    @media (max-width:1269px){[data-sb-moon]{margin-top:62px !important;}}
+  </style>
+</helmet>
+<div data-screen-label="Leaderboard" style="position:fixed;inset:0;background:#000;color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;overflow:hidden;display:flex;flex-direction:column;user-select:none;-webkit-user-select:none;{{inkVar}}">
+
+  <div style="position:absolute;top:0;left:0;right:0;z-index:20;display:flex;justify-content:space-between;align-items:flex-start;padding:16px 26px;pointer-events:none">
+    <div style="display:flex;align-items:center;gap:13px;pointer-events:auto">
+      <a href="./uploads/SceneBench.dc.html" style="display:flex;align-items:center;gap:13px;color:var(--ink,#ffffff)">
+        <div style="width:40px;height:40px;border-radius:50%;background:var(--ink,#ffffff)"></div>
+        <div style="display:flex;flex-direction:column;justify-content:center;gap:4px">
+          <div style="font-family:'Anton',sans-serif;font-size:20px;font-weight:400;letter-spacing:0.08em;line-height:1">SCENEBENCH</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:700;letter-spacing:0.18em;color:#6f6f6f;line-height:1">BY STARSHOT LABS</div>
+        </div>
+      </a>
+      <div style="display:flex;align-items:center;gap:22px;margin-left:22px">
+        <a href="#about" style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.18em;color:#7a7a7a;transition:color .15s ease" style-hover="color:var(--ink,#ffffff)">ABOUT</a>
+        <a href="#faq" style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.18em;color:#7a7a7a;transition:color .15s ease" style-hover="color:var(--ink,#ffffff)">FAQ</a>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:28px;pointer-events:auto">
+      <span style="color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;font-size:14px;font-weight:900;letter-spacing:0.05em;padding:10px 2px;box-shadow:inset 0 -3px 0 var(--ink,#ffffff)">LEADERBOARD</span>
+      <a href="./uploads/SceneBench.dc.html" style="background:var(--ink,#ffffff);color:#000000;font-family:'Archivo',sans-serif;font-size:15px;font-weight:900;letter-spacing:0.04em;padding:14px 22px;cursor:pointer;transition:transform .16s cubic-bezier(.2,.9,.2,1),background .16s ease" style-hover="transform:translateY(-2px);background:#e5342b;color:#ffffff" style-active="transform:translateY(0px) scale(0.96)">GENERATE YOUR OWN</a>
+    </div>
+  </div>
+
+  <div data-sb-moon="true" style="flex:0 0 auto;align-self:center;position:relative;z-index:6;pointer-events:none;width:min(clamp(380px, 230px + 17vw, 570px), max(100vw - 880px, 380px))">
+    <svg viewBox="0 0 680 132" style="display:block;width:100%;height:auto">
+      <path d="M 0 0 L 680 0 A 510 510 0 0 1 0 0 Z" style="fill:var(--ink,#ffffff)"></path>
+      <text x="340" y="28" fill="#000000" style="font-family:'IBM Plex Mono',monospace;font-size:13.5px;letter-spacing:0.24em;text-anchor:middle">CURRENT CHAMPION</text>
+    </svg>
+    {{champArc}}
+  </div>
+
+
+  <div style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column;width:min(1180px,100%);margin:0 auto;padding:0 26px;box-sizing:border-box">
+
+    <div style="flex:0 0 auto;display:flex;align-items:center;gap:22px;padding:24px 0 16px">
+      <div style="display:flex;align-items:center;gap:13px;min-width:0;flex:1 1 auto;max-width:320px;height:34px">
+        <input value="{{query}}" onChange="{{onQuery}}" onKeyDown="{{onQueryKey}}" placeholder="search model or lab…" style="background:none;border:none;border-bottom:1px solid #2a2a2a;border-radius:0;outline:none;font-family:'Archivo',sans-serif;font-size:14px;font-weight:500;letter-spacing:0.01em;color:var(--ink,#ffffff);flex:1 1 auto;min-width:0;width:100%;padding:6px 0 8px;margin:0;transition:border-color .16s ease" style-focus="border-bottom-color:var(--ink,#ffffff)">
+        <sc-if value="{{hasQuery}}" hint-placeholder-val="{{false}}">
+          <button onClick="{{clearQuery}}" style="background:none;border:none;font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:500;letter-spacing:0.2em;color:#6a6a6a;padding:6px 1px;cursor:pointer;transition:color .15s ease;flex:0 0 auto" style-hover="color:var(--ink,#ffffff)">CLEAR</button>
+        </sc-if>
+      </div>
+      <div ref="{{wrapRef}}" style="position:relative;flex:0 0 auto">
+        <button onClick="{{toggleOpen}}" style="display:flex;align-items:center;gap:11px;background:none;border:1px solid #2a2a2a;border-radius:0;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;color:var(--ink,#ffffff);height:34px;padding:0 13px;cursor:pointer;transition:border-color .16s ease" style-hover="border-color:#5f5f5f">
+          <span>{{sceneLabel}}</span>
+          <span style="font-size:9px;line-height:1;color:#7a7a7a">&#9662;</span>
+        </button>
+        <sc-if value="{{open}}" hint-placeholder-val="{{false}}">
+          <div style="position:absolute;top:calc(100% + 6px);left:0;z-index:40;width:236px;background:#0a0a0a;border:1px solid #262626;padding:5px 0;box-shadow:0 18px 40px rgba(0,0,0,0.6)">
+            <button onClick="{{pickAll}}" style="width:100%;box-sizing:border-box;display:flex;align-items:center;gap:11px;background:none;border:none;font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;letter-spacing:0.2em;padding:9px 13px;cursor:pointer;text-align:left;transition:background .14s ease,color .14s ease;color:#9a9a9a" style-hover="background:rgba(255,255,255,0.055);color:var(--ink,#ffffff)">ALL SCENES</button>
+            <div style="height:1px;background:#1c1c1c;margin:5px 0"></div>
+            <sc-for list="{{sceneOpts}}" as="sc" hint-placeholder-count="5">
+              <button onClick="{{sc.pick}}" style="width:100%;box-sizing:border-box;display:flex;align-items:center;gap:11px;background:none;border:none;font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;letter-spacing:0.2em;padding:9px 13px;cursor:pointer;text-align:left;transition:background .14s ease,color .14s ease;color:#cfcfcf" style-hover="background:rgba(255,255,255,0.055);color:var(--ink,#ffffff)">
+                <span style="width:10px;height:10px;flex:0 0 auto;border:1px solid #4a4a4a;{{sc.box}}"></span>
+                <span>{{sc.label}}</span>
+              </button>
+            </sc-for>
+          </div>
+        </sc-if>
+      </div>
+      <div style="display:flex;align-items:center;gap:20px;flex:0 0 auto;margin-left:auto">
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:400;letter-spacing:0.2em;color:#6a6a6a;text-transform:none">Sort by</span>
+        <button onClick="{{sortElo}}" style="background:none;border:none;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;padding:7px 1px;cursor:pointer;transition:color .15s ease;{{sElo}}">ELO</button>
+        <button onClick="{{sortWr}}" style="background:none;border:none;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;padding:7px 1px;cursor:pointer;transition:color .15s ease;{{sWr}}">WIN RATE</button>
+        <button onClick="{{sortVotes}}" style="background:none;border:none;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;padding:7px 1px;cursor:pointer;transition:color .15s ease;{{sVotes}}">VOTES</button>
+      </div>
+    </div>
+
+
+    <div style="flex:0 0 auto;display:grid;grid-template-columns:52px minmax(206px,1fr) 88px 96px minmax(150px,0.7fr) 92px;column-gap:18px;align-items:center;height:32px;padding:0 22px;border-bottom:1px solid #262626;font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:700;letter-spacing:0.22em;color:#5f5f5f">
+      <div>RANK</div>
+      <div>MODEL</div>
+      <div style="text-align:right">ELO</div>
+      <div style="text-align:right">DELTA (7D)</div>
+      <div style="text-align:right">WIN RATE</div>
+      <div style="text-align:right">VOTES</div>
+    </div>
+
+    <div ref="{{scrollRef}}" style="flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden">
+      <sc-for list="{{rows}}" as="row" hint-placeholder-count="8">
+
+        <sc-if value="{{row.isChamp}}" hint-placeholder-val="{{false}}">
+          <div data-sb-row="true" style="display:grid;grid-template-columns:52px minmax(206px,1fr) 88px 96px minmax(150px,0.7fr) 92px;column-gap:18px;align-items:center;height:clamp(56px,5.8vh,68px);padding:0 22px;background:var(--ink,#ffffff);color:#000000">
+            <div style="font-size:25px;font-weight:900;letter-spacing:-0.03em;font-variant-numeric:tabular-nums;line-height:1">{{row.rank}}</div>
+            <div style="min-width:0;display:flex;align-items:center;gap:13px">
+              <div style="width:30px;height:30px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border:1px solid rgba(0,0,0,0.28);font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:700;letter-spacing:0.06em;color:#000000">{{row.mark}}</div>
+              <div style="min-width:0;display:flex;flex-direction:column;gap:5px">
+                <div style="font-size:18px;font-weight:900;letter-spacing:0.005em;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{row.name}}</div>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:700;letter-spacing:0.18em;line-height:1;color:rgba(0,0,0,0.5)">{{row.lab}}</div>
+              </div>
+            </div>
+            <div style="text-align:right;font-size:21px;font-weight:800;letter-spacing:-0.02em;font-variant-numeric:tabular-nums">{{row.elo}}</div>
+            <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.06em;color:{{row.deltaInk}}">{{row.delta}}</div>
+            <div style="display:flex;align-items:center;gap:14px">
+              <div style="flex:1 1 auto;min-width:0;height:3px;background:rgba(0,0,0,0.18)">
+                <div style="height:100%;background:#000000;transform-origin:0 50%;animation:sb-bar .9s cubic-bezier(.16,1,.3,1) both;width:{{row.w}}"></div>
+              </div>
+              <div style="flex:0 0 auto;width:50px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11.5px;font-weight:700;letter-spacing:0.04em">{{row.wr}}</div>
+            </div>
+            <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11.5px;font-weight:500;letter-spacing:0.06em;color:rgba(0,0,0,0.55)">{{row.votes}}</div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{row.notChamp}}" hint-placeholder-val="{{true}}">
+          <div data-sb-row="true" style="display:grid;grid-template-columns:52px minmax(206px,1fr) 88px 96px minmax(150px,0.7fr) 92px;column-gap:18px;align-items:center;height:clamp(56px,5.8vh,68px);padding:0 22px;border-bottom:1px solid #161616;transition:background .16s ease,box-shadow .16s ease" style-hover="background:rgba(255,255,255,0.045);box-shadow:inset 3px 0 0 var(--ink,#ffffff)">
+            <div style="font-size:25px;font-weight:900;letter-spacing:-0.03em;font-variant-numeric:tabular-nums;line-height:1;color:#4f4f4f">{{row.rank}}</div>
+            <div style="min-width:0;display:flex;align-items:center;gap:13px">
+              <div style="width:30px;height:30px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border:1px solid #2f2f2f;font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:700;letter-spacing:0.06em;color:#8a8a8a">{{row.mark}}</div>
+              <div style="min-width:0;display:flex;flex-direction:column;gap:5px">
+                <div style="font-size:18px;font-weight:800;letter-spacing:0.005em;line-height:1;color:var(--ink,#ffffff);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{row.name}}</div>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:700;letter-spacing:0.18em;line-height:1;color:#5f5f5f">{{row.lab}}</div>
+              </div>
+            </div>
+            <div style="text-align:right;font-size:21px;font-weight:800;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;color:var(--ink,#ffffff)">{{row.elo}}</div>
+            <sc-if value="{{row.up}}" hint-placeholder-val="{{true}}">
+              <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.06em;color:#35c46a">{{row.delta}}</div>
+            </sc-if>
+            <sc-if value="{{row.down}}" hint-placeholder-val="{{false}}">
+              <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.06em;color:#e5342b">{{row.delta}}</div>
+            </sc-if>
+            <div style="display:flex;align-items:center;gap:14px">
+              <div style="flex:1 1 auto;min-width:0;height:3px;background:rgba(255,255,255,0.13)">
+                <div style="height:100%;background:var(--ink,#ffffff);transform-origin:0 50%;animation:sb-bar .9s cubic-bezier(.16,1,.3,1) both;width:{{row.w}}"></div>
+              </div>
+              <div style="flex:0 0 auto;width:50px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11.5px;font-weight:500;letter-spacing:0.04em;color:#cfcfcf">{{row.wr}}</div>
+            </div>
+            <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11.5px;font-weight:500;letter-spacing:0.06em;color:#6f6f6f">{{row.votes}}</div>
+          </div>
+        </sc-if>
+
+      </sc-for>
+      <sc-if value="{{empty}}" hint-placeholder-val="{{false}}">
+        <div style="display:flex;align-items:center;justify-content:center;padding:54px 22px;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.24em;color:#5f5f5f">NO MODELS MATCH THAT SEARCH</div>
+      </sc-if>
+    </div>
+
+    <div style="flex:0 0 auto;padding:0 0 16px">
+      <div style="height:44px;display:flex;align-items:center;justify-content:center">
+        <sc-if value="{{more}}" hint-placeholder-val="{{true}}">
+          <button onClick="{{loadMore}}" style="background:none;border:1px solid #2a2a2a;border-radius:0;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;color:#cfcfcf;padding:11px 28px;cursor:pointer;transition:border-color .16s ease,color .16s ease" style-hover="border-color:var(--ink,#ffffff);color:var(--ink,#ffffff)">{{moreLabel}}</button>
+        </sc-if>
+      </div>
+      <div style="display:flex;justify-content:center;padding:13px 0 0;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;color:#5f5f5f;text-align:center">{{metaLine}}</div>
+    </div>
+  </div>
+
+  <a href="./uploads/SceneBench.dc.html" style="flex:0 0 auto;height:60px;margin-top:14px;background:var(--ink,#ffffff);color:#000000;display:flex;align-items:center;justify-content:center;font-family:'Archivo',sans-serif;font-size:18px;font-weight:900;letter-spacing:0.06em;cursor:pointer;transition:letter-spacing .15s cubic-bezier(.2,.9,.2,1)" style-hover="letter-spacing:0.13em;color:#000000" style-active="letter-spacing:0.02em">ENTER THE ARENA</a>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;whiteTone&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#f2f1ed&quot;,&quot;options&quot;:[&quot;#ffffff&quot;,&quot;#f2f1ed&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;}}">
+class Component extends DCLogic {
+  state = { sort: 'elo', scenes: [], query: '', open: false, limit: null, fit: 8 };
+  STEP = 8;
+
+  SCENES = [
+    { k: 'arch', label: 'ARCHITECTURE' },
+    { k: 'land', label: 'LANDSCAPE' },
+    { k: 'int', label: 'INTERIOR' },
+    { k: 'game', label: 'GAME LEVEL' },
+    { k: 'veh', label: 'VEHICLE' },
+  ];
+
+  MODELS = [
+    { n: 'Claude Opus 4.5', lab: 'ANTHROPIC', elo: 2087, d: 18, wr: 71.4, v: 12486 },
+    { n: 'GPT-5.2', lab: 'OPENAI', elo: 2041, d: 7, wr: 68.2, v: 11930 },
+    { n: 'Gemini 3 Pro', lab: 'GOOGLE DEEPMIND', elo: 2019, d: -12, wr: 66.5, v: 12204 },
+    { n: 'Grok 4.1', lab: 'XAI', elo: 1948, d: 24, wr: 61.8, v: 8617 },
+    { n: 'Claude Sonnet 4.5', lab: 'ANTHROPIC', elo: 1902, d: -3, wr: 58.4, v: 9455 },
+    { n: 'DeepSeek V4', lab: 'DEEPSEEK', elo: 1866, d: 31, wr: 55.1, v: 6742 },
+    { n: 'Qwen 3 Max', lab: 'ALIBABA', elo: 1824, d: -9, wr: 52.6, v: 5908 },
+    { n: 'Gemini 3 Flash', lab: 'GOOGLE DEEPMIND', elo: 1790, d: 5, wr: 49.8, v: 7331 },
+    { n: 'Llama 4', lab: 'META', elo: 1742, d: -21, wr: 45.2, v: 6120 },
+    { n: 'Mistral Large 3', lab: 'MISTRAL', elo: 1698, d: 2, wr: 41.7, v: 4884 },
+    { n: 'GPT-5.2 mini', lab: 'OPENAI', elo: 1655, d: -14, wr: 38.9, v: 5207 },
+    { n: 'Kimi K2', lab: 'MOONSHOT', elo: 1601, d: 11, wr: 34.6, v: 3972 },
+    { n: 'Claude Haiku 4.5', lab: 'ANTHROPIC', elo: 1574, d: 6, wr: 32.8, v: 4310 },
+    { n: 'Grok 4 mini', lab: 'XAI', elo: 1552, d: -8, wr: 31.2, v: 3688 },
+    { n: 'DeepSeek R2', lab: 'DEEPSEEK', elo: 1531, d: 15, wr: 29.9, v: 3401 },
+    { n: 'Qwen 3 32B', lab: 'ALIBABA', elo: 1508, d: -5, wr: 28.4, v: 2955 },
+    { n: 'Nova Pro 2', lab: 'AMAZON', elo: 1486, d: 9, wr: 26.8, v: 2733 },
+    { n: 'Command A 2', lab: 'COHERE', elo: 1461, d: -11, wr: 25.1, v: 2418 },
+    { n: 'Phi-5', lab: 'MICROSOFT', elo: 1437, d: 4, wr: 23.6, v: 2190 },
+    { n: 'Llama 4 Scout', lab: 'META', elo: 1412, d: -6, wr: 22.0, v: 2077 },
+    { n: 'GLM-5', lab: 'ZHIPU', elo: 1388, d: 12, wr: 20.7, v: 1864 },
+    { n: 'Mistral Small 4', lab: 'MISTRAL', elo: 1361, d: -3, wr: 19.2, v: 1602 },
+    { n: 'Yi-Large 2', lab: '01.AI', elo: 1334, d: 7, wr: 17.8, v: 1445 },
+    { n: 'Falcon 3 180B', lab: 'TII', elo: 1302, d: -9, wr: 16.1, v: 1218 },
+  ];
+
+  setSort = (k) => this.setState({ sort: k });
+  loadMore = () => this.setState((s) => ({ limit: (s.limit ?? s.fit) + this.STEP }));
+
+  // the initial page is exactly what fits without scrolling; expanding then scrolls
+  measure = () => {
+    const el = this.scroll.current;
+    if (!el) return;
+    const row = el.querySelector('[data-sb-row]');
+    const rowH = row ? row.offsetHeight : 60;
+    const fit = Math.max(1, Math.floor(el.clientHeight / rowH));
+    if (fit !== this.state.fit) this.setState({ fit });
+  };
+  toggleOpen = () => this.setState((s) => ({ open: !s.open }));
+  pickAll = () => this.setState({ scenes: [], open: false });
+  toggleScene = (k) => this.setState((s) => ({
+    scenes: s.scenes.includes(k) ? s.scenes.filter((x) => x !== k) : s.scenes.concat(k),
+  }));
+  onDocDown = (e) => {
+    if (!this.state.open) return;
+    const w = this.wrap.current;
+    if (w && !w.contains(e.target)) this.setState({ open: false });
+  };
+  onDocKey = (e) => { if (e.key === 'Escape' && this.state.open) this.setState({ open: false }); };
+  componentDidMount() {
+    document.addEventListener('mousedown', this.onDocDown);
+    document.addEventListener('keydown', this.onDocKey);
+    this._raf = requestAnimationFrame(this.measure);
+    if (window.ResizeObserver && this.scroll.current) {
+      this._ro = new ResizeObserver(this.measure);
+      this._ro.observe(this.scroll.current);
+    }
+  }
+  componentDidUpdate() { this.measure(); }
+  componentWillUnmount() {
+    document.removeEventListener('mousedown', this.onDocDown);
+    document.removeEventListener('keydown', this.onDocKey);
+    cancelAnimationFrame(this._raf);
+    this._ro && this._ro.disconnect();
+  }
+  onQuery = (e) => this.setState({ query: e.target.value });
+  onQueryKey = (e) => { if (e.key === 'Escape') this.setState({ query: '' }); };
+  clearQuery = () => this.setState({ query: '' });
+
+  MARKS = {
+    'ANTHROPIC': 'AN', 'OPENAI': 'OA', 'GOOGLE DEEPMIND': 'GD', 'XAI': 'XA',
+    'DEEPSEEK': 'DS', 'ALIBABA': 'AL', 'MOONSHOT': 'MO', 'META': 'ME',
+    'MISTRAL': 'MI', 'AMAZON': 'AM', 'COHERE': 'CO', 'MICROSOFT': 'MS',
+    'ZHIPU': 'ZH', '01.AI': '01', 'TII': 'TI',
+  };
+
+  wrap = React.createRef();
+  scroll = React.createRef();
+
+  hash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return (h >>> 0);
+  }
+
+  // per-scene splits are derived deterministically from the model+scene name,
+  // so a scene filter re-ranks plausibly instead of showing the global table.
+  forScene(m, scene) {
+    const h = this.hash(m.n + '|' + scene);
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    return {
+      ...m,
+      elo: m.elo + ((h % 113) - 56),
+      d: ((h >>> 7) % 71) - 33,
+      wr: clamp(m.wr + (((h >>> 11) % 17) - 8) + (((h >>> 19) % 10) / 10), 21, 84),
+      v: Math.round(m.v * (0.13 + ((h >>> 15) % 11) / 62)),
+    };
+  }
+
+  renderVals() {
+    const ink = this.props.whiteTone || '#ffffff';
+    const num = (v) => v.toLocaleString('en-US');
+
+    const st = this.state;
+    const sel = st.scenes;
+    const pool = this.MODELS.map((m) => {
+      if (!sel.length) return m;
+      const parts = sel.map((k) => this.forScene(m, k));
+      const tv = parts.reduce((t, p) => t + p.v, 0) || 1;
+      return {
+        ...m,
+        elo: Math.round(parts.reduce((t, p) => t + p.elo * p.v, 0) / tv),
+        wr: parts.reduce((t, p) => t + p.wr * p.v, 0) / tv,
+        d: Math.round(parts.reduce((t, p) => t + p.d, 0) / parts.length),
+        v: parts.reduce((t, p) => t + p.v, 0),
+      };
+    });
+    const ranked = pool.slice().sort((a, b) => b.elo - a.elo).map((m, i) => ({ ...m, rank: i + 1 }));
+    const champ = ranked[0];
+    const key = st.sort;
+    const q = st.query.trim().toLowerCase();
+    const match = (m) => !q || m.n.toLowerCase().includes(q) || m.lab.toLowerCase().includes(q);
+    const cmp = key === 'wr' ? (a, b) => b.wr - a.wr : key === 'votes' ? (a, b) => b.v - a.v : (a, b) => b.elo - a.elo;
+
+    const all = ranked.filter(match).sort(cmp).map((m) => ({
+      rank: String(m.rank).padStart(2, '0'),
+      name: m.n,
+      lab: m.lab,
+      mark: this.MARKS[m.lab] || m.lab.slice(0, 2),
+      elo: m.elo,
+      delta: (m.d > 0 ? '\u25b2 ' : '\u25bc ') + Math.abs(m.d),
+      up: m.d > 0,
+      deltaInk: m.d > 0 ? '#0f7a38' : '#b52a20',
+      down: m.d <= 0,
+      wr: m.wr.toFixed(1) + '%',
+      w: m.wr.toFixed(1) + '%',
+      votes: num(m.v),
+      isChamp: m.rank === 1,
+      notChamp: m.rank !== 1,
+    }));
+    const rows = all.slice(0, st.limit ?? st.fit);
+    const rest = all.length - rows.length;
+
+    const nm = champ.n.toUpperCase();
+    const fs = Math.min(42, Math.floor(690 / (nm.length * 0.66)));
+    const champArc = React.createElement('svg',
+      { viewBox: '0 0 680 132', style: { position: 'absolute', inset: 0, width: '100%', height: '100%' } },
+      React.createElement('path', { id: 'sbChampArc', d: 'M 58 10 A 480 480 0 0 0 622 10', fill: 'none' }),
+      React.createElement('text', { fill: '#000000', style: { fontFamily: "'Archivo',sans-serif", fontWeight: 900, fontSize: fs + 'px', letterSpacing: '-0.015em' } },
+        React.createElement('textPath', { href: '#sbChampArc', startOffset: '50%', textAnchor: 'middle' }, nm)));
+
+    const on = 'color:' + ink + ';box-shadow:inset 0 -2px 0 ' + ink;
+    const off = 'color:#9a9a9a;box-shadow:inset 0 -2px 0 rgba(255,255,255,0)';
+
+    return {
+      champArc,
+      more: rest > 0,
+      moreLabel: 'LOAD ' + rest + ' MORE',
+      loadMore: this.loadMore,
+      metaLine: (q ? all.length + ' OF ' + ranked.length : ranked.length) + ' MODELS \u00b7 ' + num(pool.reduce((t, m) => t + m.v, 0)) + ' VOTES CAST',
+      query: st.query,
+      hasQuery: !!st.query,
+      onQuery: this.onQuery,
+      onQueryKey: this.onQueryKey,
+      clearQuery: this.clearQuery,
+      empty: all.length === 0,
+      wrapRef: this.wrap,
+      scrollRef: this.scroll,
+      open: st.open,
+      toggleOpen: this.toggleOpen,
+      pickAll: this.pickAll,
+      sceneLabel: sel.length === 0 ? 'ALL SCENES' : sel.length === 1 ? (this.SCENES.find((sc) => sc.k === sel[0]) || {}).label : sel.length + ' SCENES',
+      sceneOpts: this.SCENES.map((sc) => ({
+        label: sc.label,
+        pick: () => this.toggleScene(sc.k),
+        box: sel.includes(sc.k) ? 'background:' + ink + ';border-color:' + ink : 'background:transparent',
+      })),
+      rows,
+      sortElo: () => this.setSort('elo'),
+      sortWr: () => this.setSort('wr'),
+      sortVotes: () => this.setSort('votes'),
+      sElo: key === 'elo' ? on : off,
+      sWr: key === 'wr' ? on : off,
+      sVotes: key === 'votes' ? on : off,
+      inkVar: '--ink:' + ink,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

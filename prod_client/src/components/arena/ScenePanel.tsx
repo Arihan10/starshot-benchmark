@@ -6,7 +6,16 @@ import type { LocalCell } from "@/lib/localScenes";
 import PctReadout from "./PctReadout";
 import { shatter } from "./shatter";
 
-export type Outcome = "won" | "lost" | null;
+/**
+ * What the round did to this panel.
+ *
+ * `skipped` is a REVEAL WITHOUT A RESULT: declining to choose still ends the
+ * round, so the models are named and the crowd's split is shown — but nothing
+ * won and nothing lost, so neither the glow nor the shatter fires. Reading it as
+ * `null` instead would have hidden the reveal entirely, and reading it as a loss
+ * for both would have shattered two scenes nobody voted against.
+ */
+export type Outcome = "won" | "lost" | "skipped" | null;
 
 /**
  * How long the row takes to re-form around the panel being entered or left.

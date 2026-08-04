@@ -22,19 +22,32 @@ import { assetUrl, cfImageUrl } from "./r2";
 // framed and addressed. The splat then replaces it as what you actually see
 // (`loadTour` sets splatView on any scene that ships one).
 //
-// `dir` is the folder under public/; `cell` is the published cell prefix
-// (run/slot/model) its tour hangs under in the bucket. The two are separate
-// arguments because they are separate facts — the same build can be checked in
-// under any name — and they have to be kept pointing at the SAME build by hand.
-function cellSource(dir: string, cell: string): TourSource {
-	const base = `/scenes/${dir}`;
+// `cell` is the published cell prefix (run/slot/model) everything hangs under in
+// the bucket. `dir` is optional and names a folder under public/ holding a
+// CHECKED-IN COPY of that same cell's dollhouse and splat — the two files the page
+// cannot show anything without.
+//
+// Only the opening pair is worth checking in. It is what a first visit waits on,
+// so it is served from our own origin and the comparison stands up with no
+// catalog, no bucket and no orchestrator; every later round is a round the viewer
+// is already watching something during, and can stream. Cells with no `dir`
+// resolve all four asset classes from the bucket.
+//
+// The two are separate arguments because they are separate facts — the same build
+// can be checked in under any name — and they have to be kept pointing at the SAME
+// build by hand.
+function cellSource(cell: string, dir?: string): TourSource {
 	// Every walkthrough asset is named by the manifest as a bare filename relative
 	// to tour.json, and publish.py puts the whole set under one prefix — so one
 	// resolver serves panos, proxy and minimap slices alike.
 	const tour = (file: string) => assetUrl(`${cell}/tour/${file}`);
 	return {
-		dollhouseUrl: `${base}/scene-lite.glb`,
-		splatUrl: `${base}/trained.web.sog`,
+		dollhouseUrl: dir
+			? `/scenes/${dir}/scene-lite.glb`
+			: assetUrl(`${cell}/published/scene-lite.glb`),
+		splatUrl: dir
+			? `/scenes/${dir}/trained.web.sog`
+			: assetUrl(`${cell}/splat/trained.web.sog`),
 		// WITHOUT THIS THERE IS NO WALKTHROUGH. The manifest is what carries the
 		// capture points, and with none of them the scene has nowhere to put you:
 		// the dollhouse is inert, clicking it does nothing, and the cursor stands
@@ -72,39 +85,86 @@ export type LocalCell = {
 	source: TourSource;
 };
 
+/** One matchup: a prompt, the two builds of it, and how the crowd voted. */
+export type LocalRound = {
+	id: string;
+	/**
+	 * The prompt both builds were given. It lives on the ROUND rather than beside
+	 * the masthead, because it is the question this pair is an answer to — a
+	 * prompt held anywhere else can drift from the scenes under it silently.
+	 */
+	prompt: string;
+	/** Share of previous voters who picked the LEFT build. */
+	leftShare: number;
+	cells: readonly [LocalCell, LocalCell];
+};
+
 // Built ONCE at module load, never per render. OrbitViewer reloads its engine
 // whenever the source's identity changes, so rebuilding these inside a component
-// would restart both scenes on every render.
-export const LOCAL_CELLS: readonly LocalCell[] = [
+// would restart every scene on every render.
+//
+// #TODO: the run ids are pinned here, so re-running "ahhhhhhhh" under a new name
+// silently costs those cells their walkthrough (the dollhouse and splat keep
+// working, which is what makes it silent). Rounds should arrive from the server
+// carrying their own cell keys — same #TODO as `elo` and `leftShare`.
+export const LOCAL_ROUNDS: readonly LocalRound[] = [
 	{
-		id: "modern-house-gemini-flash",
-		slot: "modern-house",
-		model: "Gemini Flash",
-		elo: 2091,
-		// #TODO: the run id is pinned here, so re-running "ahhhhhhhh" under a new
-		// name silently costs both cells their walkthrough (the dollhouse and splat
-		// keep working, which is what makes it silent). The pairing should arrive
-		// from the server carrying its own cell keys — same #TODO as `elo`.
-		source: cellSource(
-			"modern-house-gemini-flash",
-			"ahhhhhhhh/modern-house/gemini-flash",
-		),
+		id: "platformer",
+		prompt: "A super mario style platformer level",
+		leftShare: 38,
+		cells: [
+			{
+				id: "modern-house-gemini-flash",
+				slot: "modern-house",
+				model: "Gemini Flash",
+				elo: 2091,
+				// The checked-in pair, and the reason it is the OPENING round: these
+				// two are the only assets a first visit waits on.
+				source: cellSource(
+					"ahhhhhhhh/modern-house/gemini-flash",
+					"modern-house-gemini-flash",
+				),
+			},
+			{
+				id: "platformer-level-opus-new",
+				slot: "platformer-level",
+				model: "Claude Opus",
+				elo: 2108,
+				source: cellSource(
+					"ahhhhhhhh/platformer-level/opus-new",
+					"platformer-level-opus-new",
+				),
+			},
+		],
 	},
 	{
-		id: "platformer-level-opus-new",
-		slot: "platformer-level",
-		model: "Claude Opus",
-		elo: 2108,
-		source: cellSource(
-			"platformer-level-opus-new",
-			"ahhhhhhhh/platformer-level/opus-new",
-		),
+		id: "hotel-room",
+		prompt: "A hotel room",
+		leftShare: 61,
+		// Streamed in full — no checked-in copy. By the time this round comes up the
+		// viewer has been looking at the previous one for a while, which is the
+		// budget these two are loaded against.
+		cells: [
+			{
+				id: "hotel-room-gemini-pro",
+				slot: "hotel-room",
+				model: "Gemini Pro",
+				elo: 2143,
+				source: cellSource("good_opus_new_hotel2/hotel-room/gemini-pro"),
+			},
+			{
+				id: "modern-house-opus-new",
+				slot: "modern-house",
+				model: "Claude Opus",
+				elo: 2108,
+				source: cellSource("ahhhhhhhh/modern-house/opus-new"),
+			},
+		],
 	},
 ];
 
-/**
- * What share of previous voters picked the LEFT build, revealed after you vote.
- * #TODO: hard-coded, and the same shape of lie as `elo` — it comes from the vote
- * tally for this pairing and should arrive with it.
- */
-export const LEFT_VOTE_SHARE = 38;
+// #TODO: BOTH ROUNDS PAIR TWO DIFFERENT PROMPTS AGAINST EACH OTHER, which is not
+// what the page claims to be showing — a matchup is supposed to be one prompt
+// built twice. These are the cells that exist with tours and splats captured, so
+// they are what the swap can be exercised against; the moment a slot has two
+// models captured, a round should be built from that instead.

@@ -230,7 +230,6 @@ const LOOK_SENSITIVITY = 0.002; // rad per pixel of locked movement — matches 
 // may already be gone and `locked` already false. Without a grace window that Esc
 // would fall through and also leave free flight — one keypress doing two things. Same
 // trick sogviewer.js uses for the same reason.
-const ESCAPE_GRACE_MS = 250;
 
 // --- zoom -------------------------------------------------------------------
 //
@@ -487,6 +486,77 @@ const _walkAlt = new Vector3();
 // destination's floor: shin, waist, brow. Enough to tell a doorway from a door and a
 // counter from a wall, few enough to stay cheap. See `walkBackFrom`.
 const WALK_HEIGHTS = [0.15, 0.5, 0.9] as const;
+// --- framing ------------------------------------------------------------------
+//
+// How far back a perspective camera has to stand, looking along `dir` at the box's
+// centre, for the WHOLE box to fit the frame — both axes, exactly.
+//
+// The overview used to stand at a multiple of the scene's largest dimension. That
+// is a fit for a roughly cubic scene and nothing else: a long flat one — the
+// platformer strip is four panels wide and barely tall — is measured by its width,
+// pushed back by its width, and then shows up as a sliver in the middle of the
+// frame, while a compact house at the same treatment fills it. Two scenes built
+// from the same prompt looked like they were photographed from different distances,
+// which is precisely the thing a comparison must not do.
+//
+// It also has to know the VIEWPORT. Each scene sits in half the window — an aspect
+// well under 1 — where the horizontal field is much narrower than the vertical, so
+// a wide scene runs out of room sideways long before the vertical fov notices.
+// `aspect` is what carries that.
+//
+// Every corner is tested rather than a bounding sphere: a sphere is the diagonal,
+// which over-measures a flat box badly and would push the camera back to frame
+// empty space around the corners.
+function fitDistance(
+	box: Box3,
+	dir: Vector3,
+	fovDeg: number,
+	aspect: number,
+): number {
+	const forward = _fitFwd.copy(dir).normalize(); // centre -> camera
+	// Any up that is not parallel to the view; the basis only has to be orthogonal,
+	// not oriented, because both axes are tested and |x| / |y| are symmetric.
+	const seed = Math.abs(forward.y) > 0.95 ? _fitAltUp : _fitUp;
+	const right = _fitRight.crossVectors(seed, forward).normalize();
+	const up = _fitCamUp.crossVectors(forward, right).normalize();
+	const centre = box.getCenter(_fitCentre);
+	const tanV = Math.tan((fovDeg * Math.PI) / 360);
+	const tanH = tanV * (aspect > 0 ? aspect : 1);
+
+	let need = 0;
+	for (let i = 0; i < 8; i++) {
+		_fitCorner
+			.set(
+				i & 1 ? box.max.x : box.min.x,
+				i & 2 ? box.max.y : box.min.y,
+				i & 4 ? box.max.z : box.min.z,
+			)
+			.sub(centre);
+		// Depth toward the camera: a corner nearer the eye needs proportionally more
+		// distance to stay inside the same angle, which is what makes this exact
+		// rather than an approximation from the centre.
+		const depth = _fitCorner.dot(forward);
+		const x = Math.abs(_fitCorner.dot(right));
+		const y = Math.abs(_fitCorner.dot(up));
+		need = Math.max(need, depth + x / tanH, depth + y / tanV);
+	}
+	return need;
+}
+
+const _fitFwd = new Vector3();
+const _fitRight = new Vector3();
+const _fitCamUp = new Vector3();
+const _fitCentre = new Vector3();
+const _fitCorner = new Vector3();
+const _fitUp = new Vector3(0, 1, 0);
+const _fitAltUp = new Vector3(0, 0, 1);
+
+// The direction the overview looks from, as a unit vector: over one shoulder and
+// down. Only the DISTANCE along it is computed per scene.
+const BROWSE_DIR = new Vector3(0.7, 0.5, 0.9).normalize();
+// Breathing room around the fit, so nothing sits hard against the frame edge.
+const BROWSE_MARGIN = 1.12;
+
 const _DOWN = new Vector3(0, -1, 0);
 const _losFrom = new Vector3();
 const _losDir = new Vector3();
@@ -650,10 +720,10 @@ export class OrbitEngine {
 		point: [number, number, number];
 		planNormal: [number, number, number] | null;
 	} | null = null;
-	// Pointer-lock state. `unlockedAt` timestamps the release so the Esc that caused
-	// it can be told apart from a later, deliberate one — see ESCAPE_GRACE_MS.
+	// Pointer-lock state. There is no longer a timestamp beside it: Escape used to
+	// need to know whether the browser's own lock exit had just consumed a press,
+	// and now that one press always means "leave", nothing asks.
 	private locked = false;
-	private unlockedAt = 0;
 	// This click was spent taking hold of the pointer, so it must not also travel.
 	private lockClickPending = false;
 	private pointerClientX = 0;
@@ -816,6 +886,9 @@ export class OrbitEngine {
 	private highlightEnabled = true;
 
 	private interiorBusy = false;
+	// An Escape that arrived while a hop was in flight. Spent the moment the hop
+	// lands — see the Escape handler.
+	private exitWhenLanded = false;
 	private savedInterior: SavedInterior | null = null;
 	private peekHeld = false;
 	// Hold-to-locate cuts the scene open along the same axis the map does — the
@@ -1104,7 +1177,6 @@ export class OrbitEngine {
 			this.dragging = false;
 			this.canvas.style.cursor = "";
 		} else {
-			this.unlockedAt = performance.now();
 		}
 		this.stopLookInertia(); // 1:1 mouse look has no coast, and neither does taking hold
 		this.emit();
@@ -1123,16 +1195,6 @@ export class OrbitEngine {
 		this.noteInput();
 	};
 
-	// Whether this Escape was spent releasing the pointer. Returns true when it was,
-	// so the caller leaves the mode alone — the first Esc buys back the cursor, and
-	// only a second one actually goes anywhere.
-	private consumeEscape(): boolean {
-		if (this.locked) {
-			this.releaseLock();
-			return true;
-		}
-		return performance.now() - this.unlockedAt < ESCAPE_GRACE_MS;
-	}
 
 	// Where the reticle sits and what a click acts on. Centred, it is the middle of
 	// the viewport regardless of the pointer; otherwise it is the pointer itself.
@@ -1725,11 +1787,11 @@ export class OrbitEngine {
 			}
 			if (ev.code === "Escape") {
 				ev.preventDefault();
-				// Two-stage exit: the first Esc hands the cursor back so the chrome is
-				// reachable, and only a second one leaves free flight. Without this the
-				// browser's own lock exit and our handler would both fire on one keypress.
-				if (this.consumeEscape()) return;
-				// Always a way back to the walkthrough, whatever the cursor is over.
+				// One press, same as everywhere else — and here it means "put me back
+				// on the ground", not "leave the scene": flight is a way of moving
+				// around inside a scene, so its Escape hands you to the nearest capture
+				// point and a second one leaves from there. Always a way back to the
+				// walkthrough, whatever the cursor happens to be over.
 				this.returnToInterior(this.nearestPanoTo(this.camera.position));
 				return;
 			}
@@ -1747,24 +1809,33 @@ export class OrbitEngine {
 			return;
 		}
 		if (ev.code === "Escape") {
-			// Escape unwinds the walkthrough one layer at a time: the pointer lock
-			// first (same two-stage rule as free flight), then whatever transient
-			// thing is running, and only once nothing is left, the walkthrough
-			// itself.
+			// ESCAPE MEANS LEAVE. One press, from wherever you are in the scene.
 			//
-			// That last step is what makes the interior two-way. Clicking the scene
-			// is the way IN and this is the only way OUT — the chrome that used to
-			// carry an "overview" button is gone, and no other key leaves the mode,
-			// so without this an entered scene is a trap.
-			if (this.consumeEscape()) return;
-			const sonar = this.markers.sonarActive;
-			const touring = !!this.director.progress;
+			// It used to unwind one layer per press — the pointer lock, then a running
+			// sonar or auto-tour, and only then the walkthrough — which reads well in
+			// a list and terribly under a hand. The layers are invisible: nothing on
+			// screen tells you how many presses you are from the way out, so the first
+			// Escape looks like it did nothing. Worse, the browser spends a press of
+			// its own on the pointer lock and another on fullscreen before ours is
+			// even consulted, so leaving could take three.
+			//
+			// Clicking the scene is the way IN and this is the only way OUT — the
+			// chrome that used to carry an "overview" button is gone — so it cannot
+			// afford to be conditional. Anything still running is simply stopped on
+			// the way past.
+			this.markers.hideSonar();
 			this.yieldTour();
-			if (sonar) {
-				this.markers.hideSonar();
-				this.emit();
+			// A hop between capture points holds `interiorBusy` for about half a
+			// second, and `exit` refuses while it is up — so an Escape pressed during
+			// one used to vanish, which is the same complaint by another route. The
+			// journey is hurried to its landing and the exit runs the moment it
+			// arrives, so the press is always spent on leaving.
+			if (this.interiorBusy) {
+				this.exitWhenLanded = true;
+				this.hurryMove(160);
+			} else {
+				this.exit();
 			}
-			if (!sonar && !touring) this.exit();
 			return;
 		}
 		if (this.interiorBusy || ev.repeat) return;
@@ -3175,6 +3246,15 @@ export class OrbitEngine {
 			};
 		}
 		this.activate(mv.index);
+		// LEAVING BEATS THE QUEUE. An Escape taken mid-hop is spent here, ahead of
+		// any buffered click — travelling on to somewhere the viewer asked for
+		// before they asked to leave would strand them one hop further in.
+		if (this.exitWhenLanded) {
+			this.exitWhenLanded = false;
+			this.pendingTravel = null;
+			this.exit();
+			return;
+		}
 		// Input buffering: run the most recent queued click as one journey.
 		const next = this.pendingTravel;
 		this.pendingTravel = null;
@@ -3927,6 +4007,7 @@ export class OrbitEngine {
 		this.crossfade = null; // a dissolve queued for a scene that's now gone
 		this.clearPanoOverlay();
 		this.interiorBusy = false;
+		this.exitWhenLanded = false;
 		this.peekHeld = false;
 		this.savedInterior = null;
 		this.renderer.clippingPlanes = [];
@@ -4183,10 +4264,16 @@ export class OrbitEngine {
 
 		this.markers.build(this.sceneMaxDim, this.metrics);
 
-		const dist = this.sceneMaxDim * 1.6;
+		// FRAMED TO THE SCENE, not to a multiple of one of its dimensions — so a
+		// wide flat level and a compact house both arrive filling the panel, which is
+		// the only way two builds can be compared by eye. See `fitDistance`.
 		this.browsePos
 			.copy(this.sceneCenter)
-			.add(new Vector3(dist * 0.7, dist * 0.5, dist * 0.9));
+			.addScaledVector(
+				BROWSE_DIR,
+				fitDistance(box, BROWSE_DIR, OVERVIEW_FOV, this.camera.aspect) *
+					BROWSE_MARGIN,
+			);
 		this.camera.position.copy(this.browsePos);
 		this.camera.fov = OVERVIEW_FOV;
 		this.camera.lookAt(this.sceneCenter);

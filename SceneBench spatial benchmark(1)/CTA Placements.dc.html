@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  body { margin: 0; background: #0a0a0c; }
+  a { color: #EDEDED; text-decoration: none; }
+  a:hover { color: #ffffff; }
+</style>
+</helmet>
+
+<section style="padding: 56px; display: flex; flex-direction: column; gap: 30px; font-family: 'Figtree', 'Helvetica Neue', sans-serif; background: #0a0a0c">
+
+  <div style="display: flex; flex-direction: column; gap: 10px; max-width: 1180px">
+    <div style="display: flex; align-items: baseline; gap: 14px; color: rgba(237,237,237,0.4); font-size: 11px; letter-spacing: 0.18em">
+      <span style="color: #EDEDED">TURN 2</span>
+      <span>WHERE THE GENERATE CTA GOES — 4 PLACEMENTS</span>
+    </div>
+    <p style="margin: 0; font-size: 14.5px; line-height: 1.65; color: rgba(237,237,237,0.62); max-width: 880px; text-wrap: pretty">Schematics of the live arena at a 1440×900 viewport. The hard constraint is that nothing scrolls, so every placement is scored by the height it takes from the two canvases — currently the largest element on the page. Arena page untouched; say a number and I'll build it there.</p>
+  </div>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 34px; align-items: flex-start">
+
+    <div id="2a" style="display: flex; flex-direction: column; gap: 12px; width: 560px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="background: #EDEDED; color: #0a0a0c; font-size: 10px; font-weight: 600; letter-spacing: 0.14em; padding: 4px 8px; border-radius: 2px">2a</span>
+        <span style="color: #EDEDED; font-size: 13px; font-weight: 600; letter-spacing: 0.02em">Dedicated bar above the footer</span>
+        <span style="margin-left: auto; font-size: 10px; letter-spacing: 0.16em; color: rgba(237,237,237,0.4)">−77px CANVAS</span>
+      </div>
+
+      <div style="position: relative; width: 560px; height: 350px; background: #05060a; border: 1px solid rgba(237,237,237,0.1); border-radius: 3px; overflow: hidden; display: flex; flex-direction: column">
+        <div style="position: absolute; left: 50%; top: -402px; width: 450px; height: 450px; border-radius: 50%; transform: translateX(-50%); background: radial-gradient(circle at 50% 44%, #EDEDED 0%, #DCDDE1 88%, #A4A7AE 100%)"></div>
+        <div style="position: relative; flex: 0 0 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-size: 8px; letter-spacing: 0.14em; color: rgba(237,237,237,0.55); mix-blend-mode: difference">
+          <span>SCENEBENCH</span>
+          <span>ABOUT · LEADERBOARD · FAQ · GENERATE</span>
+        </div>
+        <div style="position: relative; flex: 0 0 42px; display: flex; align-items: center; justify-content: center; font-family: 'Archivo', sans-serif; font-size: 19px; font-weight: 500; color: #EDEDED">A modern house.</div>
+        <div style="flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 16px">
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+        </div>
+        <div style="flex: 0 0 40px; display: flex; align-items: center; justify-content: center; gap: 6px">
+          <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 12px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">A WINS</span>
+          <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 9px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">SKIP</span>
+          <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 9px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">TIE</span>
+          <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 12px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">B WINS</span>
+        </div>
+        <div style="flex: 0 0 30px; display: flex; align-items: center; gap: 10px; padding: 0 16px; border-top: 1px solid rgba(237,237,237,0.1); background: rgba(237,237,237,0.035); outline: 1px solid rgba(237,237,237,0.4); outline-offset: -1px">
+          <span style="font-family: 'Archivo', sans-serif; font-size: 9px; font-weight: 600; color: #EDEDED; white-space: nowrap">Want to generate your own?</span>
+          <span style="flex: 1 1 auto; border-bottom: 1px solid rgba(237,237,237,0.2); padding-bottom: 3px; font-size: 7.5px; color: rgba(237,237,237,0.34)">Describe a scene…</span>
+          <span style="background: #EDEDED; color: #05060a; border-radius: 2px; padding: 4px 9px; font-size: 7px; font-weight: 600; letter-spacing: 0.1em">GENERATE ↗</span>
+        </div>
+        <div style="flex: 0 0 26px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-top: 1px solid rgba(237,237,237,0.08); font-size: 7px; letter-spacing: 0.14em; color: rgba(237,237,237,0.4)">
+          <span>SCENEBENCH</span><span>METHODOLOGY · API · GITHUB</span>
+        </div>
+      </div>
+      <p style="margin: 0; font-size: 12.5px; line-height: 1.6; color: rgba(237,237,237,0.55)">Loudest and most obvious — a full-width band that reads as its own moment. Costs the most canvas height, and sits after the vote controls so it competes with them for the eye.</p>
+    </div>
+
+    <div id="2b" style="display: flex; flex-direction: column; gap: 12px; width: 560px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="background: #EDEDED; color: #0a0a0c; font-size: 10px; font-weight: 600; letter-spacing: 0.14em; padding: 4px 8px; border-radius: 2px">2b</span>
+        <span style="color: #EDEDED; font-size: 13px; font-weight: 600; letter-spacing: 0.02em">Merged into the footer bar</span>
+        <span style="margin-left: auto; font-size: 10px; letter-spacing: 0.16em; color: rgba(237,237,237,0.4)">−0px CANVAS</span>
+      </div>
+
+      <div style="position: relative; width: 560px; height: 350px; background: #05060a; border: 1px solid rgba(237,237,237,0.1); border-radius: 3px; overflow: hidden; display: flex; flex-direction: column">
+        <div style="position: absolute; left: 50%; top: -402px; width: 450px; height: 450px; border-radius: 50%; transform: translateX(-50%); background: radial-gradient(circle at 50% 44%, #EDEDED 0%, #DCDDE1 88%, #A4A7AE 100%)"></div>
+        <div style="position: relative; flex: 0 0 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-size: 8px; letter-spacing: 0.14em; color: rgba(237,237,237,0.55); mix-blend-mode: difference">
+          <span>SCENEBENCH</span>
+          <span>ABOUT · LEADERBOARD · FAQ · GENERATE</span>
+        </div>
+        <div style="position: relative; flex: 0 0 42px; display: flex; align-items: center; justify-content: center; font-family: 'Archivo', sans-serif; font-size: 19px; font-weight: 500; color: #EDEDED">A modern house.</div>
+        <div style="flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 16px">
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+        </div>
+        <div style="flex: 0 0 40px; display: flex; align-items: center; justify-content: center; gap: 6px">
+          <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 12px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">A WINS</span>
+          <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 9px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">SKIP</span>
+          <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 9px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">TIE</span>
+          <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 12px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">B WINS</span>
+        </div>
+        <div style="flex: 0 0 27px; display: flex; align-items: center; gap: 9px; padding: 0 16px; border-top: 1px solid rgba(237,237,237,0.1); outline: 1px solid rgba(237,237,237,0.4); outline-offset: -1px">
+          <span style="font-family: 'Archivo', sans-serif; font-size: 8px; font-weight: 600; color: #EDEDED; white-space: nowrap">Generate your own</span>
+          <span style="flex: 1 1 auto; border-bottom: 1px solid rgba(237,237,237,0.2); padding-bottom: 2px; font-size: 7px; color: rgba(237,237,237,0.34)">Describe a scene…</span>
+          <span style="background: #EDEDED; color: #05060a; border-radius: 2px; padding: 3px 7px; font-size: 7px; font-weight: 700">↗</span>
+          <span style="font-size: 6.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.34); white-space: nowrap">API · GITHUB</span>
+        </div>
+      </div>
+      <p style="margin: 0; font-size: 12.5px; line-height: 1.6; color: rgba(237,237,237,0.55)">The footer already spans the width and is already the page's utility strip — absorbing the CTA into it costs nothing. Trade-off: footers get ignored, so this is the quietest option.</p>
+    </div>
+
+    <div id="2c" style="display: flex; flex-direction: column; gap: 12px; width: 560px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="background: #EDEDED; color: #0a0a0c; font-size: 10px; font-weight: 600; letter-spacing: 0.14em; padding: 4px 8px; border-radius: 2px">2c</span>
+        <span style="color: #EDEDED; font-size: 13px; font-weight: 600; letter-spacing: 0.02em">Under the prompt, as its counterpart</span>
+        <span style="margin-left: auto; font-size: 10px; letter-spacing: 0.16em; color: rgba(237,237,237,0.4)">−57px CANVAS</span>
+      </div>
+
+      <div style="position: relative; width: 560px; height: 350px; background: #05060a; border: 1px solid rgba(237,237,237,0.1); border-radius: 3px; overflow: hidden; display: flex; flex-direction: column">
+        <div style="position: absolute; left: 50%; top: -402px; width: 450px; height: 450px; border-radius: 50%; transform: translateX(-50%); background: radial-gradient(circle at 50% 44%, #EDEDED 0%, #DCDDE1 88%, #A4A7AE 100%)"></div>
+        <div style="position: relative; flex: 0 0 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-size: 8px; letter-spacing: 0.14em; color: rgba(237,237,237,0.55); mix-blend-mode: difference">
+          <span>SCENEBENCH</span>
+          <span>ABOUT · LEADERBOARD · FAQ · GENERATE</span>
+        </div>
+        <div style="position: relative; flex: 0 0 40px; display: flex; align-items: center; justify-content: center; font-family: 'Archivo', sans-serif; font-size: 19px; font-weight: 500; color: #EDEDED">A modern house.</div>
+        <div style="position: relative; flex: 0 0 22px; display: flex; align-items: center; justify-content: center; padding: 0 16px">
+          <div style="display: flex; align-items: center; gap: 10px; width: 330px; padding: 3px 4px 3px 12px; border: 1px solid rgba(237,237,237,0.22); border-radius: 999px; background: rgba(237,237,237,0.03); outline: 1px solid rgba(237,237,237,0.4); outline-offset: 3px">
+            <span style="font-size: 7.5px; color: rgba(237,237,237,0.75); white-space: nowrap">Want to generate your own?</span>
+            <span style="flex: 1 1 auto; font-size: 7.5px; color: rgba(237,237,237,0.3)">Describe a scene…</span>
+            <span style="background: #EDEDED; color: #05060a; border-radius: 999px; width: 13px; height: 13px; display: flex; align-items: center; justify-content: center; font-size: 7px; font-weight: 700">↗</span>
+          </div>
+        </div>
+        <div style="flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 16px">
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+        </div>
+        <div style="flex: 0 0 40px; display: flex; align-items: center; justify-content: center; gap: 6px">
+          <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 12px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">A WINS</span>
+          <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 9px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">SKIP</span>
+          <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 9px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">TIE</span>
+          <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 12px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">B WINS</span>
+        </div>
+        <div style="flex: 0 0 26px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-top: 1px solid rgba(237,237,237,0.08); font-size: 7px; letter-spacing: 0.14em; color: rgba(237,237,237,0.4)">
+          <span>SCENEBENCH</span><span>METHODOLOGY · API · GITHUB</span>
+        </div>
+      </div>
+      <p style="margin: 0; font-size: 12.5px; line-height: 1.6; color: rgba(237,237,237,0.55)">Sits directly under the prompt it mirrors: "here's the prompt they got — want to set one?" Highest-attention spot on the page and it reads as one thought with the headline. Pill keeps it from feeling like a second toolbar.</p>
+    </div>
+
+    <div id="2d" style="display: flex; flex-direction: column; gap: 12px; width: 560px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="background: #EDEDED; color: #0a0a0c; font-size: 10px; font-weight: 600; letter-spacing: 0.14em; padding: 4px 8px; border-radius: 2px">2d</span>
+        <span style="color: #EDEDED; font-size: 13px; font-weight: 600; letter-spacing: 0.02em">In the vote row's dead space</span>
+        <span style="margin-left: auto; font-size: 10px; letter-spacing: 0.16em; color: rgba(237,237,237,0.4)">−0px CANVAS</span>
+      </div>
+
+      <div style="position: relative; width: 560px; height: 350px; background: #05060a; border: 1px solid rgba(237,237,237,0.1); border-radius: 3px; overflow: hidden; display: flex; flex-direction: column">
+        <div style="position: absolute; left: 50%; top: -402px; width: 450px; height: 450px; border-radius: 50%; transform: translateX(-50%); background: radial-gradient(circle at 50% 44%, #EDEDED 0%, #DCDDE1 88%, #A4A7AE 100%)"></div>
+        <div style="position: relative; flex: 0 0 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-size: 8px; letter-spacing: 0.14em; color: rgba(237,237,237,0.55); mix-blend-mode: difference">
+          <span>SCENEBENCH</span>
+          <span>ABOUT · LEADERBOARD · FAQ · GENERATE</span>
+        </div>
+        <div style="position: relative; flex: 0 0 42px; display: flex; align-items: center; justify-content: center; font-family: 'Archivo', sans-serif; font-size: 19px; font-weight: 500; color: #EDEDED">A modern house.</div>
+        <div style="flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 16px">
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+          <div style="border: 1px solid rgba(237,237,237,0.12); border-radius: 2px; background: rgba(237,237,237,0.02)"></div>
+        </div>
+        <div style="flex: 0 0 40px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 16px">
+          <div style="display: flex; align-items: center; gap: 6px">
+            <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 11px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">A WINS</span>
+            <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 8px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">SKIP</span>
+            <span style="border: 1px solid rgba(237,237,237,0.1); border-radius: 2px; padding: 5px 8px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.45)">TIE</span>
+            <span style="border: 1px solid rgba(237,237,237,0.22); border-radius: 2px; padding: 5px 11px; font-size: 7.5px; letter-spacing: 0.14em; color: rgba(237,237,237,0.8)">B WINS</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; padding: 4px 5px 4px 11px; border: 1px solid rgba(237,237,237,0.16); border-radius: 2px; outline: 1px solid rgba(237,237,237,0.4); outline-offset: 3px">
+            <span style="font-size: 7.5px; color: rgba(237,237,237,0.7); white-space: nowrap">Generate your own</span>
+            <span style="width: 80px; border-bottom: 1px solid rgba(237,237,237,0.2); padding-bottom: 2px; font-size: 7.5px; color: rgba(237,237,237,0.3)">Describe…</span>
+            <span style="background: #EDEDED; color: #05060a; border-radius: 2px; padding: 3px 7px; font-size: 7.5px; font-weight: 700">↗</span>
+          </div>
+        </div>
+        <div style="flex: 0 0 26px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-top: 1px solid rgba(237,237,237,0.08); font-size: 7px; letter-spacing: 0.14em; color: rgba(237,237,237,0.4)">
+          <span>SCENEBENCH</span><span>METHODOLOGY · API · GITHUB</span>
+        </div>
+      </div>
+      <p style="margin: 0; font-size: 12.5px; line-height: 1.6; color: rgba(237,237,237,0.55)">The vote row is centred with ~300px of empty space either side; the CTA fills the right edge for free. Costs no height, but crowds the voting moment and breaks the row's symmetry.</p>
+    </div>
+  </div>
+
+  <div style="max-width: 880px; padding: 18px 22px; border: 1px solid rgba(237,237,237,0.12); border-radius: 3px; background: rgba(237,237,237,0.025)">
+    <p style="margin: 0; font-size: 13px; line-height: 1.65; color: rgba(237,237,237,0.72); text-wrap: pretty"><span style="color: #EDEDED; font-weight: 600">Recommendation: <a href="#2c">2c</a>.</span> The prompt is already the page's hero, and a person reading "A modern house." is exactly the person who wants to type their own. It borrows the headline's attention instead of competing for new attention, and it is the cheapest real estate on the page for something this prominent. <a href="#2b">2b</a> is the fallback if you want zero canvas loss.</p>
+  </div>
+</section>
+</x-dc>
+</body>
+</html>

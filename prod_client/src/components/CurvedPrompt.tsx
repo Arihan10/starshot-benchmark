@@ -30,25 +30,41 @@ const CENTRE = VB / 2;
 // SMALL ON PURPOSE. Every unit of inset lifts the line off the bottom of the disc
 // (a concentric circle's lowest point is exactly INSET above the disc's lowest
 // point), and the masthead band is only as tall as the navbar — so a generous
-// inset walks the prompt straight up into the label above it. This is a little
-// under 3% of the diameter: enough to clear the limb with the descenders, little
-// enough to leave the line sitting low on the disc where the moon is widest.
-const INSET = 29;
+// inset walks the prompt straight up into the label above it. This is 2% of the
+// diameter, and the floor is set by the DESCENDERS, not the baseline: at FONT_MAX
+// they hang roughly 8 units below it, which still leaves a clear dozen units of
+// moon under the tail of a "y" before the limb runs out.
+const INSET = 20;
 
 // How much of the circle the line may use, each side of the bottom. The limit is
-// not the moon — it is the BAND: the disc is clipped to the masthead, so past
-// this the baseline climbs out of the visible cap and the ends of the prompt
-// would be set on black rather than on the moon.
-const HALF_SPAN_DEG = 30;
+// not the moon — it is the BAND: the disc is clipped to the masthead, so past this
+// the baseline climbs out of the visible cap and the ends of the prompt would be
+// set on black rather than on the moon. It also has to stop short of the label
+// above it, which is what sets this rather than the geometry.
+const HALF_SPAN_DEG = 24;
 
-// The size range, in viewBox units — so, as thousandths of the moon's diameter. A
-// short prompt gets FONT_MAX and stops there; without a ceiling "A house" would
+// The size range, in viewBox units — so, as thousandths of the moon's diameter.
+//
+// LENGTH IS WHAT SIZES THE PROMPT, not the moon. The arc is a fixed run of a fixed
+// circle, so a longer prompt has exactly one way to fit on it: set smaller. That
+// is the whole of the rule — the disc never grows to accommodate a sentence, and
+// the masthead stays the same object whatever anyone types.
+//
+// A short prompt gets FONT_MAX and stops there; without a ceiling "A house" would
 // inflate to fill the arc and dwarf everything around it. A long one shrinks to
 // FONT_MIN and no further, below which the prompt is no longer the thing you read
 // first; past that the tail clips, which is the honest failure and better than
 // type nobody can read.
-const FONT_MAX = 46;
-const FONT_MIN = 21;
+//
+// THE CEILING IS THE SPREAD. Only short prompts ever reach it — anything past
+// about six words fits at its own natural size well below — so this number is not
+// "how big is the prompt", it is "how much bigger is a two-word prompt than a
+// twelve-word one". Set high, the masthead changed scale every round; the moon and
+// the label around it stayed put while the one line between them swung, and the
+// page looked like it was zooming rather than turning. Lowering it tightens that
+// spread and leaves the long prompts, which never touched it, exactly as they were.
+const FONT_MAX = 38;
+const FONT_MIN = 17;
 
 // Leave the arc's last few percent empty at both ends. Text run to the very tip
 // sits where the curve is steepest and reads as falling off the edge.

@@ -1,6 +1,13 @@
 "use client";
 
-import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import {
+	useCallback,
+	useEffect,
+	useImperativeHandle,
+	useRef,
+	useState,
+	type Ref,
+} from "react";
 import type { TourSource } from "@/lib/orbit/types";
 import type { Scene } from "@/lib/scenes";
 import ArrivalToast from "./orbit/ArrivalToast";
@@ -113,6 +120,48 @@ export default function OrbitViewer({
 		void enterFullscreen();
 	}, [inside, landed, supported, enterFullscreen]);
 
+	// LEAVING FULLSCREEN LEAVES THE SCENE — because the browser will not let us do
+	// this any other way.
+	//
+	// Escape is the way out of the walkthrough, and the engine listens for it. But
+	// while a page is fullscreen, Chrome CONSUMES the Escape that exits fullscreen
+	// and never dispatches it to the document: the keydown handler is not called,
+	// cannot be called, and no amount of work in it will help. The first press
+	// therefore only shrank the window, and a viewer who meant "get me out" was
+	// still standing in the scene wondering why nothing happened.
+	//
+	// So the exit is taken from the fullscreen state itself, which is the one signal
+	// that press does produce. `leftDeliberately` is what keeps the ⛶ control
+	// meaning what it says: pressing it is a request about the WINDOW, and must not
+	// also throw away the place you are standing in.
+	const leftDeliberately = useRef(false);
+	const toggleFullscreen = useCallback(() => {
+		if (isFullscreen) leftDeliberately.current = true;
+		toggle();
+	}, [isFullscreen, toggle]);
+
+	// A TRANSITION out of fullscreen, not merely the absence of it. Entering a scene
+	// sets `inside` a full second before the screen is taken, so a rule that read
+	// "not fullscreen while inside" would fire on the way IN and ask the engine to
+	// leave the moment the dive began. (It would be refused — `exit` wants the
+	// walkthrough to have landed — but a correctness that rests on someone else's
+	// guard is one edit away from not holding.) Only a viewer who HAD the screen
+	// can hand it back.
+	const hadScreen = useRef(false);
+	useEffect(() => {
+		if (isFullscreen) {
+			hadScreen.current = true;
+			return;
+		}
+		if (!inside || !hadScreen.current) return;
+		hadScreen.current = false;
+		if (leftDeliberately.current) {
+			leftDeliberately.current = false;
+			return;
+		}
+		engineRef.current?.exit();
+	}, [isFullscreen, inside, engineRef]);
+
 	// Coming out, the screen goes back FIRST: the parent is not told the camera has
 	// left until it has, so whatever the parent does about it — the comparison page
 	// re-forms its row — happens on a page that is already its normal size again.
@@ -173,7 +222,9 @@ export default function OrbitViewer({
 		<div ref={rootRef} className='group relative h-full w-full bg-black'>
 			<div ref={hostRef} className='absolute inset-0' />
 
-			{supported && <FullscreenButton isFullscreen={isFullscreen} onToggle={toggle} />}
+			{supported && (
+				<FullscreenButton isFullscreen={isFullscreen} onToggle={toggleFullscreen} />
+			)}
 
 			{/* --- inside the scene ------------------------------------------------
 			    The walkthrough's aids, faded out as ONE GROUP the moment the camera

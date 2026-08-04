@@ -32,6 +32,120 @@ body {
   color: var(--foreground);
 }
 
+/* THE STARSHOT NOD, in two parts: a gleam travels the length of the wordmark and
+   leaves a spark at the far corner. It runs with the mark's own lighting sweep, so
+   reaching for the lockup lights the glass and polishes the name in one gesture.
+
+   IT IS LIGHT, NOT AN OBJECT. An earlier version sent a star across the word —
+   a shape passing in FRONT of type you were trying to read, so the thing being
+   read kept disappearing behind it. This is a glow ON the letterforms instead:
+   nothing is ever covered, the word simply lights up as the light reaches it.
+
+   WHAT MOVES IS THE MASK, not a colour. The overlay is the word in white with a
+   bloom around it, and a soft-edged window travels along it — so the letters are
+   lit and haloed inside the window and untouched outside it. Sweeping a coloured
+   band through the glyphs instead (the first attempt) tinted the type as it went,
+   which reads as mis-registered printing rather than as light. */
+@keyframes wordmark-glow {
+  0% {
+    -webkit-mask-position: 100% 50%;
+    mask-position: 100% 50%;
+    opacity: 0;
+  }
+  18% {
+    opacity: 1;
+  }
+  82% {
+    opacity: 1;
+  }
+  100% {
+    -webkit-mask-position: 0% 50%;
+    mask-position: 0% 50%;
+    opacity: 0;
+  }
+}
+
+/* And where the gleam runs out, it leaves a spark — the one moment the nod is a
+   STAR rather than a shine. Off in the corner above the last letter, so it is
+   something noticed rather than something read through. */
+@keyframes star-twinkle {
+  0% {
+    opacity: 0;
+    transform: scale(0) rotate(-40deg);
+  }
+  45% {
+    opacity: 1;
+    transform: scale(1) rotate(10deg);
+  }
+  70% {
+    opacity: 0.9;
+    transform: scale(0.82) rotate(26deg);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.15) rotate(58deg);
+  }
+}
+
+/* THE PROMPT RIDES THE MOON, and the moon is a wheel. The prompt's SVG is the
+   disc's own square box (see CurvedPrompt), so a rotation about its centre carries
+   the words ALONG THE LIMB rather than sliding them across it — the one path a
+   line written on a sphere can travel.
+
+   ONE TURN, THREE PARTS, ALL THE SAME DIRECTION. The outgoing prompt is carried up
+   and off the visible cap; the surface keeps turning while nothing is legible; the
+   next prompt comes round from the other side and slows into place. The old text
+   used to be cut instantly at the swap, which broke the illusion at the one moment
+   it mattered — a wheel does not teleport its cargo, it takes it with it.
+
+   The angles are shared: 40° out, 40° in, so the moon's own texture turns 80° over
+   the whole cycle and everything on the disc stays rigidly related. */
+@keyframes prompt-roll-out {
+  0% {
+    opacity: 1;
+    transform: rotate(0deg);
+  }
+  70% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+    transform: rotate(40deg);
+  }
+}
+
+/* And in from the far side, decelerating: the turn is nearly spent by the time the
+   words are legible, so what you read is a wheel settling rather than text flying
+   in. The same keyframes on a linear ease would read as a mechanism being cranked.
+   The lit disc underneath never moves, and neither does the question printed above
+   it — only the surface and what is written on it come round. */
+@keyframes prompt-settle {
+  0% {
+    opacity: 0;
+    transform: rotate(-40deg);
+  }
+  26% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+    transform: rotate(0deg);
+  }
+}
+
+/* The surface, turning with them. Accelerating out of rest and decelerating into
+   it — one continuous 80° so the craters that were under the old prompt are gone
+   by the time the new one arrives, which is what makes the cycle legible as
+   ROTATION rather than as a caption change. */
+@keyframes moon-cycle {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(80deg);
+  }
+}
+
 /* Arena: the vote result rising into place — the percentage and the reveal cards
    both arrive this way, so the two readouts read as one moment. */
 @keyframes arena-rise {

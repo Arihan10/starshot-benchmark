@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type Ref } from "react";
 import { easeExpo, useProgress } from "./useProgress";
 
 // The reveal is staged rather than shown at once: the rating counts to its new
@@ -25,12 +25,15 @@ export default function RevealCard({
 	delta,
 	won,
 	align,
+	ref,
 }: {
 	model: string;
 	elo: number;
 	delta: number;
 	won: boolean;
 	align: "left" | "right";
+	/** The bar measures this card to size both of its sides. See VoteBar. */
+	ref?: Ref<HTMLDivElement>;
 }) {
 	const t = useProgress(COUNT_MS, COUNT_DELAY_MS, easeExpo);
 	const [showHistory, setShowHistory] = useState(false);
@@ -42,10 +45,19 @@ export default function RevealCard({
 
 	const live = Math.round(delta * t);
 	const sign = live > 0 ? `+${live}` : live < 0 ? String(live) : "±0";
+	// THE CHIP IS HELD AT ITS FINAL WIDTH from the first frame. It counts "±0" up
+	// to "+12", which is a character longer — so left to itself the chip grows
+	// mid-count, and with it the whole card. That shifts the row under a reader
+	// who is watching a number, and it moves the card's width a second after the
+	// bar has already measured it and sized both sides (see VoteBar). Tabular
+	// figures make `ch` an exact per-digit advance, so reserving the ending
+	// string's length is exact rather than approximate.
+	const settled = delta > 0 ? `+${delta}` : delta < 0 ? String(delta) : "±0";
 
 	const chip = (
 		<span
-			className={`rounded-xs border px-2 py-1 font-sans text-[clamp(10px,0.85vw,15px)] font-medium tabular-nums ${
+			style={{ minWidth: `${settled.length}ch` }}
+			className={`inline-block rounded-xs border px-2 py-1 text-center font-sans text-[clamp(10px,0.85vw,15px)] font-medium tabular-nums ${
 				delta > 0
 					? "border-background/25 bg-background text-foreground"
 					: "border-foreground/25 bg-transparent"
@@ -57,6 +69,14 @@ export default function RevealCard({
 
 	return (
 		<div
+			ref={ref}
+			// `min-w-max` IS THE NO-TRUNCATION RULE. The card fills its half of the bar
+			// (`w-full`) but is never allowed narrower than its own content, so a long
+			// model name pushes the card wider instead of losing its tail — and the bar
+			// reads that width back off it to size both sides (see VoteBar). Between
+			// them, the two mean the row fits whatever it is given rather than cropping
+			// it to fit.
+			//
 			// Full width of its half, and its content pushed APART: the model name
 			// sits at the outer edge of the screen and the rating toward the middle,
 			// so the two cards frame the control between them instead of floating in
@@ -67,14 +87,14 @@ export default function RevealCard({
 			// which puts the light in front of the control instead of behind it. The
 			// loser's card still recedes; it does it by dropping its contrast, not by
 			// letting the picture through.
-			className={`flex w-full items-center justify-between gap-[clamp(12px,1.6vw,28px)] rounded-xs border px-[clamp(14px,1.8vw,30px)] py-[clamp(10px,1.3vh,18px)] transition-colors duration-500 ${
+			className={`flex w-full min-w-max items-center justify-between gap-[clamp(12px,1.6vw,28px)] rounded-xs border px-[clamp(14px,1.8vw,30px)] py-[clamp(10px,1.3vh,18px)] transition-colors duration-500 ${
 				won
 					? "border-foreground bg-foreground text-background"
 					: "border-white/10 bg-background text-foreground/40"
 			} ${align === "right" ? "flex-row-reverse" : ""}`}
 			style={{ animation: "arena-rise 320ms ease both" }}
 		>
-			<div className={`flex min-w-0 flex-col gap-1 ${align === "right" ? "items-end" : ""}`}>
+			<div className={`flex flex-col gap-1 ${align === "right" ? "items-end" : ""}`}>
 				<span className="font-sans text-[clamp(9px,0.7vw,12px)] font-medium tracking-[0.2em] opacity-60">
 					BUILT BY
 				</span>
@@ -82,7 +102,7 @@ export default function RevealCard({
 				    wordmark's Anton, which has one weight and a poster's proportions —
 				    a model name set in it would announce itself louder than the site
 				    does. This is a result, so it is the interface face, set hard. */}
-				<span className="truncate font-sans text-[clamp(14px,1.35vw,24px)] font-extrabold tracking-[-0.015em] uppercase">
+				<span className="font-sans text-[clamp(14px,1.35vw,24px)] font-extrabold tracking-[-0.015em] whitespace-nowrap uppercase">
 					{model}
 				</span>
 			</div>

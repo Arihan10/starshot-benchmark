@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous">
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Instrument+Serif:ital@0;1&family=Archivo:wght@500;700;800;900&family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    html{scroll-snap-type:y mandatory;scroll-behavior:smooth;}
+    html,body{margin:0;padding:0;background:#000;overflow-x:clip;}
+    section{scroll-snap-align:start;scroll-snap-stop:always;}
+    a{color:#ffffff;text-decoration:none;} a:hover{color:#8f8f8f;}
+    @keyframes sb-roll{from{transform:translateY(-152vh);}to{transform:translateY(0);}}
+    @keyframes sb-spin-in{from{transform:rotate(-274deg);}to{transform:rotate(0deg);}}
+    @keyframes sb-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+    @keyframes sb-rise{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0px);}}
+    @keyframes sb-shoot{0%{transform:rotate(38deg) translateX(-30vw);opacity:0;}2%{opacity:.9;}13%{opacity:.9;}18%{transform:rotate(38deg) translateX(122vw);opacity:0;}100%{transform:rotate(38deg) translateX(122vw);opacity:0;}}
+    @keyframes sb-nudge{0%,100%{transform:translateY(0);}50%{transform:translateY(5px);}}
+    @media (max-width:860px){
+      [data-sb-moon]{opacity:0.24 !important;}
+      [data-sb-copy]{width:auto !important;max-width:none !important;}
+    }
+    @media (max-width:720px){
+      [data-sb-nav-cta]{font-size:13px !important;padding:11px 15px !important;}
+      [data-sb-nav-lead]{font-size:13px !important;}
+    }
+    @media (max-width:560px){[data-sb-nav-links]{display:none !important;}}
+  </style>
+</helmet>
+<div data-screen-label="About" style="position:relative;min-height:100vh;background:#000;color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;{{inkVar}}">
+
+  <div aria-hidden="true" style="position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none">
+    <div style="position:absolute;top:-6%;left:-14%;width:210px;height:1px;background:linear-gradient(90deg,rgba(242,241,237,0) 0%,rgba(242,241,237,0.85) 62%,rgba(242,241,237,0) 100%);transform-origin:0 50%;animation:sb-shoot 17s linear 0s infinite"></div>
+    <div style="position:absolute;top:12%;left:-22%;width:150px;height:1px;background:linear-gradient(90deg,rgba(242,241,237,0) 0%,rgba(242,241,237,0.55) 62%,rgba(242,241,237,0) 100%);transform-origin:0 50%;animation:sb-shoot 23s linear 6.5s infinite"></div>
+    <div style="position:absolute;top:-14%;left:18%;width:260px;height:1px;background:linear-gradient(90deg,rgba(242,241,237,0) 0%,rgba(242,241,237,0.7) 62%,rgba(242,241,237,0) 100%);transform-origin:0 50%;animation:sb-shoot 29s linear 13s infinite"></div>
+    <div style="position:absolute;top:30%;left:-10%;width:120px;height:1px;background:linear-gradient(90deg,rgba(242,241,237,0) 0%,rgba(242,241,237,0.45) 62%,rgba(242,241,237,0) 100%);transform-origin:0 50%;animation:sb-shoot 21s linear 18.5s infinite"></div>
+    <div style="position:absolute;top:-2%;left:46%;width:180px;height:1px;background:linear-gradient(90deg,rgba(242,241,237,0) 0%,rgba(242,241,237,0.6) 62%,rgba(242,241,237,0) 100%);transform-origin:0 50%;animation:sb-shoot 34s linear 25s infinite"></div>
+  </div>
+
+  <div ref="{{moonRef}}" data-sb-moon="true" style="position:fixed;left:0;top:0;z-index:1;width:360px;transform-origin:50% 50%;pointer-events:none;will-change:transform">
+    <div style="width:100%;animation:sb-roll 1.6s cubic-bezier(.16,1,.3,1) both;{{moonDyn}}">
+      <div style="width:100%;animation:sb-spin-in 1.6s cubic-bezier(.16,1,.3,1) both,sb-spin 150s linear 1.6s infinite">
+        <svg viewBox="0 0 400 400" style="display:block;width:100%;height:auto">
+          <circle cx="200" cy="200" r="200" style="fill:var(--ink,#ffffff)"></circle>
+          <ellipse cx="148" cy="132" rx="46" ry="38" fill="rgba(0,0,0,0.055)"></ellipse>
+          <circle cx="254" cy="248" r="54" fill="rgba(0,0,0,0.045)"></circle>
+          <circle cx="116" cy="268" r="27" fill="rgba(0,0,0,0.06)"></circle>
+          <circle cx="288" cy="116" r="18" fill="rgba(0,0,0,0.05)"></circle>
+          <circle cx="206" cy="332" r="12" fill="rgba(0,0,0,0.05)"></circle>
+          <circle cx="86" cy="186" r="9" fill="rgba(0,0,0,0.05)"></circle>
+          <circle cx="200" cy="200" r="151" fill="none" stroke="rgba(0,0,0,0.045)" stroke-width="1"></circle>
+          <circle cx="200" cy="200" r="93" fill="none" stroke="rgba(0,0,0,0.032)" stroke-width="1"></circle>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <div style="position:fixed;top:0;left:0;right:0;z-index:20;display:flex;justify-content:space-between;align-items:flex-start;padding:16px 26px;pointer-events:none">
+    <div style="display:flex;align-items:center;gap:13px;pointer-events:auto">
+      <a href="./uploads/SceneBench.dc.html" style="display:flex;align-items:center;gap:13px;color:var(--ink,#ffffff)">
+        <div style="width:40px;height:40px;border-radius:50%;background:var(--ink,#ffffff)"></div>
+        <div style="display:flex;flex-direction:column;justify-content:center;gap:4px">
+          <div style="font-family:'Anton',sans-serif;font-size:20px;font-weight:400;letter-spacing:0.08em;line-height:1">SCENEBENCH</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:700;letter-spacing:0.18em;color:#6f6f6f;line-height:1">BY STARSHOT LABS</div>
+        </div>
+      </a>
+      <div data-sb-nav-links="true" style="display:flex;align-items:center;gap:22px;margin-left:22px">
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.18em;color:var(--ink,#ffffff)">ABOUT</span>
+        <a href="#faq" style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.18em;color:#7a7a7a;transition:color .15s ease" style-hover="color:var(--ink,#ffffff)">FAQ</a>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:28px;pointer-events:auto">
+      <a href="./Leaderboard.dc.html" data-sb-nav-lead="true" style="color:var(--ink,#ffffff);font-family:'Archivo',sans-serif;font-size:14px;font-weight:900;letter-spacing:0.05em;padding:10px 2px;box-shadow:inset 0 -3px 0 rgba(255,255,255,0);transition:box-shadow .18s ease" style-hover="box-shadow:inset 0 -3px 0 var(--ink,#ffffff);color:var(--ink,#ffffff)">LEADERBOARD</a>
+      <a href="./uploads/SceneBench.dc.html" data-sb-nav-cta="true" style="background:var(--ink,#ffffff);color:#000000;font-family:'Archivo',sans-serif;font-size:15px;font-weight:900;letter-spacing:0.04em;padding:14px 22px;cursor:pointer;transition:transform .16s cubic-bezier(.2,.9,.2,1),background .16s ease" style-hover="transform:translateY(-2px);background:#e5342b;color:#ffffff" style-active="transform:translateY(0px) scale(0.96)">GENERATE YOUR OWN</a>
+    </div>
+  </div>
+
+  <section style="position:relative;z-index:2;height:100vh;min-height:100vh;box-sizing:border-box;overflow:hidden;display:flex;align-items:center;justify-content:flex-end;padding:68px clamp(26px,3vw,58px) 40px">
+    <div data-sb-copy="true" style="width:min(620px,54vw);max-height:100%;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:clamp(10px,2.6vh,30px)">
+
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.26em;color:#6a6a6a;animation:sb-rise .6s cubic-bezier(.16,1,.3,1) .15s both">ABOUT SCENEBENCH</div>
+
+      <div style="font-family:'Instrument Serif',serif;font-style:italic;font-size:clamp(27px,3.6vw,56px);font-weight:400;line-height:1.04;letter-spacing:-0.01em;color:var(--ink,#ffffff);text-wrap:pretty;animation:sb-rise .6s cubic-bezier(.16,1,.3,1) .24s both">How well can a language model build in 3D?</div>
+
+      <div style="font-family:'Archivo',sans-serif;font-size:clamp(13px,1.1vw,16.5px);font-weight:500;line-height:1.55;color:#a8a8a8;max-width:540px;text-wrap:pretty;animation:sb-rise .6s cubic-bezier(.16,1,.3,1) .32s both">LLMs inherently think in terms of text — a one-dimensional ordered sequence of words. How will they fare when asked to construct omnidirectional 3D scenes, a fundamentally different modality?<br><br>SceneBench places different LLMs in a harness we engineered in-house here at Starshot Labs, and asks them to build the same scene from the same prompt, while the actual 3D generation is taken care of by our foundational model. Due to the subjective and creative nature of 3D generation, we want&nbsp;<i>your</i>&nbsp;votes to decide which LLMs reign at the top, and which ones feed at the bottom.<br><br>You might be thinking: "of course the smarter, larger models will do better!" But some of the results might surprise you!</div>
+
+      <div style="display:flex;flex-direction:column;gap:clamp(7px,1.4vh,16px);max-width:540px;animation:sb-rise .6s cubic-bezier(.16,1,.3,1) .4s both">
+        <div style="display:grid;grid-template-columns:34px minmax(0,1fr);column-gap:16px;align-items:baseline;border-top:1px solid #1c1c1c;padding-top:clamp(7px,1.3vh,14px)">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.16em;color:#5f5f5f">01</div>
+          <div style="font-family:'Archivo',sans-serif;font-size:clamp(13px,1vw,15px);font-weight:500;line-height:1.5;color:#c9c9c9"><span style="font-weight: 900; letter-spacing: 0.02em;">PROMPT.</span>&nbsp;Both models are given the same prompt, selected across a variety of different scene kinds, from buildings to game levels.</div>
+        </div>
+        <div style="display:grid;grid-template-columns:34px minmax(0,1fr);column-gap:16px;align-items:baseline;border-top:1px solid #1c1c1c;padding-top:clamp(7px,1.3vh,14px)">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.16em;color:#5f5f5f">02</div>
+          <div style="font-family:'Archivo',sans-serif;font-size:clamp(13px,1vw,15px);font-weight:500;line-height:1.5;color:#c9c9c9"><span style="font-weight: 900; letter-spacing: 0.02em;">BUILD.</span> Two models generate the scene independently. Neither sees the other's work, and both utilize Starshot's in-house 3D generation model.</div>
+        </div>
+        <div style="display:grid;grid-template-columns:34px minmax(0,1fr);column-gap:16px;align-items:baseline;border-top:1px solid #1c1c1c;padding-top:clamp(7px,1.3vh,14px)">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.16em;color:#5f5f5f">03</div>
+          <div style="font-family:'Archivo',sans-serif;font-size:clamp(13px,1vw,15px);font-weight:500;line-height:1.5;color:#c9c9c9"><span style="font-weight:900;letter-spacing:0.02em">VOTE.</span> You pick the better build. Ratings update after every vote and feed the public leaderboard.</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="position:absolute;left:clamp(26px,3vw,58px);bottom:22px;display:flex;flex-direction:column;align-items:center;gap:7px;pointer-events:none;animation:sb-rise .6s cubic-bezier(.16,1,.3,1) .8s both">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:700;letter-spacing:0.26em;color:#4f4f4f">SCROLL</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#4f4f4f;animation:sb-nudge 2.4s ease-in-out infinite">&#8595;</div>
+    </div>
+  </section>
+
+  <section style="position:relative;z-index:2;height:100vh;min-height:100vh;box-sizing:border-box;overflow:hidden;display:flex;align-items:center;justify-content:flex-start;padding:68px clamp(26px,3vw,58px) 40px">
+    <div data-sb-copy="true" style="width:min(620px,54vw);max-height:100%;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:clamp(10px,2.6vh,30px)">
+
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.26em;color:#6a6a6a">WHO WE ARE</div>
+
+      <div style="font-family:'Instrument Serif',serif;font-style:italic;font-size:clamp(32px,4vw,56px);font-weight:400;line-height:1.04;letter-spacing:-0.01em;color:var(--ink,#ffffff);text-wrap:pretty">Starshot Labs builds foundation models for 3D.</div>
+
+      <div style="font-family:'Archivo',sans-serif;font-size:clamp(14px,1.1vw,16.5px);font-weight:500;line-height:1.62;color:#a8a8a8;max-width:540px;text-wrap:pretty">We are a research team working on generative 3D: models that turn language into geometry, layout, and the relationships between objects in a scene.<br><br>SceneBench grew out of our own evaluation work. We needed a way to compare how language models reason about space, and head-to-head voting gave us a clearer signal than any rubric we wrote ourselves. We made it public because the same question is open for everyone building in this space.</div>
+
+      <div style="display:flex;align-items:center;gap:clamp(16px,2vw,28px);flex-wrap:wrap;padding-top:clamp(2px,1vh,8px)">
+        <a href="#starshot" style="display:flex;align-items:center;gap:10px;background:var(--ink,#ffffff);color:#000000;font-family:'Archivo',sans-serif;font-size:15px;font-weight:900;letter-spacing:0.04em;padding:14px 22px;cursor:pointer;transition:transform .16s cubic-bezier(.2,.9,.2,1),background .16s ease" style-hover="transform:translateY(-2px);background:#e5342b;color:#ffffff" style-active="transform:translateY(0px) scale(0.96)">STARSHOT LABS <span style="font-size:13px">&#8599;</span></a>
+        <a href="./Leaderboard.dc.html" style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.22em;color:#9a9a9a;padding:7px 1px;box-shadow:inset 0 -1px 0 rgba(255,255,255,0.18);transition:color .15s ease,box-shadow .15s ease" style-hover="color:var(--ink,#ffffff);box-shadow:inset 0 -1px 0 var(--ink,#ffffff)">VIEW THE LEADERBOARD</a>
+      </div>
+    </div>
+  </section>
+
+  <section style="position:relative;z-index:2;height:100vh;min-height:100vh;box-sizing:border-box;overflow:hidden;display:flex;flex-direction:column;align-items:center;padding:clamp(120px,18vh,200px) clamp(26px,3vw,58px) 0">
+    <div style="width:min(880px,100%);display:flex;flex-direction:column;align-items:center;gap:clamp(18px,3vh,34px);text-align:center">
+
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.26em;color:#6a6a6a">GET STARTED</div>
+
+      <div style="font-family:'Instrument Serif',serif;font-style:italic;font-size:clamp(34px,4.4vw,60px);font-weight:400;line-height:1.04;letter-spacing:-0.01em;color:var(--ink,#ffffff)">Two ways in.</div>
+
+      <div style="width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:clamp(12px,1.4vw,20px);padding-top:clamp(6px,1.5vh,18px)">
+        <a href="./uploads/SceneBench.dc.html" style="display:flex;flex-direction:column;align-items:flex-start;gap:9px;background:var(--ink,#ffffff);color:#000000;padding:clamp(22px,3vh,32px) clamp(22px,2.4vw,32px);text-align:left;cursor:pointer;transition:transform .18s cubic-bezier(.2,.9,.2,1)" style-hover="transform:translateY(-3px);color:#000000">
+          <span style="font-family:'Archivo',sans-serif;font-size:clamp(18px,1.8vw,24px);font-weight:900;letter-spacing:0.03em">VOTE ON SCENES</span>
+          <span style="font-family:'Archivo',sans-serif;font-size:14px;font-weight:500;line-height:1.5;color:rgba(0,0,0,0.62)">Compare two builds of the same prompt and pick the one that gets the space right.</span>
+        </a>
+        <a href="./uploads/SceneBench.dc.html" style="display:flex;flex-direction:column;align-items:flex-start;gap:9px;background:transparent;border:1px solid #2f2f2f;color:var(--ink,#ffffff);padding:clamp(22px,3vh,32px) clamp(22px,2.4vw,32px);text-align:left;cursor:pointer;transition:transform .18s cubic-bezier(.2,.9,.2,1),border-color .18s ease" style-hover="transform:translateY(-3px);border-color:var(--ink,#ffffff);color:var(--ink,#ffffff)">
+          <span style="font-family:'Archivo',sans-serif;font-size:clamp(18px,1.8vw,24px);font-weight:900;letter-spacing:0.03em">GENERATE YOUR OWN</span>
+          <span style="font-family:'Archivo',sans-serif;font-size:14px;font-weight:500;line-height:1.5;color:#8f8f8f">Describe any scene and watch two models build it head to head.</span>
+        </a>
+      </div>
+    </div>
+  </section>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;whiteTone&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#f2f1ed&quot;,&quot;options&quot;:[&quot;#ffffff&quot;,&quot;#f2f1ed&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;moonScale&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:1,&quot;min&quot;:0.7,&quot;max&quot;:1.4,&quot;step&quot;:0.05,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Layout&quot;}}">
+class Component extends DCLogic {
+  moon = React.createRef();
+
+  componentDidMount() {
+    this.apply();
+    window.addEventListener('scroll', this.tick, { passive: true });
+    window.addEventListener('resize', this.apply);
+  }
+  componentWillUnmount() {
+    window.removeEventListener('scroll', this.tick);
+    window.removeEventListener('resize', this.apply);
+    cancelAnimationFrame(this._raf);
+  }
+
+  tick = () => {
+    if (this._raf) return;
+    this._raf = requestAnimationFrame(() => { this._raf = 0; this.apply(); });
+  };
+
+  // three parked positions: left of the copy, right of the copy, then rising
+  // into the bottom of the last screen with only its top cap showing.
+  apply = () => {
+    const el = this.moon.current;
+    if (!el) return;
+    const W = window.innerWidth, H = window.innerHeight;
+    const D = Math.max(240, Math.min(0.46 * H, 0.44 * W, 560));
+    const big = Math.max(1.35 * W, 1.1 * H, 980);
+    el.style.width = D + 'px';
+
+    const stops = [
+      { x: 0.26 * W, y: 0.52 * H, k: 1 },
+      { x: 0.74 * W, y: 0.5 * H, k: 1 },
+      { x: 0.5 * W, y: H + big / 2 - 0.3 * H, k: big / D },
+    ];
+
+    const t = Math.max(0, Math.min(2, (window.scrollY || 0) / Math.max(1, H)));
+    const i = t < 1 ? 0 : 1;
+    const f = t - i;
+    const u = f * f * (3 - 2 * f);
+    const a = stops[i], b = stops[i + 1];
+    const x = a.x + (b.x - a.x) * u;
+    const y = a.y + (b.y - a.y) * u;
+    const k = a.k + (b.k - a.k) * u;
+
+    el.style.transform = 'translate(' + (x - D / 2) + 'px,' + (y - D / 2) + 'px) scale(' + k + ')';
+  };
+
+  renderVals() {
+    const ink = this.props.whiteTone || '#ffffff';
+    const scale = Number(this.props.moonScale ?? 1);
+    return {
+      moonRef: this.moon,
+      inkVar: '--ink:' + ink,
+      moonDyn: scale === 1 ? '' : 'transform-origin:50% 50%;scale:' + scale,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

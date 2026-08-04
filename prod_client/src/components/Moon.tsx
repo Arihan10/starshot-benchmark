@@ -20,24 +20,6 @@ const SPIN_SECONDS = 260;
 const SURFACE =
 	"radial-gradient(circle at 50% 44%, #EDEDED 0%, #E8E8EA 68%, #D7D8DC 88%, #BDBFC5 96.5%, #A4A7AE 100%)";
 
-// THE HALO, and it is always on. Without it the disc meets the page at a hard
-// vector edge — a shape cut out of the black rather than a lit body sitting in it.
-//
-// Three stops, not one: a single blur of any radius decays too evenly and reads as
-// a ring hovering off the limb. Stacking a tight bright one, a mid, and a very wide
-// faint one approximates how light actually falls away, so there is no radius at
-// which the eye can find where the glow "ends".
-//
-// Radii are FRACTIONS OF THE DIAMETER (via --moon-d) so the falloff stays in
-// proportion as the viewport resizes the disc — a fixed px blur is a halo on a
-// small screen and a hairline on a large one. Cool-tinted rather than white: this
-// is light coming off a grey body into a black sky, and a neutral glow beside the
-// faintly warm surface reads as a lens artifact instead.
-const GLOW = [
-	"0 0 calc(var(--moon-d) * 0.045) rgba(226,233,247,0.30)",
-	"0 0 calc(var(--moon-d) * 0.13) rgba(198,212,240,0.15)",
-	"0 0 calc(var(--moon-d) * 0.30) rgba(170,190,228,0.07)",
-].join(", ");
 
 // Craters as polar coordinates rather than hand-written percentages: they are
 // placed on a RING, all the way round, so the rotation always has fresh ones to
@@ -47,19 +29,49 @@ const GLOW = [
 //
 // `deg` is measured clockwise from the bottom of the disc, `dist` is percent of
 // the radius from centre, `size` is the crater radius in px on the disc.
+// DENSER THAN IT NEEDS TO BE TO LOOK LIKE A MOON, because it also has to look
+// like a moon that TURNS. A sparse surface is a fine still image and a poor
+// wheel: with only a dozen soft dishes on it, an 80° rotation moves almost
+// nothing the eye can hold onto, and the disc reads as sitting still while its
+// caption changes. Landmarks at mixed sizes and mixed spacings are what let you
+// see that the same face is not in front of you any more.
 const CRATERS: { deg: number; dist: number; size: number; alpha: number }[] = [
 	{ deg: 0, dist: 46, size: 46, alpha: 0.115 },
+	{ deg: 12, dist: 38, size: 18, alpha: 0.1 },
 	{ deg: 22, dist: 43, size: 30, alpha: 0.125 },
+	{ deg: 35, dist: 49, size: 22, alpha: 0.09 },
 	{ deg: 48, dist: 47, size: 38, alpha: 0.1 },
+	{ deg: 61, dist: 40, size: 16, alpha: 0.12 },
 	{ deg: 75, dist: 41, size: 54, alpha: 0.085 },
+	{ deg: 92, dist: 48, size: 20, alpha: 0.105 },
 	{ deg: 104, dist: 45, size: 26, alpha: 0.09 },
+	{ deg: 118, dist: 39, size: 33, alpha: 0.08 },
 	{ deg: 133, dist: 44, size: 60, alpha: 0.075 },
+	{ deg: 148, dist: 49, size: 19, alpha: 0.11 },
 	{ deg: 162, dist: 47, size: 34, alpha: 0.105 },
+	{ deg: 176, dist: 40, size: 24, alpha: 0.095 },
 	{ deg: 195, dist: 42, size: 44, alpha: 0.095 },
+	{ deg: 210, dist: 48, size: 17, alpha: 0.115 },
 	{ deg: 228, dist: 46, size: 28, alpha: 0.115 },
+	{ deg: 243, dist: 39, size: 36, alpha: 0.08 },
 	{ deg: 261, dist: 43, size: 50, alpha: 0.08 },
+	{ deg: 278, dist: 48, size: 21, alpha: 0.1 },
 	{ deg: 295, dist: 47, size: 32, alpha: 0.1 },
+	{ deg: 312, dist: 41, size: 15, alpha: 0.12 },
 	{ deg: 330, dist: 44, size: 40, alpha: 0.09 },
+	{ deg: 346, dist: 49, size: 25, alpha: 0.085 },
+];
+
+// THE BRIGHT ONES. A young crater throws pale ejecta out around itself, and on a
+// grey body that is the highest-contrast thing there is — which makes these the
+// features you actually track as the surface turns. Kept few: they are landmarks,
+// and a sky full of landmarks has none.
+const BRIGHT: { deg: number; dist: number; size: number; alpha: number }[] = [
+	{ deg: 40, dist: 44, size: 26, alpha: 0.5 },
+	{ deg: 127, dist: 47, size: 17, alpha: 0.42 },
+	{ deg: 205, dist: 41, size: 30, alpha: 0.38 },
+	{ deg: 288, dist: 45, size: 20, alpha: 0.46 },
+	{ deg: 342, dist: 38, size: 14, alpha: 0.44 },
 ];
 
 // A few craters get a rim instead of a soft dish — the mix is what stops the
@@ -107,6 +119,10 @@ function place(deg: number, dist: number): string {
 // Earlier layers paint on top, so the order here is smallest-first: the rims and
 // dishes sit ON the plains rather than the plains washing over them.
 const CRATER_LAYERS = [
+	...BRIGHT.map(
+		(b) =>
+			`radial-gradient(circle ${b.size}px at ${place(b.deg, b.dist)}, rgba(255,255,255,${b.alpha}) 0%, rgba(255,255,255,${(b.alpha * 0.4).toFixed(3)}) 42%, transparent 100%)`,
+	),
 	...RIMMED.map(
 		(c) =>
 			`radial-gradient(circle ${c.size + 6}px at ${place(c.deg, c.dist)}, transparent 0 ${c.size}px, rgba(9,11,16,${c.alpha}) ${c.size}px ${c.size + 2}px, rgba(9,11,16,${(c.alpha * 0.35).toFixed(3)}) ${c.size + 2}px ${c.size + 5}px, transparent ${c.size + 5}px)`,
@@ -137,9 +153,10 @@ const CRATER_LAYERS = [
 const GRAIN =
 	"url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='moon-grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23moon-grain)' opacity='0.14'/%3E%3C/svg%3E\")";
 
-// Both layers hang off the same box and anchor the same way — the disc's bottom
-// edge on the bottom of whatever box it is given. Shared so the halo cannot drift
-// out of register with the body casting it.
+// The disc hangs off the box it is given by its BOTTOM edge — which is the same
+// anchoring CurvedPrompt uses for its viewBox, and that identity is what makes the
+// two curves one curve. Changing it here without changing it there silently
+// unpins the prompt from the limb.
 const ANCHOR =
 	"pointer-events-none absolute left-1/2 top-full -translate-x-1/2 -translate-y-full rounded-full";
 
@@ -148,27 +165,52 @@ const ANCHOR =
  * of the nearest positioned ancestor — which is the masthead band, and which
  * therefore decides how much of the disc shows.
  *
- * TWO ELEMENTS, and the split is the point: the DISC is clipped to that band (only
- * its lower cap should ever be on screen), but the HALO is not. Clipping both — the
- * obvious arrangement, one `overflow-hidden` around the lot — sliced the glow off
- * along the band's bottom edge, which is exactly where the disc runs tangent to it:
- * a hard horizontal line of light ending in mid-air, under a limb that nothing was
- * occluding. Light has to be free to fall past the body it comes off, so the glow
- * spills onto the page below and stops where it runs out.
+ * CLIPPED TO THE BAND, so only its lower cap is ever on screen. The disc carried a
+ * halo for a while, spilling past the clip onto the page below; it is gone now —
+ * the moon reads as a body against black without a light source having to be
+ * implied around it, and the prompt sitting on the limb is easier to read without
+ * a gradient behind the letters at the edge.
  */
-export default function Moon({ diameter }: { diameter: string }) {
-	// Published as a custom property so the halo can be written as a fraction of
-	// the disc instead of as a magic number.
-	const sized = { "--moon-d": diameter, width: diameter, height: diameter } as React.CSSProperties;
+export default function Moon({
+	diameter,
+	cycle = 0,
+}: {
+	diameter: string;
+	/**
+	 * Bumped once per round. Each change turns the SURFACE through 80° — the same
+	 * arc the prompt riding on it travels — so a new matchup arrives on a moon that
+	 * visibly rotated to bring it round, rather than on one that swapped its
+	 * caption. Keyed rather than transitioned: the turn is a one-shot event with a
+	 * beginning, and a transition would only interpolate between two resting
+	 * angles.
+	 */
+	cycle?: number;
+}) {
+	const sized = { width: diameter, height: diameter } as React.CSSProperties;
 
 	return (
 		<>
-			{/* The halo alone: no background, so it is nothing but its own box-shadow
-			    — the lit disc is painted after this and covers the circle itself. */}
-			<div aria-hidden className={ANCHOR} style={{ ...sized, boxShadow: GLOW }} />
-
 			<div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
 				<div className={ANCHOR} style={{ ...sized, background: SURFACE }}>
+					{/* THE ROUND'S TURN, on its own layer. Two rotations cannot share one
+					    element — the second would replace the first, not add to it — so
+					    the 80° cycle sits OUTSIDE the drift and the browser composes the
+					    two. `key` restarts it: the drift's phase restarts with it, which
+					    is a jump of no consequence, happening as it does underneath the
+					    very rotation that is meant to be moving everything. */}
+					<div
+						key={cycle}
+						className="absolute inset-0 rounded-full"
+						style={
+							cycle
+								? {
+										animation:
+											"moon-cycle 1420ms cubic-bezier(0.42,0,0.14,1) both",
+										willChange: "transform",
+									}
+								: undefined
+						}
+					>
 					{/* The surface turns; the lighting does not. Separating them is the
 					    whole trick — rotating the lit disc as well would swing the
 					    highlight around and read as the light source orbiting, not the
@@ -189,6 +231,7 @@ export default function Moon({ diameter }: { diameter: string }) {
 							className="absolute inset-0 rounded-full"
 							style={{ backgroundImage: GRAIN, backgroundSize: "240px 240px" }}
 						/>
+					</div>
 					</div>
 				</div>
 			</div>
