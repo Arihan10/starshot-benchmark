@@ -114,7 +114,15 @@ class DSU {
 	}
 }
 
-export function buildNavGraph(
+/** How long a sightline slice may run before it hands the frame back. */
+const SLICE_MS = 4;
+
+/**
+ * @param breathe Yield between slices of the sightline solve, so the raycasting
+ * never occupies a whole frame. Omit it and the solve runs straight through,
+ * which is what a caller with nothing on screen to protect wants.
+ */
+export async function buildNavGraph(
 	panos: NavPano[],
 	panoLevel: number[] | null,
 	isBlocked: (
@@ -122,7 +130,8 @@ export function buildNavGraph(
 		b: [number, number, number],
 	) => boolean,
 	tuning: NavTuning,
-): NavGraph {
+	breathe?: () => Promise<void>,
+): Promise<NavGraph> {
 	const { reach: REACH, farDist: FAR_DIST, verticalDy: VERTICAL_DY } = tuning;
 	const n = panos.length;
 	const pos = panos.map((p) => new Vector3().fromArray(p.position));
@@ -150,7 +159,17 @@ export function buildNavGraph(
 	// derived below). LOS is only raycast for the nearest same-level candidates
 	// within reach, so the whole build stays ~O(n · LOS_CANDIDATES) raycasts.
 	const all: NavEdge[][] = Array.from({ length: n }, () => []);
+	// THE ONLY EXPENSIVE PART OF THIS FUNCTION, and the reason it can be handed a
+	// `breathe`. Measured on a round turn it ran 115–172 ms in one unbroken block —
+	// a dropped frame either way, but a very visible one when it lands on the
+	// reveal cards animating in. Sliced against the clock rather than a fixed
+	// node count, so a slower machine takes more slices instead of longer frames.
+	let sliceStart = performance.now();
 	for (let i = 0; i < n; i++) {
+		if (breathe && performance.now() - sliceStart > SLICE_MS) {
+			await breathe();
+			sliceStart = performance.now();
+		}
 		const near: Array<{
 			j: number;
 			dist: number;

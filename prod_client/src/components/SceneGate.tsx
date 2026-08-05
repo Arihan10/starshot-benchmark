@@ -20,7 +20,7 @@ export default function SceneGate({ children }: { children: (scene: Scene) => Re
 function Message({ children, error }: { children: ReactNode; error?: boolean }) {
 	return (
 		<div className="absolute inset-0 flex items-center justify-center">
-			<span className={`text-sm ${error ? "text-red-400" : "text-neutral-500"}`}>{children}</span>
+			<span className={`text-sm ${error ? "text-red-400" : "text-ink-40"}`}>{children}</span>
 		</div>
 	);
 }

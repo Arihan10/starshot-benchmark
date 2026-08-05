@@ -15,13 +15,15 @@ import {
 	type Quaternion,
 	Raycaster,
 	Scene,
-	type ShaderMaterial,
+	ShaderMaterial,
 	SphereGeometry,
 	SRGBColorSpace,
 	Vector2,
 	Vector3,
 	WebGLRenderer,
 	WebGLRenderTarget,
+	NormalBlending,
+	PlaneGeometry,
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
@@ -54,7 +56,7 @@ import { SurfaceCursor } from "./cursor";
 import { LightRig } from "./lighting";
 import { prepareLitScene } from "./prepare";
 import { MarkerLayer } from "./markerLayer";
-import { SplatLayer } from "./splatLayer";
+import { SplatLayer, IDENTITY_TRANSFORM, type SplatTransform } from "./splatLayer";
 import { collectObjects, ObjectAddressing } from "./objectAddressing";
 import { type PanoEntry, PanoStreamer } from "./panoTextures";
 import { Projection } from "./projection";
@@ -504,11 +506,12 @@ const WALK_HEIGHTS = [0.15, 0.5, 0.9] as const;
 // a wide scene runs out of room sideways long before the vertical fov notices.
 // `aspect` is what carries that.
 //
-// Every corner is tested rather than a bounding sphere: a sphere is the diagonal,
-// which over-measures a flat box badly and would push the camera back to frame
-// empty space around the corners.
+// Every point of the hull is tested rather than a bounding sphere: a sphere is the
+// diagonal, which over-measures a flat scene badly and would push the camera back
+// to frame empty space around the corners.
 function fitDistance(
-	box: Box3,
+	hull: Vector3[],
+	centre: Vector3,
 	dir: Vector3,
 	fovDeg: number,
 	aspect: number,
@@ -519,20 +522,16 @@ function fitDistance(
 	const seed = Math.abs(forward.y) > 0.95 ? _fitAltUp : _fitUp;
 	const right = _fitRight.crossVectors(seed, forward).normalize();
 	const up = _fitCamUp.crossVectors(forward, right).normalize();
-	const centre = box.getCenter(_fitCentre);
-	const tanV = Math.tan((fovDeg * Math.PI) / 360);
-	const tanH = tanV * (aspect > 0 ? aspect : 1);
+	const tanFull = Math.tan((fovDeg * Math.PI) / 360);
+	// The horizontal field is untouched — nothing overlays the sides of a panel —
+	// but the vertical is only as tall as the band between the page's furniture.
+	const tanH = tanFull * (aspect > 0 ? aspect : 1);
+	const tanV = tanFull * ((SAFE_HI - SAFE_LO) / 2);
 
 	let need = 0;
-	for (let i = 0; i < 8; i++) {
-		_fitCorner
-			.set(
-				i & 1 ? box.max.x : box.min.x,
-				i & 2 ? box.max.y : box.min.y,
-				i & 4 ? box.max.z : box.min.z,
-			)
-			.sub(centre);
-		// Depth toward the camera: a corner nearer the eye needs proportionally more
+	for (const point of hull) {
+		_fitCorner.copy(point).sub(centre);
+		// Depth toward the camera: a point nearer the eye needs proportionally more
 		// distance to stay inside the same angle, which is what makes this exact
 		// rather than an approximation from the centre.
 		const depth = _fitCorner.dot(forward);
@@ -543,10 +542,135 @@ function fitDistance(
 	return need;
 }
 
+// THE VOLUME THE FRAMING IS SOLVED AGAINST: the scene's box swept once around its
+// own vertical axis, as a ring of points at the floor and another at the ceiling.
+//
+// THE OVERVIEW TURNS, ALL THE WAY ROUND. A fit computed from the eight corners of
+// the box is a fit for ONE azimuth — the one it happened to be solved at — and
+// everything downstream then drifts for the rest of the revolution: measured across
+// a turn, one build's footprint wandered 58px up and down its panel while its
+// silhouette breathed in and out by 61. Two of those, turning out of phase, is most
+// of what made the pair look unplanned. Nothing was where it had been a moment ago,
+// so nothing looked placed.
+//
+// A ring is what a turntable actually sweeps, so a framing that holds for the ring
+// holds for every frame of the rotation. The scene is fitted once, stands on its
+// line, and stays there while it turns — and, just as importantly, cannot swing
+// out of its own frame at some angle nobody checked.
+//
+// It costs size on compact scenes: a square footprint's swept radius is its
+// half-diagonal, ~1.41x its half-width, and that room is reserved whether or not
+// the current angle needs it. That is the price of a full revolution — the camera
+// genuinely does visit every side, so every side has to fit.
+function framingHull(box: Box3, centre: Vector3): Vector3[] {
+	const r = Math.max(
+		Math.hypot(box.max.x - centre.x, box.max.z - centre.z),
+		Math.hypot(box.max.x - centre.x, box.min.z - centre.z),
+		Math.hypot(box.min.x - centre.x, box.max.z - centre.z),
+		Math.hypot(box.min.x - centre.x, box.min.z - centre.z),
+	);
+	const hull: Vector3[] = [];
+	for (let i = 0; i < HULL_SEGMENTS; i++) {
+		const a = (i / HULL_SEGMENTS) * Math.PI * 2;
+		const x = centre.x + r * Math.cos(a);
+		const z = centre.z + r * Math.sin(a);
+		hull.push(new Vector3(x, box.min.y, z), new Vector3(x, box.max.y, z));
+	}
+	return hull;
+}
+
+// Enough that the ring's flat sides never let a corner of the real box poke out
+// past it: at 24 the inscribed error is under 1%, well inside BROWSE_MARGIN.
+const HULL_SEGMENTS = 24;
+
+/**
+ * WHERE THE BUILD STANDS, as one point: the middle of its floor.
+ *
+ * This is what gets placed on GROUND_LINE, and it is deliberately NOT the lowest
+ * pixel of the silhouette. The lowest pixel belongs to whichever corner is nearest
+ * the camera, so it travels as the scene turns — anchoring on it made a flat strip's
+ * baseline wander 108px across one revolution while a compact house next to it held
+ * within 15. The centre of the floor is ON the axis the turntable spins about, so it
+ * does not move at all, whatever the shape or the angle.
+ *
+ * It also matches what the eye does. Objects on a shelf are not aligned by their
+ * frontmost overhang; they stand on it, and each hangs over the edge by however
+ * much its own shape hangs over.
+ */
+function groundAnchor(box: Box3, centre: Vector3): Vector3 {
+	return new Vector3(centre.x, box.min.y, centre.z);
+}
+
+/**
+ * How far to slide the camera SIDEWAYS so the build sits in the middle of the frame.
+ *
+ * The vertical solve above places a point — where the build stands — at a chosen
+ * line. This places a SPAN: the hull's projected left and right edges, centred
+ * about each other. Aiming at `sceneCenter` is not the same thing and does not
+ * produce it: the overview looks from over one shoulder (BROWSE_DIR), so a scene
+ * whose mass sits off its own bounding-box centre — a house at one end of a plot,
+ * a level that runs to one side — projects lopsided even though the camera is
+ * pointed exactly at the middle of the box. What is centred has to be what you
+ * SEE, which is the hull, not the point it was measured from.
+ *
+ * Iterated for the same reason the vertical one is: moving the camera changes the
+ * projection, so the correction is only exact in the limit. Four passes settle it
+ * well inside a pixel at these distances.
+ */
+function centrePan(
+	camera: PerspectiveCamera,
+	hull: Vector3[],
+	pos: Vector3,
+	target: Vector3,
+	up: number,
+	upAxis: Vector3,
+): number {
+	// The camera's own right, taken once — the direction it faces never changes
+	// here, only where it stands.
+	camera.position.copy(pos).addScaledVector(upAxis, up);
+	camera.lookAt(_panAim.copy(target).addScaledVector(upAxis, up));
+	camera.updateMatrixWorld(true);
+	const right = _centreRight.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+	let pan = 0;
+
+	for (let pass = 0; pass < 4; pass++) {
+		camera.position.copy(pos).addScaledVector(upAxis, up).addScaledVector(right, pan);
+		camera.lookAt(
+			_panAim.copy(target).addScaledVector(upAxis, up).addScaledVector(right, pan),
+		);
+		camera.updateMatrixWorld(true);
+
+		let lo = Infinity;
+		let hi = -Infinity;
+		for (const point of hull) {
+			const x = _panCorner.copy(point).project(camera).x;
+			if (x < lo) lo = x;
+			if (x > hi) hi = x;
+		}
+		const off = (lo + hi) / 2;
+		if (Math.abs(off) < 0.002) break;
+
+		// NDC -> world at the aim plane, scaled by aspect because x is the wide axis.
+		const half =
+			camera.position.distanceTo(target) *
+			Math.tan((camera.fov * Math.PI) / 360) *
+			camera.aspect;
+		pan += off * half;
+	}
+	return pan;
+}
+
+// How fast the overview turns. Slow enough to read as a body being looked at
+// rather than as a spinner, fast enough that a viewer who waits sees the far side —
+// and with rounds down to a few seconds each (see NextTimer), "who waits" is now a
+// much shorter person to be. At 0.6 a full revolution took a minute, which is
+// several rounds; this brings it under half of that.
+const BROWSE_SPIN_SPEED = 2.1;
+
+const _centreRight = new Vector3();
 const _fitFwd = new Vector3();
 const _fitRight = new Vector3();
 const _fitCamUp = new Vector3();
-const _fitCentre = new Vector3();
 const _fitCorner = new Vector3();
 const _fitUp = new Vector3(0, 1, 0);
 const _fitAltUp = new Vector3(0, 0, 1);
@@ -554,8 +678,148 @@ const _fitAltUp = new Vector3(0, 0, 1);
 // The direction the overview looks from, as a unit vector: over one shoulder and
 // down. Only the DISTANCE along it is computed per scene.
 const BROWSE_DIR = new Vector3(0.7, 0.5, 0.9).normalize();
-// Breathing room around the fit, so nothing sits hard against the frame edge.
-const BROWSE_MARGIN = 1.12;
+// Breathing room around the fit. At 1.0 the swept volume exactly fills the safe
+// band — which is what is wanted now that the canvases run the full height of the
+// window: the margin existed to keep builds off a frame edge that the masthead and
+// the vote bar were already crowding, and with those reserved separately (SAFE_TOP
+// and SAFE_BOTTOM) it was buying the same clearance twice and spending 12% of every
+// build's size on it.
+// UNDER ONE ON PURPOSE. At 1.0 the entire swept volume is guaranteed inside the
+// safe band on every frame of the turn — which is correct and leaves a panel of
+// mostly sky, because the fit has to hold for the scene's WIDEST rotation and the
+// build spends most of the turn narrower than that. At 0.78 the widest pose is
+// allowed to overhang; every other pose fills the frame, which is what the canvas
+// is for. The floor is still framed by GROUND_LINE, so it overhangs at the sides
+// rather than sinking out of the bottom.
+const BROWSE_MARGIN = 0.78;
+
+// WHERE THE SCENE STANDS IN ITS PANEL — the fraction of the way down the frame at
+// which the bottom of the build should rest.
+//
+// TWO BUILDS FROM ONE PROMPT ARE ALMOST NEVER THE SAME SHAPE, and they are not
+// even the same size: measured, one pair is a platformer strip 120m wide and
+// barely tall next to a house 35m across and mostly vertical. `fitDistance` frames
+// each to its own box, which lands each one CENTRED in its own panel — and that is
+// what made the pair look unstaged. The strip's ground plane sat 180px higher than
+// the house's, so the two read as photographs taken in different rooms rather than
+// as two objects set down on one shelf, and the eye has to do the work of deciding
+// they are comparable before it can start comparing them.
+//
+// So the FOOTPRINT is what gets aligned, not the middle. Whatever a scene's
+// proportions, the bottom of it meets this line, and the panel's leftover room
+// collects ABOVE it — where an empty half-panel reads as air over a low building
+// instead of as a gap underneath a floating one.
+//
+// Not 0.5, and not the very bottom either: the vote bar lives under these panels,
+// and a build resting on the last few percent of the frame reads as sitting on the
+// buttons. Just below centre is where a plinth would be.
+export const GROUND_LINE = 0.58;
+
+// THE PAGE PUTS FURNITURE BACK OVER THE CANVASES, so a strip at each end is
+// reserved and the fit works inside what is left.
+//
+// BOTH STRIPS MATTER AGAIN. The canvases run the full height of the window now —
+// the masthead floats over them rather than sitting above them — so the moon and
+// the navbar are laid ON the scenes just as the vote bar is, and a build framed to
+// the raw window puts its roofline behind the disc.
+//
+// The bottom strip: the vote bar floats over the scenes, and without this a build
+// gets framed with its near corner underneath the "A WINS" button — correctly framed by the camera's reckoning and plainly wrong on
+// the screen. The top strip is much smaller because nothing solid is up there; it
+// only has to keep a roofline out of the moon's brightest light.
+//
+// These two numbers and the vote bar's own offset in page.tsx are one decision
+// split across two files. Move the bar and this has to move with it.
+const SAFE_TOP = 0.14;
+const SAFE_BOTTOM = 0.15;
+// The same band in NDC, where the framing maths happens: +1 is the top of the frame.
+const SAFE_HI = 1 - 2 * SAFE_TOP;
+const SAFE_LO = -1 + 2 * SAFE_BOTTOM;
+
+/**
+ * How far to slide the framing along the camera's own up axis so the scene's
+ * footprint comes to rest on GROUND_LINE. In world units; may be either sign.
+ *
+ * MEASURED IN THE PICTURE, NOT IN THE BOX. The overview looks down a tilted axis,
+ * so a floor's centre does not project to the middle of its own footprint, and how
+ * far down the frame it lands depends on the distance the fit just chose. Both are
+ * properties of the projection, so `anchor` is projected to NDC and placed there —
+ * while `hull` is what the placement is clamped against.
+ *
+ * CLAMPED TO THE SLACK THE FIT LEFT OVER, which is what makes this safe and is
+ * also what makes it work. `fitDistance` has just guaranteed the whole box is
+ * inside the frame; every step here is limited to the room between the box and the
+ * frame edge, so nothing it took care to include can be pushed back out. A tall
+ * scene has almost no slack and barely moves; a flat one has most of the panel
+ * spare and travels a long way — and they meet on the same line, which is the
+ * point.
+ *
+ * SOLVED RATHER THAN COMPUTED, because a camera translation does not move every
+ * corner by the same amount in NDC: near corners swing more than far ones, so
+ * there is no single closed-form conversion from "NDC I want" to "metres to move".
+ * Each pass moves by the conversion that is exact at the target plane and then
+ * re-measures; it converges in two or three, and the loop is bounded regardless.
+ */
+function groundLinePan(
+	camera: PerspectiveCamera,
+	hull: Vector3[],
+	anchor: Vector3,
+	pos: Vector3,
+	target: Vector3,
+): number {
+	// NDC y runs +1 at the top of the frame to -1 at the bottom.
+	const want = 1 - 2 * GROUND_LINE;
+
+	// The camera's OWN up, not the world's: the view is tilted, so sliding along
+	// world Y would move the image diagonally and change the distance to the scene
+	// as it went. Taken once — only the camera's position changes below, never the
+	// direction it faces, so this axis is fixed for the whole solve.
+	camera.position.copy(pos);
+	camera.lookAt(target);
+	camera.updateMatrixWorld(true);
+	const up = _panUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+	let pan = 0;
+
+	for (let pass = 0; pass < 6; pass++) {
+		camera.position.copy(pos).addScaledVector(up, pan);
+		camera.lookAt(_panAim.copy(target).addScaledVector(up, pan));
+		camera.updateMatrixWorld(true);
+
+		let lo = Infinity;
+		let hi = -Infinity;
+		for (const point of hull) {
+			const y = _panCorner.copy(point).project(camera).y;
+			if (y < lo) lo = y;
+			if (y > hi) hi = y;
+		}
+		const stand = _panCorner.copy(anchor).project(camera).y;
+
+		// What the anchor still owes the line, held inside the SAFE BAND at both ends
+		// by the HULL: the point being placed is where the build stands, but the
+		// thing that must not stray under the page's furniture is the whole of it.
+		//
+		// The lower bound is applied last so it wins outright. When a scene is too
+		// tall for the band the two bounds cross, and of the two failures — a roof
+		// clipped by the top of the window, or a wall of geometry sliding under the
+		// vote buttons — the roof is the one to take.
+		const owed = want - stand;
+		const step = Math.max(SAFE_LO - lo, Math.min(SAFE_HI - hi, owed));
+		if (Math.abs(step) < 0.002) break;
+
+		// NDC -> world at the plane the camera is aimed at, where the two are
+		// exactly proportional. Raising the camera lowers the image, hence the sign.
+		const half =
+			camera.position.distanceTo(target) *
+			Math.tan((camera.fov * Math.PI) / 360);
+		pan -= step * half;
+	}
+	return pan;
+}
+
+const _panCorner = new Vector3();
+const _panAim = new Vector3();
+const _panUp = new Vector3();
+const _panShift = new Vector3();
 
 const _DOWN = new Vector3(0, -1, 0);
 const _losFrom = new Vector3();
@@ -649,6 +913,44 @@ type SavedInterior = {
 // five edge types (walk / portal / vertical / phase / far), each with its own
 // affordance and its own transition. All per-frame work mutates three.js / the
 // canvas directly (never React), so the UI only re-renders on discrete changes.
+/**
+ * Hand the frame back, then carry on.
+ *
+ * A macrotask rather than a microtask — `await Promise.resolve()` would drain
+ * straight back into the same task and slice nothing. `setTimeout(0)` is the
+ * portable one that actually lets the browser paint between slices.
+ */
+const yieldFrame = () => new Promise<void>((r) => setTimeout(r, 0));
+
+/**
+ * A scene, fetched and fully solved, waiting to be put on screen.
+ *
+ * The handoff between `prepareTour` and `commitTour`. Everything in here was
+ * computed while the PREVIOUS scene was still rendering, which is the point: the
+ * commit is assignment, not work. `box` and `center` are null only for the
+ * "nothing to show" case, which the commit reports rather than the prepare.
+ */
+export type PreparedTour = {
+	entries: PanoEntry[];
+	proxyRoot: Group | null;
+	lite: Group | null;
+	connectors: Connector[];
+	objectIds: string[];
+	minimaps: MinimapSlice[];
+	minimapPrefetch: HTMLImageElement[];
+	mapLabels: MapLabel[];
+	mapBasis: ReturnType<typeof readBasis>;
+	levelWord: string;
+	panoLevel: number[];
+	splatReady: boolean;
+	splatTransform?: SplatTransform;
+	box: Box3 | null;
+	center?: Vector3 | null;
+	sceneScale: SceneScale;
+	metrics: NavMetrics;
+	navGraph: NavGraph | null;
+};
+
 export class OrbitEngine {
 	private readonly host: HTMLElement;
 	private readonly onState: (s: OrbitState) => void;
@@ -842,6 +1144,13 @@ export class OrbitEngine {
 	// The typed navigation graph (built at scene load) + per-scene directory data
 	// the chrome reads for chapters / search / the minimap overlay.
 	private navGraph: NavGraph | null = null;
+	// A scene solved ahead of being asked for, and the prepare still running for
+	// one. See warmTour — this is where the round change's cost went.
+	private warmed: { source: TourSource; prepared: PreparedTour } | null = null;
+	private warming: {
+		source: TourSource;
+		promise: Promise<PreparedTour | null>;
+	} | null = null;
 	private nodeDir: NodeDir[] = [];
 	private chapters: Chapter[] = [];
 
@@ -869,7 +1178,25 @@ export class OrbitEngine {
 	// scene load; the fallback keeps a not-yet-loaded engine self-consistent.
 	private sceneScale: SceneScale = DEFAULT_SCALE;
 	private metrics: NavMetrics = DEFAULT_METRICS;
+	// The swept volume the framing is solved against, and the point on the floor it
+	// stands the build on. Kept because the framing is recomputed whenever the panel
+	// changes shape. The hull is empty until a scene has loaded.
+	// THE POOL OF LIGHT, IN THE SCENE.
+	//
+	// It was a CSS radial gradient laid over the panel, which is a flat ellipse on a
+	// flat surface: it does not foreshorten, it does not turn with the build, and at
+	// this camera angle it reads as a streak across the picture rather than as light
+	// lying on a floor. This is a quad ON the ground plane, so perspective does the
+	// work — it is a circle in world space and whatever shape the camera makes of it
+	// on screen is the correct one.
+	private stageGlow: Mesh | null = null;
+	private framingHull: Vector3[] = [];
+	private readonly groundAnchor = new Vector3();
 	private readonly browsePos = new Vector3();
+	// The point the overview orbits and looks at. NOT `sceneCenter`: the framing is
+	// panned so the build stands on GROUND_LINE, and coming back out of a
+	// walkthrough has to return to the pose the viewer left, not to a centred one.
+	private readonly browseTarget = new Vector3();
 
 	private transition: Transition | null = null;
 	private move: Move | null = null;
@@ -991,7 +1318,7 @@ export class OrbitEngine {
 		this.controls.screenSpacePanning = true;
 		this.controls.zoomToCursor = true;
 		this.controls.autoRotate = true;
-		this.controls.autoRotateSpeed = 0.6;
+		this.controls.autoRotateSpeed = BROWSE_SPIN_SPEED;
 		this.controls.mouseButtons = {
 			LEFT: MOUSE.ROTATE,
 			MIDDLE: MOUSE.PAN,
@@ -1468,6 +1795,20 @@ export class OrbitEngine {
 		this.splat.resize(); // its canvas is a sibling, not a child — size it too
 		this.camera.aspect = w / h;
 		this.camera.updateProjectionMatrix();
+
+		// A NEW PANEL SHAPE IS A NEW FRAMING. Only in the overview, and only when the
+		// viewer has not taken hold of it: refitting mid-orbit would snatch the scene
+		// back from under the drag, and refitting during a flight would fight it. An
+		// untouched overview is the case that matters anyway — it is what the page
+		// shows while the pair is being judged, and it is where the two builds have
+		// to keep standing on the same line as the window changes around them.
+		if (this.mode === "overview" && !this.move && this.controls.autoRotate) {
+			this.frameOverview();
+			this.camera.position.copy(this.browsePos);
+			this.controls.target.copy(this.browseTarget);
+			this.camera.updateProjectionMatrix();
+			this.controls.update();
+		}
 	}
 
 	// --- input handlers -------------------------------------------------------
@@ -3690,13 +4031,13 @@ export class OrbitEngine {
 			this.clearPanoOverlay();
 			this.startFly(
 				this.browsePos.clone(),
-				this.sceneCenter.clone(),
+				this.browseTarget.clone(),
 				1000,
 				{
 					toFov: OVERVIEW_FOV,
 					onEnd: () => {
 						this.mode = "overview";
-						this.controls.target.copy(this.sceneCenter);
+						this.controls.target.copy(this.browseTarget);
 						this.camera.position.copy(this.browsePos);
 						this.controls.enabled = true;
 						this.controls.update();
@@ -3954,8 +4295,11 @@ export class OrbitEngine {
 		});
 	}
 
+	// The teardown, and ONLY the teardown. It used to bump `loadToken` as well,
+	// which worked while it was the first thing a load did; now that it is the last,
+	// invalidating the token here would retire the load that is midway through
+	// committing. Both callers bump for themselves — see `loadTour` and `dispose`.
 	private clearScene() {
-		this.loadToken++;
 		this.director.abort();
 		if (this.liteRoot) {
 			this.scene.remove(this.liteRoot);
@@ -3969,6 +4313,12 @@ export class OrbitEngine {
 		}
 		for (const m of this.proxyColorMats) m.dispose();
 		this.proxyColorMats = [];
+		if (this.stageGlow) {
+			this.scene.remove(this.stageGlow);
+			this.stageGlow.geometry.dispose();
+			(this.stageGlow.material as ShaderMaterial).dispose();
+			this.stageGlow = null;
+		}
 		this.projection.clearBase(this.scene);
 		this.streamer.reset();
 		this.connectors = [];
@@ -4041,38 +4391,60 @@ export class OrbitEngine {
 		for (const l of this.sonarLabels) l.style.display = "none";
 	}
 
-	async loadTour(source: TourSource) {
-		this.mode = "loading";
-		// A new scene always starts outside it, and the swap can happen from
-		// anywhere — including from inside the old one, which would otherwise leave
-		// the layout held open around a scene that no longer exists.
-		this.setInside(false);
-		this.controls.enabled = false;
-		this.clearScene();
-		const token = this.loadToken;
-		this.showOverlay("loading scene…");
-
-		try {
+	/**
+	 * Fetch, parse and SOLVE a scene without disturbing the one on screen.
+	 *
+	 * NOTHING IS TAKEN AWAY UNTIL THE REPLACEMENT IS READY. This used to empty the
+	 * panel on its first line — `clearScene`, then fetch, then parse, then apply —
+	 * so a scene change spent the whole download showing a black panel under a
+	 * "loading scene…" veil. That was invisible while the arena mounted the next
+	 * round off-screen a countdown early and threw the engine away afterwards;
+	 * collapsing it to one persistent row (worth ~165 ms of engine construction per
+	 * round, see page.tsx) put the load back on the engine you are looking at, and
+	 * the veil with it.
+	 *
+	 * EVERYTHING THAT CAN BE COMPUTED IS COMPUTED HERE, and that is the difference
+	 * between a swap that costs 200 ms and one that costs 20. Measured on a round
+	 * turn, `buildNavGraph` alone was 115–172 ms of a 167–208 ms commit — line-of-
+	 * sight raycasts between every pair of capture points, which is WALKTHROUGH data
+	 * that the orbit view never reads. The splat swap it was blamed on measured
+	 * 0.0 ms. So the scene is solved in full while the old one is still turning —
+	 * box, scale, metrics, storey assignment and nav graph — and `commitTour` is
+	 * left with assignment and scene-graph attachment.
+	 *
+	 * Nothing here touches `this`. Every value the commit needs is returned instead,
+	 * because the scene those fields describe is still on screen: `minimaps` and
+	 * `mapBasis` feed the live minimap and the flight maths (see `emit`, `flyTo`),
+	 * so writing the incoming scene's values over the outgoing one is a bug that
+	 * only this separation prevents.
+	 *
+	 * Resolves null when the load was superseded, or throws for the caller to turn
+	 * into a failure notice.
+	 */
+	async prepareTour(source: TourSource, token: number): Promise<PreparedTour | null> {
+		{
 			let manifest: TourManifest | null = null;
 			if (source.manifestUrl) {
 				// no-store, always: tour.json is rewritten in place by a
 				// re-publish or a metadata backfill, so a cached copy silently
 				// serves a scene that is missing whatever was just added to it.
 				const res = await fetch(source.manifestUrl, { cache: "no-store" });
-				if (token !== this.loadToken || this.disposed) return;
+				if (token !== this.loadToken || this.disposed) return null;
 				if (res.ok) manifest = (await res.json()) as TourManifest;
 			}
-			if (token !== this.loadToken || this.disposed) return;
+			if (token !== this.loadToken || this.disposed) return null;
 
 			const mmList =
 				manifest && Array.isArray(manifest.minimaps)
 					? manifest.minimaps
 					: [];
-			this.minimaps = mmList.map((m) => ({
+			const minimaps: MinimapSlice[] = mmList.map((m) => ({
 				...m,
 				url: source.resolveMinimap(m.file),
 			}));
-			this.minimapPrefetch = this.minimaps.map((m) => {
+			// Started now, held to the swap: the requests are the point, and firing
+			// them here spends the download on the same window everything else does.
+			const minimapPrefetch = minimaps.map((m) => {
 				const img = new Image();
 				img.src = m.url;
 				return img;
@@ -4104,16 +4476,16 @@ export class OrbitEngine {
 					: [];
 			const objectIds =
 				manifest && Array.isArray(manifest.objects) ? manifest.objects : [];
-			this.mapLabels =
+			const mapLabels =
 				manifest && Array.isArray(manifest.map_labels)
 					? manifest.map_labels
 					: [];
 			// The map's frame comes from the slices themselves (the capture stamps
 			// each with the basis it drew that image in), so the viewer places
 			// captures with exactly the mapping that produced the picture.
-			this.mapBasis = readBasis(this.minimaps[0]?.basis);
+			const mapBasis = readBasis(minimaps[0]?.basis);
 			const word = manifest?.profile?.level_word;
-			this.levelWord = typeof word === "string" && word ? word : "floor";
+			const levelWord = typeof word === "string" && word ? word : "floor";
 
 			let proxyRoot: Group | null = null;
 			if (manifest?.proxy) {
@@ -4133,48 +4505,288 @@ export class OrbitEngine {
 					lite = null;
 				}
 			}
-			// Loaded BEFORE the first frame rather than popped in afterwards: the
+			// Ready BEFORE the first frame rather than popped in afterwards: the
 			// splat IS the scene's appearance when it has one, and showing the
 			// dollhouse only to swap it out a second later reads as a glitch.
 			// Failure is non-fatal — the dollhouse and the walkthrough are each
 			// complete without it, so a broken splat costs the feature, not the scene.
 			// Drawn exactly where the file says it is — see the note by
 			// IDENTITY_TRANSFORM for why no correction is applied here.
-			if (source.splatUrl) await this.splat.load(source.splatUrl);
-			if (token !== this.loadToken || this.disposed) return;
-			this.applyScene(entries, proxyRoot, lite, connectors, objectIds);
-		} catch (e) {
-			if (token !== this.loadToken || this.disposed) return;
-			this.mode = "empty";
-			this.showOverlay(
-				`failed to load scene: ${e instanceof Error ? e.message : String(e)}`,
-				{ spinner: false, err: true },
+			const splatReady = source.splatUrl
+				? await this.splat.prepare(source.splatUrl)
+				: false;
+			if (token !== this.loadToken || this.disposed) {
+				// A scene nobody is going to see must not keep its upload.
+				if (splatReady) this.splat.discardStaged();
+				return null;
+			}
+
+			// --- SOLVED HERE, NOT AT THE SWAP ---------------------------------
+			// Everything below is arithmetic and raycasting over the meshes just
+			// loaded. It reads nothing from `this` that the outgoing scene owns, and
+			// writes nothing, so it is free to run while that scene is still up —
+			// which is the whole point, because this is where the 200 ms was.
+			//
+			// EACH PHASE STARTS ON A FRESH FRAME. Individually none of these is long;
+			// the dropped frame came from them LANDING TOGETHER — the tail of a splat
+			// decode and the box/scale solve resolving in the same task, 33 ms of
+			// work in a frame with an 8 ms budget. Awaiting between them costs a few
+			// milliseconds of a countdown that has seconds to spare, and means no
+			// frame ever carries two of them. Skipped on a cold panel, which has
+			// nothing on screen to protect.
+			const breathe = this.isEmpty ? null : yieldFrame;
+			if (breathe) await breathe();
+
+			// Which storey each capture stands on. Taken from the manifest when it
+			// says — the floor planner decided the split and assigned every capture
+			// to one, so re-deriving it here could only disagree, and a capture near
+			// a boundary is exactly where it would. Matching the nearest slice by
+			// height is the fallback for tours captured before the split was planned.
+			const panoLevel = entries.map((p) =>
+				typeof p.level === "number" && p.level >= 0 && p.level < minimaps.length
+					? p.level
+					: levelForPosition(minimaps, p.position),
 			);
+
+			// Shading is a property of the mesh, not of the engine — see prepare.ts —
+			// so it is done to the loaded groups directly, off the critical path.
+			if (lite) prepareLitScene(lite);
+			if (proxyRoot) prepareLitScene(proxyRoot);
+
+			const framed = lite ?? proxyRoot;
+			if (!framed) {
+				// No mesh at all. Reported at the swap, so the panel keeps what it has
+				// until the moment it is replaced.
+				return {
+					entries, proxyRoot, lite, connectors, objectIds,
+					minimaps, minimapPrefetch, mapLabels, mapBasis, levelWord,
+					panoLevel, splatReady, splatTransform: source.splatTransform,
+					box: null, sceneScale: DEFAULT_SCALE, metrics: DEFAULT_METRICS,
+					navGraph: null,
+				};
+			}
+
+			// RAYCASTING A DETACHED GROUP. `framed`/`proxyRoot` are not in the scene
+			// yet, and three's raycaster reads `matrixWorld` without refreshing it —
+			// normally the renderer does that each frame. Nothing has rendered these,
+			// so their matrices are identity-stale and every ray would miss.
+			framed.updateMatrixWorld(true);
+			if (proxyRoot && proxyRoot !== framed) proxyRoot.updateMatrixWorld(true);
+			if (breathe) await breathe();
+
+			const box = new Box3().setFromObject(framed);
+			const size = box.getSize(new Vector3());
+			const center = box.getCenter(new Vector3());
+			const sceneMaxDim = Math.max(size.x, size.y, size.z) || 1;
+
+			// MEASURE THE SCENE BEFORE ANYTHING READS A DISTANCE FROM IT. Every metre
+			// value below — the clip planes, the nav graph's reach, the marker sizes,
+			// the line-of-sight trims — is derived from these three numbers, so this
+			// has to land first. See scale.ts for what is measured and why.
+			//
+			// The proxy is passed because the eye height is found by dropping a ray
+			// from each capture onto it; a tour without one falls back, and both are
+			// handled inside measureSceneScale.
+			const sceneScale = measureSceneScale(
+				sceneMaxDim,
+				entries.map((p) => p.position),
+				proxyRoot,
+			);
+			const metrics = navMetrics(sceneScale);
+			console.info(`[orbit] scene scale — ${describeScale(sceneScale)}`);
+			if (breathe) await breathe();
+
+			// THE EXPENSIVE ONE. Line-of-sight between every pair of captures, against
+			// the proxy just loaded rather than the one on screen — which is why
+			// `segmentBlocked` takes both explicitly. `metrics.losTrim` is a hard
+			// prerequisite, so the measurement above has to land first.
+			const navGraph = await buildNavGraph(
+				entries.map((p) => ({ position: p.position, zone: p.zone })),
+				panoLevel,
+				(a, b) => this.segmentBlocked(a, b, proxyRoot, metrics),
+				metrics,
+				breathe ?? undefined,
+			);
+
+			if (token !== this.loadToken || this.disposed) {
+				if (splatReady) this.splat.discardStaged();
+				return null;
+			}
+
+			return {
+				entries, proxyRoot, lite, connectors, objectIds,
+				minimaps, minimapPrefetch, mapLabels, mapBasis, levelWord,
+				panoLevel, splatReady, box, center, sceneScale, metrics, navGraph,
+				splatTransform: source.splatTransform,
+			};
 		}
 	}
 
-	private applyScene(
-		entries: PanoEntry[],
-		proxyRoot: Group | null,
-		lite: Group | null,
-		connectors: Connector[],
-		objectIds: string[] = [],
-	) {
+	/**
+	 * Put a prepared scene on screen, dropping whatever was there.
+	 *
+	 * SYNCHRONOUS AND SHORT, by construction: everything slow already happened in
+	 * `prepareTour`, so this is assignment plus scene-graph attachment. Keeping it
+	 * that way is what lets two panels swap in the same frame — see the arena's
+	 * pair gate — and what keeps the vote bar's transition from stuttering.
+	 */
+	commitTour(prepared: PreparedTour) {
+		// A new scene always starts outside it, and the swap can happen from
+		// anywhere — including from inside the old one, which would otherwise leave
+		// the layout held open around a scene that no longer exists.
+		this.setInside(false);
+		this.mode = "loading";
+		this.controls.enabled = false;
+		this.clearScene();
+		// After clearScene, which drops the outgoing splat but leaves this one — see
+		// SplatLayer.clear. A source with no splat still has to say so, or a stage
+		// abandoned by a superseded load would be adopted by this scene.
+		if (prepared.splatReady) this.splat.commit();
+		else this.splat.discardStaged();
+		// Applied AFTER the commit, because `commit` re-applies whatever transform the
+		// layer is holding — set it first and the incoming splat would be placed with
+		// the outgoing one's correction. Identity for every cell but the one.
+		this.splat.setTransform(prepared.splatTransform ?? IDENTITY_TRANSFORM);
+		this.minimaps = prepared.minimaps;
+		this.minimapPrefetch = prepared.minimapPrefetch;
+		this.mapLabels = prepared.mapLabels;
+		this.mapBasis = prepared.mapBasis;
+		this.levelWord = prepared.levelWord;
+		this.panoLevel = prepared.panoLevel;
+		this.sceneScale = prepared.sceneScale;
+		this.metrics = prepared.metrics;
+		this.navGraph = prepared.navGraph;
+		this.applyScene(prepared);
+	}
+
+	/**
+	 * Solve a scene the panel is GOING to be asked for, long before it is asked.
+	 *
+	 * The countdown between two rounds is eight seconds in which the page is
+	 * showing two ratings and asking nothing of anybody, and the thing at the end
+	 * of it is two scenes wanted at once. `usePreloadRound` already spent that
+	 * window on the bytes; this spends it on the work — the GLB parse, the splat
+	 * decode and upload, the scene measurement and the nav graph.
+	 *
+	 * That work is why a swap used to stutter. Measured on a round turn, the
+	 * sightline solve plus the commit landed as one 216 ms frame about 800 ms after
+	 * the click — directly under the vote bar's transition, which is exactly where
+	 * it was seen. Done here it lands in the middle of a countdown instead, with
+	 * nothing waiting on it.
+	 *
+	 * Safe to call repeatedly with the same source; safe to call for a scene the
+	 * viewer never reaches (the stage is dropped when a different one is asked
+	 * for). It deliberately does NOT bump `loadToken` — warming is not loading, and
+	 * a scene on screen must not be superseded by one nobody has asked for yet.
+	 */
+	warmTour(source: TourSource) {
+		if (this.disposed) return;
+		if (this.warmed?.source === source || this.warming?.source === source) return;
+		const token = this.loadToken;
+		const promise = this.prepareTour(source, token)
+			.then((prepared) => {
+				// A real load started while this was in flight, so its stage has
+				// already been taken or invalidated; nothing here is usable.
+				if (this.disposed || token !== this.loadToken) return null;
+				if (prepared) this.warmed = { source, prepared };
+				return prepared;
+			})
+			.catch(() => null)
+			.finally(() => {
+				if (this.warming?.source === source) this.warming = null;
+			});
+		this.warming = { source, promise };
+	}
+
+	/**
+	 * Load a scene: prepare it if it is not already warm, then commit.
+	 *
+	 * `commitVia` is how two panels are made to land together. The engine hands the
+	 * caller a commit it can hold — the arena's pair gate runs both sides' commits
+	 * back to back once BOTH have arrived, so the row never shows one build from
+	 * the new round beside one from the old. Left out, the commit happens at once,
+	 * which is what a single viewer wants.
+	 */
+	async loadTour(source: TourSource, commitVia?: (commit: () => void) => void) {
+		// SUPERSEDE FIRST. The teardown lives in `commitTour` now, so until that runs
+		// an earlier load is still holding a live scene it believes is its own;
+		// bumping the token here is what stops that load from committing.
+		const token = ++this.loadToken;
+		if (this.isEmpty) this.showOverlay("loading scene…");
+		try {
+			const prepared = await this.takePrepared(source, token);
+			if (!prepared || !this.isCurrentLoad(token)) return;
+			const commit = () => {
+				// The gate may hold this across a few frames, and anything can happen
+				// in them — another round, a dispose. Re-checked at the moment of use.
+				if (!this.isCurrentLoad(token)) return;
+				this.commitTour(prepared);
+			};
+			if (commitVia) commitVia(commit);
+			else commit();
+		} catch (e) {
+			if (!this.isCurrentLoad(token)) return;
+			this.failLoad(e);
+		}
+	}
+
+	/** The warm scene for `source` if there is one, otherwise a fresh prepare. */
+	private async takePrepared(source: TourSource, token: number) {
+		if (this.warmed?.source === source) {
+			const { prepared } = this.warmed;
+			this.warmed = null;
+			return prepared;
+		}
+		// Warming and asked for mid-flight — pressing "next" early. Joining the
+		// prepare already running is the whole point; starting a second one would
+		// throw away its splat stage and pay for the decode twice.
+		if (this.warming?.source === source) {
+			const prepared = await this.warming.promise;
+			if (prepared) {
+				this.warmed = null;
+				return prepared;
+			}
+		}
+		return this.prepareTour(source, token);
+	}
+
+	/** Whether there is anything on screen to be protected from a load. */
+	get isEmpty(): boolean {
+		return !this.liteRoot && !this.proxyGroup;
+	}
+
+	/** A token for a load the caller is going to drive itself. */
+	nextLoadToken(): number {
+		return ++this.loadToken;
+	}
+
+	/** Whether `token` is still the live load. */
+	isCurrentLoad(token: number): boolean {
+		return token === this.loadToken && !this.disposed;
+	}
+
+	/**
+	 * Take the panel down and say why.
+	 *
+	 * The old scene comes down HERE and only here. A panel still showing the last
+	 * build under "failed to load scene" would be reporting a failure over
+	 * something that did not fail.
+	 */
+	failLoad(e: unknown) {
+		this.splat.discardStaged();
+		this.clearScene();
+		this.mode = "empty";
+		this.showOverlay(
+			`failed to load scene: ${e instanceof Error ? e.message : String(e)}`,
+			{ spinner: false, err: true },
+		);
+	}
+
+	private applyScene(prepared: PreparedTour) {
+		const { entries, proxyRoot, lite, connectors, objectIds } = prepared;
 		this.connectors = connectors;
 		this.inspectable = new Set(objectIds);
 		this.streamer.reset(entries);
-		// Which storey each capture stands on. Taken from the manifest when it says
-		// — the floor planner decided the split and assigned every capture to one,
-		// so re-deriving it here could only disagree, and a capture near a boundary
-		// is exactly where it would. Matching the nearest slice by height is the
-		// fallback for tours captured before the split was planned.
-		this.panoLevel = entries.map((p) =>
-			typeof p.level === "number" &&
-			p.level >= 0 &&
-			p.level < this.minimaps.length
-				? p.level
-				: levelForPosition(this.minimaps, p.position),
-		);
 		this.projectionMode = !!proxyRoot;
 		this.sharedOverview = !lite && !!proxyRoot;
 
@@ -4187,18 +4799,15 @@ export class OrbitEngine {
 			return;
 		}
 
-		// Make both roots shadeable BEFORE anything re-skins them: generate the
-		// missing normals (without which the standard material shades to black),
-		// force the matte splat-tier look, and put falsely-BLEND opaque geometry
-		// back in the opaque queue so depth — not centroid sorting — decides what
-		// occludes what. See prepare.ts.
+		// Both roots were made shadeable in `prepareTour` — the missing normals
+		// generated, the matte splat-tier look forced, falsely-BLEND opaque geometry
+		// put back in the opaque queue (see prepare.ts). It is a property of the
+		// mesh, so it is done to the mesh, off this path.
 		if (lite) {
-			prepareLitScene(lite);
 			this.liteRoot = lite;
 			this.scene.add(lite);
 		}
 		if (proxyRoot) {
-			prepareLitScene(proxyRoot);
 			this.projection.setup(proxyRoot, this.sphereA);
 			this.proxyGroup = proxyRoot;
 			this.scene.add(proxyRoot);
@@ -4223,62 +4832,84 @@ export class OrbitEngine {
 			this.projection.buildBase(this.proxyGroup, this.scene);
 		}
 
-		const framed = lite ?? proxyRoot!;
-		const box = new Box3().setFromObject(framed);
+		// The box, the scale, the metrics and the nav graph were all solved in
+		// `prepareTour`; `commitTour` has already assigned the last three. What is
+		// left is the part that has to touch the camera and the shadow rig.
+		const box = prepared.box!;
+		this.sceneCenter.copy(prepared.center!);
 		const size = box.getSize(new Vector3());
-		box.getCenter(this.sceneCenter);
 		this.sceneMaxDim = Math.max(size.x, size.y, size.z) || 1;
 		this.sceneTopY = box.max.y;
 		this.sceneBottomY = box.min.y;
 		this.rig.fit(box); // spend the shadow frustum's precision on this scene
 
-		// MEASURE THE SCENE BEFORE ANYTHING READS A DISTANCE FROM IT. Every metre
-		// value below — the clip planes, the nav graph's reach, the marker sizes, the
-		// line-of-sight trims — is derived from these three numbers, so this has to
-		// land first. See scale.ts for what is measured and why.
-		//
-		// The proxy is passed because the eye height is found by dropping a ray from
-		// each capture onto it; a tour without one falls back, and both are handled
-		// inside measureSceneScale.
-		this.sceneScale = measureSceneScale(
-			this.sceneMaxDim,
-			entries.map((p) => p.position),
-			this.proxyGroup,
-		);
-		this.metrics = navMetrics(this.sceneScale);
-		console.info(`[orbit] scene scale — ${describeScale(this.sceneScale)}`);
-
 		this.camera.near = this.metrics.cameraNear;
 		this.camera.far = this.metrics.cameraFar;
 
-		// Build the typed navigation graph now that geometry + panos are placed.
-		// `segmentBlocked` reads `metrics.losTrim`, so the measurement above is a
-		// hard prerequisite rather than a nicety.
-		this.navGraph = buildNavGraph(
-			entries.map((p) => ({ position: p.position, zone: p.zone })),
-			this.panoLevel,
-			(a, b) => this.segmentBlocked(a, b),
-			this.metrics,
-		);
 		this.buildSceneDirectory(entries);
 
 		this.markers.build(this.sceneMaxDim, this.metrics);
 
-		// FRAMED TO THE SCENE, not to a multiple of one of its dimensions — so a
-		// wide flat level and a compact house both arrive filling the panel, which is
-		// the only way two builds can be compared by eye. See `fitDistance`.
-		this.browsePos
-			.copy(this.sceneCenter)
-			.addScaledVector(
-				BROWSE_DIR,
-				fitDistance(box, BROWSE_DIR, OVERVIEW_FOV, this.camera.aspect) *
-					BROWSE_MARGIN,
-			);
+		// SIZED TO THE FOOTPRINT, spread past it. A pool exactly the width of the
+		// floor is hidden BY the floor; what reads is the part that escapes the
+		// edges. Laid a hair above box.min.y so it cannot z-fight the ground it is
+		// lying on.
+		const foot = Math.max(size.x, size.z) * 1.45;
+		const glowMat = new ShaderMaterial({
+			transparent: true,
+			depthWrite: false,
+			// DEPTH-TESTED, so the build occludes it: the light is on the ground and
+			// the ground is behind the thing standing on it.
+			depthTest: true,
+			// NORMAL, NOT ADDITIVE, and the reason is the two-canvas stack.
+			//
+			// Additive is what a light on black wants, and on one opaque canvas it is
+			// right. Here the three.js layer is TRANSPARENT — the splat renders on its
+			// own canvas underneath (see splatLayer.ts) — so whatever this draws is
+			// composited by the BROWSER using the canvas's alpha. An additive quad
+			// contributes almost no alpha, so it was multiplied away twice and the
+			// pool simply never appeared. Straight alpha survives the handoff.
+			blending: NormalBlending,
+			uniforms: { uColor: { value: new Color(0.886, 0.91, 0.94) } },
+			vertexShader: `
+				varying vec2 vUv;
+				void main() {
+					vUv = uv;
+					gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+				}
+			`,
+			fragmentShader: `
+				uniform vec3 uColor;
+				varying vec2 vUv;
+				void main() {
+					// Radial falloff from the centre, squared so the edge goes soft
+					// rather than stopping — a lamp on a floor has no rim.
+					float d = length(vUv - 0.5) * 2.0;
+					float a = clamp(1.0 - d, 0.0, 1.0);
+					a = a * a * 0.34;
+					gl_FragColor = vec4(uColor * a, a);
+				}
+			`,
+		});
+		const glow = new Mesh(new PlaneGeometry(1, 1), glowMat);
+		glow.rotation.x = -Math.PI / 2;
+		glow.scale.set(foot, foot, 1);
+		glow.position.set(
+			this.sceneCenter.x,
+			box.min.y + this.sceneMaxDim * 0.002,
+			this.sceneCenter.z,
+		);
+		glow.renderOrder = -1;
+		this.stageGlow = glow;
+		this.scene.add(glow);
+
+		this.framingHull = framingHull(box, this.sceneCenter);
+		this.groundAnchor.copy(groundAnchor(box, this.sceneCenter));
+		this.frameOverview();
 		this.camera.position.copy(this.browsePos);
-		this.camera.fov = OVERVIEW_FOV;
-		this.camera.lookAt(this.sceneCenter);
+		this.camera.lookAt(this.browseTarget);
 		this.camera.updateProjectionMatrix();
-		this.controls.target.copy(this.sceneCenter);
+		this.controls.target.copy(this.browseTarget);
 		this.controls.enabled = true;
 		this.controls.update();
 		this.controls.autoRotate = true;
@@ -4288,26 +4919,98 @@ export class OrbitEngine {
 		this.hideOverlay();
 	}
 
+	// THE OVERVIEW POSE, as a function of the scene and the panel it is being shown
+	// in — which is why it is a method and not four lines inside the loader. The
+	// panel's aspect is half of the answer, and the panel resizes: the window
+	// changes, the row re-forms after a walkthrough. Framing once at load meant a
+	// resized window left the two builds fitted for a shape the page no longer had,
+	// and drifting off the shared ground line is exactly the thing this is for.
+	private frameOverview() {
+		if (this.framingHull.length === 0) return;
+
+		// FRAMED TO THE SCENE, not to a multiple of one of its dimensions — so a
+		// wide flat level and a compact house both arrive filling the panel, which
+		// is the only way two builds can be compared by eye. See `fitDistance`.
+		this.browsePos
+			.copy(this.sceneCenter)
+			.addScaledVector(
+				BROWSE_DIR,
+				fitDistance(
+					this.framingHull,
+					this.sceneCenter,
+					BROWSE_DIR,
+					OVERVIEW_FOV,
+					this.camera.aspect,
+				) * BROWSE_MARGIN,
+			);
+		this.browseTarget.copy(this.sceneCenter);
+
+		// AND THEN STOOD ON THE GROUND LINE. The fit decides how big the scene is in
+		// the panel; this decides where in the panel it sits, which is the half that
+		// makes a pair look like a pair. The fov has to be the overview's before the
+		// solve reads it — the pan is measured through the lens it will be seen
+		// through — and the camera is left wherever the solve finished with it, so
+		// every caller sets the pose it wants afterwards.
+		this.camera.fov = OVERVIEW_FOV;
+		this.camera.updateProjectionMatrix();
+		const pan = groundLinePan(
+			this.camera,
+			this.framingHull,
+			this.groundAnchor,
+			this.browsePos,
+			this.browseTarget,
+		);
+		_panShift.setFromMatrixColumn(this.camera.matrixWorld, 1).normalize();
+		this.browsePos.addScaledVector(_panShift, pan);
+		this.browseTarget.addScaledVector(_panShift, pan);
+
+		// AND THEN CENTRED ACROSS. The vertical solve above stands the build on the
+		// ground line; this puts it in the middle of the frame. Solved after it, and
+		// given the vertical offset, because the two are not independent — sliding up
+		// changes what the hull projects to, so centring against the pre-pan
+		// projection would leave it off by however far the camera had moved.
+		const across = centrePan(
+			this.camera,
+			this.framingHull,
+			this.browsePos,
+			this.browseTarget,
+			0,
+			_panShift,
+		);
+		_centreRight.setFromMatrixColumn(this.camera.matrixWorld, 0).normalize();
+		this.browsePos.addScaledVector(_centreRight, across);
+		this.browseTarget.addScaledVector(_centreRight, across);
+	}
+
 	// Line-of-sight test for the nav graph: is the straight segment between two
 	// capture points blocked by the proxy? (No proxy → nothing occludes, so every
 	// same-level pair reads as a clear walk.) Trimmed at both ends so hugging a
 	// wall doesn't read as a block.
+	// `proxy` and `metrics` are arguments rather than reads off `this` so the nav
+	// graph can be solved against a scene that has not been installed yet — see
+	// prepareTour, where doing exactly that is what took ~150 ms off the swap.
+	// Both default to the live scene for every other caller.
 	private segmentBlocked(
 		a: [number, number, number],
 		b: [number, number, number],
+		proxy: Group | null = this.proxyGroup,
+		metrics: NavMetrics = this.metrics,
 	): boolean {
-		if (!this.proxyGroup) return false;
+		if (!proxy) return false;
 		const from = v3(a);
 		const d = v3(b).sub(from);
 		const dist = d.length();
 		if (dist < 1e-3) return false;
 		d.divideScalar(dist);
-		const trim = this.metrics.losTrim;
+		const trim = metrics.losTrim;
 		this.occluder.set(from, d);
 		this.occluder.near = trim;
 		this.occluder.far = dist - trim;
 		if (this.occluder.far <= this.occluder.near) return false;
-		return this.occluder.intersectObject(this.proxyGroup, true).length > 0;
+		// `proxy`, NOT `this.proxyGroup` — during a prepare the latter is still the
+		// OUTGOING scene, so testing against it would solve the incoming scene's
+		// sightlines through the previous building's walls.
+		return this.occluder.intersectObject(proxy, true).length > 0;
 	}
 
 	// Live LOS from the camera to a target pano position. Shoots one direct ray

@@ -1,4 +1,5 @@
 "use client";
+import Button from "@/components/ui/Button";
 
 /**
  * One half of the vote, as a segment of the bar floating over the scenes.
@@ -47,15 +48,23 @@ export default function VoteButton({
 	);
 
 	return (
-		<button
-			type="button"
+		<Button
+			// The side is the SHAPE: A raked left, B raked right, so the pair leans
+			// away from the SKIP between them and the three interlock into one bar.
+			// Colour is no longer part of it — see the sweep below.
+			variant="solid"
+			sweep
+			shape={side === "a" ? "start" : "end"}
 			onClick={onVote}
 			disabled={disabled}
-			className="group/vote flex w-full cursor-pointer items-center justify-center gap-[clamp(7px,0.9vw,14px)] bg-foreground px-[clamp(12px,1.4vw,26px)] py-[clamp(12px,1.6vh,21px)] font-sans text-[clamp(11px,0.95vw,16px)] font-bold tracking-[0.12em] whitespace-nowrap text-background uppercase transition-[background-color,color,transform] duration-200 hover:-translate-y-0.75 hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 focus-visible:ring-offset-2 focus-visible:ring-offset-black active:translate-y-0 disabled:cursor-default disabled:opacity-40"
+			className="group/vote relative flex w-full items-center justify-center disabled:cursor-default disabled:opacity-40"
+			style={{ animation: "content-swap 400ms ease both" }}
 		>
-			{side === "a" && arrow}
-			<span className="truncate">{label}</span>
-			{side === "b" && arrow}
-		</button>
+			<span className="relative flex items-center gap-sm">
+				{side === "a" && arrow}
+				<span className="truncate">{label}</span>
+				{side === "b" && arrow}
+			</span>
+		</Button>
 	);
 }

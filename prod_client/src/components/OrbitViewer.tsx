@@ -53,6 +53,8 @@ export type OrbitViewerHandle = {
 export default function OrbitViewer({
 	scene = null,
 	source = null,
+	warm = null,
+	commitVia,
 	onFocusedChange,
 	ref,
 }: {
@@ -64,14 +66,22 @@ export default function OrbitViewer({
 	// Must be referentially STABLE — its identity is what triggers a reload, so a
 	// source rebuilt inline on each render would restart the scene every frame.
 	source?: TourSource | null;
+	/** A source to solve ahead of time — see OrbitEngine.warmTour. Also stable. */
+	warm?: TourSource | null;
+	/** Hands this panel's swap to a coordinator. See PairGate. */
+	commitVia?: (commit: () => void) => void;
 	onFocusedChange?: (focused: boolean) => void;
 }) {
 	const rootRef = useRef<HTMLDivElement>(null);
-	const { hostRef, engineRef, state, inside } = useOrbitEngine({ scene, source });
+	const { hostRef, engineRef, state, inside } = useOrbitEngine({
+		scene,
+		source,
+		warm,
+		commitVia,
+	});
 	const {
 		isFullscreen,
 		supported,
-		enter: enterFullscreen,
 		exit: exitFullscreen,
 		toggle,
 	} = useFullscreen(rootRef);
@@ -91,34 +101,19 @@ export default function OrbitViewer({
 	const { mode, minimap, overlay } = state;
 	const landed = mode === "interior";
 
-	// FULLSCREEN IS THE LAST BEAT OF ARRIVING, AND THE FIRST BEAT OF LEAVING.
+	// ENTERING A SCENE DOES NOT TAKE THE SCREEN.
 	//
-	// Going in, it waits for `mode === "interior"` — the engine saying the flight is
-	// over. The panel finished opening before that (the row takes 1000 ms, the
-	// flight 1100), so the screen is taken with nothing else still moving; asking on
-	// the click instead would run the browser's own fullscreen transition across the
-	// whole dive.
+	// It used to: arriving inside asked for browser fullscreen, so stepping into a
+	// build swapped the whole window, hid the browser chrome and left the viewer to
+	// find their way out of a mode they had not asked for. Walking through a scene
+	// does not need the screen — it needs the SITE out of the way, which is a
+	// different thing and is now what happens (see page.tsx, which clears its own
+	// furniture while a panel is toured).
 	//
-	// ONCE PER VISIT. A viewer who leaves fullscreen but stays in the scene has said
-	// what they want, and peeking or stepping between rooms must not put it back —
-	// which it would, since the mode returns to "interior" each time. The latch
-	// clears only on the way out.
-	//
-	// The request is a promise that may simply be refused: it is made about a second
-	// after the click that started the journey, and a browser that has already
-	// expired that gesture is entitled to say no. Nothing is broken when it does —
-	// the walkthrough is exactly as usable in the panel, and the ⛶ control is still
-	// there — so the refusal is swallowed rather than handled.
-	const tookScreen = useRef(false);
-	useEffect(() => {
-		if (!inside) {
-			tookScreen.current = false;
-			return;
-		}
-		if (!landed || !supported || tookScreen.current) return;
-		tookScreen.current = true;
-		void enterFullscreen();
-	}, [inside, landed, supported, enterFullscreen]);
+	// The ⛶ control is still there for anyone who does want it, and because nothing
+	// enters fullscreen behind the viewer's back, Escape reaches the document again
+	// and the engine's own handler gets it — which is what the block below had to
+	// work around when the browser was consuming it.
 
 	// LEAVING FULLSCREEN LEAVES THE SCENE — because the browser will not let us do
 	// this any other way.
@@ -218,8 +213,37 @@ export default function OrbitViewer({
 		setViewedLevel(currentLevel);
 	}
 
+	// `isolate` KEEPS THIS COMPONENT'S LAYERING INSIDE THIS COMPONENT.
+	//
+	// Without it the root is `relative` with `z-index: auto`, which creates NO
+	// stacking context — so every z-index used in here competes directly with the
+	// panel's own siblings instead of staying local. The loading veil below is
+	// `z-20`; the seam the arena draws down the panel edge is `z-10`. The veil
+	// therefore covered the beam, and being black at 0.8 alpha it rendered it at
+	// exactly 1 - 0.8. Measured, the beam painted 47 against its own 237, and
+	// forced to pure red it drew rgb(51,0,0) — while its own opacity and every
+	// ancestor's read 1, with no filter or blend anywhere in the chain. Nothing
+	// about the beam was wrong, which is why nothing done to the beam fixed it.
+	//
+	// It only ever showed on a cold load, because that is the only time the veil is
+	// up, and it stopped at exactly the moment the veil came down.
 	return (
-		<div ref={rootRef} className='group relative h-full w-full bg-black'>
+		<div
+			ref={rootRef}
+			// `pointer-events-auto`, ASSERTED RATHER THAN ASSUMED.
+			//
+			// The viewer used to be rendered INSIDE the panel's dim layer, which is
+			// `pointer-events-none` so its tint cannot swallow clicks — and
+			// `pointer-events` INHERITS, so the viewer, its host and both canvases
+			// silently inherited `none`. The scene stopped taking drag, wheel and click
+			// while looking completely normal, because nothing about a canvas looks
+			// different when it is not listening.
+			//
+			// The dim is a sibling above the viewer now (see ScenePanel), so the
+			// inheritance is gone. This stays as a floor: whatever a caller wraps this
+			// component in, the layer that owns the input says so itself.
+			className='group relative isolate h-full w-full bg-ground pointer-events-auto'
+		>
 			<div ref={hostRef} className='absolute inset-0' />
 
 			{supported && (

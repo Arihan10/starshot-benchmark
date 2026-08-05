@@ -34,14 +34,15 @@ export default function LogoMark({ className }: { className?: string }) {
 		// `aria-hidden`: the wordmark beside it already says SceneBench, and a
 		// screen reader does not need to be told twice.
 		<span aria-hidden className={`relative block ${className ?? ""}`}>
-			<Image
-				src="/logo.png"
-				alt=""
-				fill
-				sizes="86px"
-				priority
-				className="object-contain [filter:brightness(0)_invert(1)]"
-			/>
+			{/* THE FLAT STATE, AND IT IS A FILL RATHER THAN A FILTER.
+
+			    This was the artwork under `brightness(0) invert(1)` — a filter chain
+			    whose only possible output is white, so the mark was the last thing on
+			    the page that could not follow the palette. Masked to the same silhouette
+			    instead (the glint below already works this way), it is a `bg-mark`
+			    rectangle showing through the logo's own alpha, so it takes whatever the
+			    mark currently is and needs no second artwork. */}
+			<span className="absolute inset-0 bg-mark [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain]" />
 
 			{/* THE COLOUR, uncovered by the terminator. The mask is twice the width of
 			    the mark and slides from one end to the other, so what crosses the face
@@ -62,7 +63,7 @@ export default function LogoMark({ className }: { className?: string }) {
 			    the mark entirely — it exists only in passing, which is what a specular
 			    is. */}
 			<span
-				className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgba(255,255,255,0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]"
+				className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgb(var(--ink-rgb)_/_0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]"
 			/>
 		</span>
 	);

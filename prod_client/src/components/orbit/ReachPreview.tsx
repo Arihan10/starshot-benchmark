@@ -126,7 +126,7 @@ export default function ReachPreview({
 			}}
 		>
 			<div
-				className='overflow-hidden rounded-xl bg-neutral-950/85 shadow-2xl backdrop-blur'
+				className='overflow-hidden rounded-xl bg-ground/85 shadow-2xl backdrop-blur'
 				style={{
 					border: `1px solid ${accent}80`,
 					// Everything inside sizes off the card's own width, so the panorama
@@ -135,7 +135,7 @@ export default function ReachPreview({
 				}}
 			>
 				<div
-					className='relative overflow-hidden bg-neutral-900'
+					className='relative overflow-hidden bg-surface'
 					style={{ aspectRatio: PANO_SCREEN_ASPECT }}
 				>
 					{layers.map((layer) => (
@@ -165,7 +165,7 @@ export default function ReachPreview({
 					))}
 					<div className='pointer-events-none absolute inset-x-0 top-0 h-14 bg-linear-to-b from-black/70 to-transparent' />
 					<span
-						className='absolute left-3 top-3 rounded px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-950'
+						className='absolute left-3 top-3 rounded px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-ground'
 						style={{ background: accent }}
 					>
 						{delta === 0
@@ -175,9 +175,9 @@ export default function ReachPreview({
 				</div>
 				<div
 					className='flex items-center justify-between gap-2 px-3 py-2'
-					style={{ fontSize: "clamp(11px, 2.6cqw, 17px)" }}
+					style={{ fontSize: "var(--text-xs)" }}
 				>
-					<span className='min-w-0 truncate font-semibold text-white'>
+					<span className='min-w-0 truncate font-semibold text-ink'>
 						{shown?.name ?? "unnamed"}
 					</span>
 					<span

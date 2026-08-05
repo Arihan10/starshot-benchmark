@@ -1,3 +1,4 @@
+import type { SplatTransform } from "./splatLayer";
 // What the orbit page needs to build one scene: the dollhouse (overview) GLB,
 // plus an optional capture-tour manifest. URLs are R2 assets (same-origin via
 // the /r2 proxy). A null manifest means dollhouse-only — no panos to place.
@@ -10,6 +11,19 @@ export type TourSource = {
 	// it REPLACES the dollhouse as the scene's appearance (overview + free flight);
 	// the dollhouse stays loaded as the fallback and as the addressable geometry.
 	splatUrl: string | null;
+	/**
+	 * Where the splat has to be moved to sit on its own mesh.
+	 *
+	 * #TODO TEMPORARY, AND IT BELONGS TO ONE BAD BUNDLE. A published SOG should
+	 * already be in the scene's frame — the trained PLYs for these cells are — but
+	 * modern-house/opus-new's decodes to a centre near (-55, +52, +17) on a scene
+	 * that lives at the origin, so it renders off in the middle distance and the
+	 * panel looks empty. This is the correction, carried by the cell that needs it
+	 * rather than baked into the engine, so exactly one line has to be deleted when
+	 * the encode is fixed. Omitted means identity, which is what every other cell
+	 * gets and what all of them should get.
+	 */
+	splatTransform?: SplatTransform;
 	resolvePano: (file: string) => { url: string; placeholderUrl: string };
 	resolveProxy: (file: string) => string;
 	resolveMinimap: (file: string) => string;

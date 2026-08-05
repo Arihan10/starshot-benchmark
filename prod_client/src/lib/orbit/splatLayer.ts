@@ -46,16 +46,30 @@ const CLEAR = [0, 0, 0] as const;
 
 type Pc = typeof import("playcanvas");
 
+/** A splat that has been decoded and uploaded but is not on screen yet. */
+type Staged = {
+	entity: import("playcanvas").Entity;
+	asset: import("playcanvas").Asset;
+	url: string;
+};
+
 export class SplatLayer {
 	private pc: Pc | null = null;
 	private app: import("playcanvas").Application | null = null;
 	private canvas: HTMLCanvasElement | null = null;
 	private camera: import("playcanvas").Entity | null = null;
 	private entity: import("playcanvas").Entity | null = null;
+	// Held alongside the entity so `clear` can unload exactly the asset it owns.
+	// It used to unload the registry wholesale (`app.assets.list()`), which is fine
+	// when a layer only ever holds one splat at a time — and wrong the moment one is
+	// being staged behind another, since the next scene's asset is in that list too.
+	private asset: import("playcanvas").Asset | null = null;
+	// The next splat, built and waiting. See `prepare`.
+	private staged: Staged | null = null;
 	private assetUrl: string | null = null;
 	private transform: SplatTransform = { ...IDENTITY_TRANSFORM };
 	private active = false;
-	// Invalidated on every load/clear so an in-flight import or asset fetch that
+	// Invalidated on every prepare/clear so an in-flight import or asset fetch that
 	// lands after the scene changed is dropped instead of attaching to it.
 	private token = 0;
 
@@ -82,13 +96,23 @@ export class SplatLayer {
 	}
 
 	/**
-	 * Load `url` as the layer's splat, creating the PlayCanvas app on first use.
+	 * Build `url` into a splat that is ready to show, WITHOUT touching the one
+	 * currently on screen.
+	 *
+	 * This is the expensive half — the fetch, the decode and the GPU upload — and
+	 * splitting it from `commit` is what lets a scene change happen with the
+	 * previous scene still rendering. Nothing here is visible: the entity is
+	 * parented but disabled, so it costs no draw call until it is committed.
+	 *
 	 * Resolves false when the load was superseded or failed — the caller carries
 	 * on without a splat rather than failing the scene, since the dollhouse and
 	 * the walkthrough are both perfectly usable on their own.
 	 */
-	async load(url: string): Promise<boolean> {
-		this.clear();
+	async prepare(url: string): Promise<boolean> {
+		// A stage that never got committed belongs to a load that has been
+		// abandoned; it holds GPU memory, so it goes now rather than at the next
+		// commit.
+		this.discardStaged();
 		const token = ++this.token;
 		try {
 			if (!this.pc) this.pc = await import("playcanvas");
@@ -109,6 +133,28 @@ export class SplatLayer {
 				asset.unload();
 				return false;
 			}
+			// A REGISTRY HIT IS NOT A LOAD.
+			//
+			// PlayCanvas keys assets by URL and hands the existing one back on a
+			// repeat request — INCLUDING one whose fetch failed earlier, and it calls
+			// back with no error when it does. So the second time a scene with a
+			// missing splat comes round, this resolves with an asset that has no
+			// resource, the entity built from it draws nothing, and `ready` goes true
+			// anyway. The engine then hides the dollhouse in favour of a splat that
+			// is not there and the panel is simply black — no overlay, because
+			// nothing reported a failure.
+			//
+			// That is the intermittent "one scene doesn't load at all": it needs the
+			// same broken URL to be asked for twice, so it misses the first time
+			// round and hits on the second. Checked rather than trusted, and evicted
+			// from the registry so a later round genuinely refetches instead of being
+			// handed the same corpse.
+			if (!asset.resource) {
+				app.assets.remove(asset);
+				asset.unload();
+				console.warn("[splat] no resource for", url);
+				return false;
+			}
 			// `app` EXPLICITLY. `new pc.Entity(name)` defaults its owning app to
 			// PlayCanvas' module-global "current application" — the last one
 			// constructed anywhere on the page — and `addComponent` resolves the
@@ -120,16 +166,65 @@ export class SplatLayer {
 			// path entirely. Same reason the camera below passes it.
 			const entity = new pc.Entity("splat", app);
 			entity.addComponent("gsplat", { asset });
+			// PARENTED BUT OFF. It has to be in the graph for the component system to
+			// have built its render resources, and it must not draw over the splat
+			// this one is replacing — which is still on screen at this point.
+			entity.enabled = false;
 			app.root.addChild(entity);
-			this.entity = entity;
-			this.assetUrl = url;
-			this.applyTransform();
-			this.resize();
+			this.staged = { entity, asset, url };
 			return true;
 		} catch (e) {
 			console.warn("[splat] load failed", e);
 			return false;
 		}
+	}
+
+	/**
+	 * Put the prepared splat on screen, dropping whatever was there.
+	 *
+	 * Synchronous by construction — everything slow already happened in `prepare` —
+	 * so the old scene and the new one are never both absent. With nothing staged
+	 * this is just a clear, which is what a scene that ships no splat wants.
+	 */
+	commit() {
+		const next = this.staged;
+		this.staged = null;
+		this.dropActive();
+		if (!next) return;
+		this.entity = next.entity;
+		this.asset = next.asset;
+		this.assetUrl = next.url;
+		next.entity.enabled = true;
+		this.applyTransform();
+		this.resize();
+	}
+
+	/** Throw away a prepared splat that is never going to be shown. */
+	discardStaged() {
+		const s = this.staged;
+		this.staged = null;
+		if (!s) return;
+		s.entity.destroy();
+		s.asset.unload();
+	}
+
+	/** Drop the splat that is on screen, leaving anything staged alone. */
+	private dropActive() {
+		// Routed through setActive rather than reaching for the style directly, so
+		// exactly ONE place decides how this canvas is hidden. Two places disagreeing
+		// is not hypothetical: this used to hide it with `display: none` while
+		// setActive showed it again with `visibility`, which left the element
+		// undisplayed forever and the splat permanently invisible.
+		this.setActive(false);
+		if (this.entity) {
+			this.entity.destroy();
+			this.entity = null;
+		}
+		if (this.asset) {
+			this.asset.unload();
+			this.asset = null;
+		}
+		this.assetUrl = null;
 	}
 
 	private create(pc: Pc) {
@@ -265,24 +360,20 @@ export class SplatLayer {
 		if (w > 0 && h > 0) this.app.resizeCanvas(w, h);
 	}
 
-	/** Drop the current splat, keeping the app alive for the next scene. */
+	/**
+	 * Drop the current splat, keeping the app alive for the next scene.
+	 *
+	 * Deliberately leaves a STAGED splat untouched: the engine clears the old scene
+	 * and commits the new one back to back, so this runs between a prepare and its
+	 * commit and must not take the thing it is about to show.
+	 */
 	clear() {
 		this.token++;
-		// Routed through setActive rather than reaching for the style directly, so
-		// exactly ONE place decides how this canvas is hidden. Two places disagreeing
-		// is not hypothetical: this method used to hide it with `display: none` while
-		// setActive showed it again with `visibility`, which left the element
-		// undisplayed forever and the splat permanently invisible.
-		this.setActive(false);
-		if (this.entity) {
-			this.entity.destroy();
-			this.entity = null;
-		}
-		if (this.app) this.app.assets.list().forEach((a) => a.unload());
-		this.assetUrl = null;
+		this.dropActive();
 	}
 
 	dispose() {
+		this.discardStaged();
 		this.clear();
 		const app = this.app;
 		this.app = null;

@@ -99,66 +99,84 @@
   <sc-if value="{{isBoot}}" hint-placeholder-val="{{true}}">
     <div style="position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;gap:12px;pointer-events:none">
       <div style="width:8px;height:8px;background:var(--ink,#ffffff);animation:sb-blink 1s infinite"></div>
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.3em;color:#8a8a8a">COMPILING SCENES</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.3em;color:#8a8a8a">LOADING SPLATS</div>
     </div>
   </sc-if>
   <sc-if value="{{isError}}" hint-placeholder-val="{{false}}">
     <div style="position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;pointer-events:none">
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.3em;color:#8a8a8a">WEBGL UNAVAILABLE — SCENES CANNOT RENDER</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.3em;color:#8a8a8a">{{errMsg}}</div>
     </div>
   </sc-if>
 </div>
 </x-dc>
-<script type="text/x-dc" data-dc-script data-props="{&quot;whiteTone&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#f2f1ed&quot;,&quot;options&quot;:[&quot;#ffffff&quot;,&quot;#f2f1ed&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;sceneLayout&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;full-fade&quot;,&quot;options&quot;:[&quot;current&quot;,&quot;divider&quot;,&quot;full&quot;,&quot;full-fade&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;centerLine&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;orbitSpeed&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:0.14,&quot;min&quot;:0,&quot;max&quot;:0.6,&quot;step&quot;:0.02,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Motion&quot;},&quot;revealHoldMs&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:2600,&quot;min&quot;:1200,&quot;max&quot;:6000,&quot;step&quot;:100,&quot;unit&quot;:&quot;ms&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Motion&quot;},&quot;shadows&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Quality&quot;}}">
+<script type="text/x-dc" data-dc-script data-props="{&quot;whiteTone&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#f2f1ed&quot;,&quot;options&quot;:[&quot;#ffffff&quot;,&quot;#f2f1ed&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;sceneLayout&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;full-fade&quot;,&quot;options&quot;:[&quot;current&quot;,&quot;divider&quot;,&quot;full&quot;,&quot;full-fade&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;centerLine&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;orbitSpeed&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:0.14,&quot;min&quot;:0,&quot;max&quot;:0.6,&quot;step&quot;:0.02,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Motion&quot;},&quot;revealHoldMs&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:2600,&quot;min&quot;:1200,&quot;max&quot;:6000,&quot;step&quot;:100,&quot;unit&quot;:&quot;ms&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Motion&quot;},&quot;frameZoom&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:1.9,&quot;min&quot;:1.2,&quot;max&quot;:3,&quot;step&quot;:0.05,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Camera&quot;}}">
 class Component extends DCLogic {
   state = { phase: 'boot', idx: 0, dispA: 0, dispB: 0 };
-  MODELS = ['Claude Opus 4.5', 'GPT-5.2', 'Gemini 3 Pro', 'Grok 4.1', 'Llama 4', 'DeepSeek V4'];
-  PAIRS = [[0,1],[2,3],[4,5],[0,2],[3,1],[5,0],[2,4],[1,5],[4,0],[3,2],[5,4],[1,3]];
-  PROMPTS = [
-    ['A cozy alpine village at dusk', 0],
-    ['A neon-drenched cyber alley', 1],
-    ['A floating island temple', 2],
-    ['A modern desert house', 3],
-    ['A candy-bright platform level', 4],
+
+  // The builds the arena puts side by side: the two cells whose TRAINED GAUSSIAN SPLAT
+  // is checked into the production client (prod_client/public/scenes). `dir` is the
+  // folder that cell's trained.web.sog sits in — splat.js resolves the rest of the URL
+  // — and `model` is the thing actually under comparison.
+  CELLS = {
+    'gemini-flash': { dir: 'modern-house-gemini-flash', model: 'Gemini Flash' },
+    'opus-new': { dir: 'platformer-level-opus-new', model: 'Claude Opus' },
+  };
+
+  // One matchup each: the prompt both builds were given, the two cells, and the share
+  // of previous voters who picked the LEFT one — revealed after the vote rather than
+  // invented per battle, since it is a property of the leaderboard.
+  //
+  // #TODO: BOTH ROUNDS PAIR TWO DIFFERENT PROMPTS AGAINST EACH OTHER, which is not what
+  // the arena claims to be showing — a matchup is one prompt built twice. These are the
+  // only two cells with a splat captured, so they are what the design can be exercised
+  // against; the moment one slot has two models trained, build the round from that.
+  // Same #TODO, and the same cause, as prod_client/src/lib/localScenes.ts.
+  ROUNDS = [
+    { prompt: 'A super mario style platformer level', leftShare: 38, cells: ['gemini-flash', 'opus-new'] },
+    { prompt: 'A modern house', leftShare: 61, cells: ['opus-new', 'gemini-flash'] },
   ];
+
   refA = React.createRef();
   refB = React.createRef();
 
-  rng32(a) { return function() { a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
   num(k, d) { const v = parseFloat(this.props[k]); return isNaN(v) ? d : v; }
 
   battle(i) {
-    const rng = this.rng32(i * 7349 + 29);
-    let [a, b] = this.PAIRS[i % this.PAIRS.length];
-    if (rng() < .5) [a, b] = [b, a];
-    const win = 54 + Math.floor(rng() * 33);
-    const aWins = rng() < .5;
-    const p = this.PROMPTS[i % this.PROMPTS.length];
-    return { prompt: p[0], recipe: p[1], mA: this.MODELS[a], mB: this.MODELS[b],
-      pctA: aWins ? win : 100 - win, pctB: aWins ? 100 - win : win,
-      seedA: i * 211 + 17, seedB: i * 977 + 71 };
+    const r = this.ROUNDS[i % this.ROUNDS.length];
+    const a = this.CELLS[r.cells[0]], b = this.CELLS[r.cells[1]];
+    return { prompt: r.prompt, dirA: a.dir, dirB: b.dir, mA: a.model, mB: b.model,
+      pctA: r.leftShare, pctB: 100 - r.leftShare };
+  }
+
+  build() {
+    const S = this.S, sp = this.num('orbitSpeed', .14), fz = this.num('frameZoom', 1.9);
+    this.vpA = new S.Viewport(this.refA.current, { orbitSpeed: sp, frameZoom: fz, az0: -0.7 });
+    this.vpB = new S.Viewport(this.refB.current, { orbitSpeed: sp * 1.12, frameZoom: fz, az0: 0.55 });
+    this._stop = S.startLoop([this.vpA, this.vpB]);
   }
 
   async componentDidMount() {
     try {
-      const S = this.S = await import('./scenes.js');
-      const sp = this.num('orbitSpeed', .14), sh = this.props.shadows ?? true;
-      this.vpA = new S.Viewport(this.refA.current, { orbitSpeed: sp, shadows: sh, az0: -0.7 });
-      this.vpB = new S.Viewport(this.refB.current, { orbitSpeed: sp * 1.12, shadows: sh, az0: 0.55 });
-      this._stop = S.startLoop([this.vpA, this.vpB]);
-      this.loadBattle(0);
+      this.S = await import('./splat.js');
+      this.build();
+      // Boot holds until both splats are on screen: they are ~12 MB apiece, and a
+      // half-loaded arena is a comparison of one scene against black.
+      await this.loadBattle(0);
       this.setState({ phase: 'vote' });
-    } catch (e) { console.error(e); this.setState({ phase: 'error' }); }
+    } catch (e) {
+      console.error(e);
+      this.setState({ phase: 'error', errMsg: e && e.code === 'no-base'
+        ? 'SPLATS NOT FOUND — SERVE prod_client/public/scenes'
+        : 'WEBGL UNAVAILABLE — SCENES CANNOT RENDER' });
+    }
   }
   componentDidUpdate() {
+    // A prop edit re-mounts the template, which takes both panels' canvases with it.
     if (this.vpA && this.refA.current && !this.refA.current.firstChild) {
       this._stop && this._stop();
       this.vpA.dispose(); this.vpB.dispose();
-      const S = this.S, sp = this.num('orbitSpeed', .14), sh = this.props.shadows ?? true;
-      this.vpA = new S.Viewport(this.refA.current, { orbitSpeed: sp, shadows: sh, az0: -0.7 });
-      this.vpB = new S.Viewport(this.refB.current, { orbitSpeed: sp * 1.12, shadows: sh, az0: 0.55 });
-      this._stop = S.startLoop([this.vpA, this.vpB]);
-      this.loadBattle(this.state.idx);
+      this.build();
+      this.loadBattle(this.state.idx).catch(e => console.error(e));
     }
   }
   componentWillUnmount() {
@@ -168,8 +186,7 @@ class Component extends DCLogic {
 
   loadBattle(i) {
     const b = this.cur = this.battle(i);
-    this.vpA.load(b.recipe, b.seedA, 0);
-    this.vpB.load(b.recipe, b.seedB, 1);
+    return Promise.all([this.vpA.load(b.dirA), this.vpB.load(b.dirB)]);
   }
   vote = () => {
     if (this.state.phase !== 'vote') return;
@@ -192,21 +209,27 @@ class Component extends DCLogic {
   }
   advance() {
     this.setState({ phase: 'switch' });
-    setTimeout(() => {
+    // The panels stay faded through the swap, not just the 280 ms of it: the outgoing
+    // splat is torn down the moment the next load starts, and the first time a cell
+    // comes round its 12 MB has to arrive before there is anything to fade back in.
+    // Once seen, a cell's asset is held (splat.js), so later rounds swap in a frame.
+    setTimeout(async () => {
       const i = this.state.idx + 1;
-      this.loadBattle(i);
-      this.setState({ idx: i, phase: 'vote' });
+      this.setState({ idx: i, phase: 'load' });
+      try { await this.loadBattle(i); } catch (e) { console.error(e); }
+      this.setState({ phase: 'vote' });
     }, 280);
   }
 
   renderVals() {
     const st = this.state, b = this.cur ?? this.battle(0);
     if (this.vpA) {
-      const sp = this.num('orbitSpeed', .14), sh = this.props.shadows ?? true;
+      const sp = this.num('orbitSpeed', .14), fz = this.num('frameZoom', 1.9);
       this.vpA.autoSpeed = sp; this.vpB.autoSpeed = sp * 1.12;
-      this.vpA.setShadows(sh); this.vpB.setShadows(sh);
+      this.vpA.setFrameZoom(fz); this.vpB.setFrameZoom(fz);
     }
-    const reveal = st.phase === 'reveal', aWin = b.pctA >= b.pctB, sw = st.phase === 'switch';
+    const reveal = st.phase === 'reveal', aWin = b.pctA >= b.pctB;
+    const loading = st.phase === 'load', sw = st.phase === 'switch' || loading;
     const ink = this.props.whiteTone || '#ffffff';
     const fs = Math.min(33, Math.floor(660 / (b.prompt.length * .56)));
     const promptArc = React.createElement('svg',
@@ -218,7 +241,8 @@ class Component extends DCLogic {
       promptArc,
       refA: this.refA, refB: this.refB,
       voteA: this.vote, voteB: this.vote, voteTie: this.vote,
-      isBoot: st.phase === 'boot', isError: st.phase === 'error', isReveal: reveal,
+      isBoot: st.phase === 'boot' || loading, isError: st.phase === 'error', isReveal: reveal,
+      errMsg: st.errMsg || 'WEBGL UNAVAILABLE — SCENES CANNOT RENDER',
       nameA: b.mA, nameB: b.mB, dispA: st.dispA, dispB: st.dispB,
       colA: aWin ? ink : '#4a4a4a', colB: aWin ? '#4a4a4a' : ink,
       inkVar: '--ink:' + ink,

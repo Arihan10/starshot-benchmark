@@ -22,14 +22,14 @@ export default function HoverCard({ preview }: { preview: HoverPreview }) {
 	const meta = EDGE_META[preview.type];
 	return (
 		<div
-			className='pointer-events-none absolute z-20 w-48 -translate-x-1/2 -translate-y-[calc(100%+14px)] overflow-hidden rounded-lg border bg-neutral-950/85 shadow-2xl backdrop-blur'
+			className='pointer-events-none absolute z-20 w-48 -translate-x-1/2 -translate-y-[calc(100%+14px)] overflow-hidden rounded-lg border bg-ground/85 shadow-2xl backdrop-blur'
 			style={{
 				left: preview.screenX,
 				top: preview.screenY,
 				borderColor: `${meta.color}66`,
 			}}
 		>
-			<div className='relative h-26 w-full bg-neutral-800'>
+			<div className='relative h-26 w-full bg-surface-lit'>
 				{/* eslint-disable-next-line @next/next/no-img-element -- runtime R2 thumbnail via /r2 proxy */}
 				<img
 					src={preview.thumbUrl}
@@ -46,10 +46,10 @@ export default function HoverCard({ preview }: { preview: HoverPreview }) {
 				</span>
 			</div>
 			<div className='flex items-center justify-between gap-2 px-2.5 py-1.5'>
-				<span className='min-w-0 truncate text-xs font-semibold text-white'>
+				<span className='min-w-0 truncate text-xs font-semibold text-ink'>
 					{preview.name ?? "unnamed"}
 				</span>
-				<span className='shrink-0 text-[10px] tabular-nums text-neutral-400'>
+				<span className='shrink-0 text-[10px] tabular-nums text-ink-64'>
 					{preview.dist < 100 ? `${preview.dist.toFixed(0)} m` : ""}
 				</span>
 			</div>

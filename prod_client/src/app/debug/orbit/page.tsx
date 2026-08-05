@@ -3,7 +3,7 @@ import ViewerHeader from "../ViewerHeader";
 
 export default function OrbitPage() {
 	return (
-		<main className="relative flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+		<main className="relative flex h-dvh flex-col overflow-hidden bg-ground text-ink">
 			<ViewerHeader />
 			<OrbitWorkspace />
 		</main>

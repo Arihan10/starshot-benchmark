@@ -2,10 +2,12 @@
 
 import { easeOutCubic, useProgress } from "./useProgress";
 
-// Held back until the shatter has played and the Elo has moved. The order is the
-// point: what YOU chose, then what it cost, then what everyone else chose. Arriving
-// first, the crowd's answer would colour your reading of your own.
-const DELAY_MS = 1650;
+// STRAIGHT AWAY. It was held 1.65 s so as not to talk over the rating counting up
+// — what you chose, then what it cost, then what everyone else chose. There is no
+// count any more (see RevealCard), so the only thing the delay was doing was
+// holding a zero on screen and then animating it, which reads as the number being
+// slow rather than as an order being kept.
+const DELAY_MS = 0;
 const COUNT_MS = 950;
 
 /**
@@ -32,14 +34,14 @@ export default function PctReadout({
 			// bottom of the panel ended up sliced in half by the card that came to
 			// meet it. This is that bar's own offset plus its height, which is the
 			// least it can be raised and still clear it.
-			className={`pointer-events-none absolute bottom-[clamp(92px,13.5vh,168px)] z-20 flex flex-col gap-0.5 ${
+			className={`pointer-events-none absolute bottom-[calc(var(--spacing-xl)*2.6)] z-20 flex flex-col gap-0.5 ${
 				align === "left"
-					? "left-[clamp(18px,1.8vw,34px)] items-start"
-					: "right-[clamp(18px,1.8vw,34px)] items-end"
+					? "left-lg items-start"
+					: "right-lg items-end"
 			}`}
 			style={{ animation: "arena-rise 520ms cubic-bezier(0.25,0.8,0.3,1) both" }}
 		>
-			<span className="font-sans text-[clamp(9px,0.72vw,13px)] font-medium tracking-[0.22em] text-foreground/55">
+			<span className="font-label text-2xs text-ink-40">
 				VOTERS PICKED THIS
 			</span>
 			<span

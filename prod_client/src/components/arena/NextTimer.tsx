@@ -1,14 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useRef } from "react";
+import Button from "@/components/ui/Button";
 import { linear, useProgress } from "./useProgress";
 
-// The clock does not start with the reveal. The ratings are still counting for the
-// first two seconds and the crowd's percentage lands at 2.6 — a bar already
-// draining through all of that reads as a deadline on reading the result. It
-// starts once the result has finished telling itself.
-const LEAD_MS = 2700;
-const RUN_MS = 5200;
+// IT STARTS WITH THE REVEAL. The 2.7 s lead existed because the ratings counted up
+// for the first two seconds and the crowd's percentage landed at 2.6 — a bar
+// draining through all of that read as a deadline on reading the result. Neither is
+// true now (see RevealCard), so there is nothing left to wait for, and a countdown
+// that sits still before it starts is just a longer countdown.
+//
+// Shorter as well: with the reveal down to a name and a number, 7.9 s of total wait
+// was most of a round spent on a result that takes a moment to read.
+const LEAD_MS = 0;
+const RUN_MS = 3000;
 
 /**
  * The wait before the next pair, in the slot the SKIP button just left.
@@ -56,27 +61,26 @@ export default function NextTimer({
 	}, [advance, paused]);
 
 	return (
-		<button
-			type="button"
+		<Button
 			onClick={advance}
 			// Solid black, not a tint: everything in this bar has to be opaque or the
 			// winning scene's glow shines through the control that is supposed to be
 			// in front of it. Hovering lifts the border rather than the ground.
-			className="group/next flex w-full cursor-pointer flex-col items-center justify-center gap-[clamp(6px,0.9vh,11px)] rounded-xs border border-white/15 bg-background px-[clamp(8px,0.9vw,16px)] py-[clamp(10px,1.3vh,18px)] transition-colors duration-200 hover:border-white/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 focus-visible:ring-offset-2 focus-visible:ring-offset-black"
-			style={{ animation: "arena-rise 420ms cubic-bezier(0.25,0.8,0.3,1) 260ms both" }}
+			className="group/next flex w-full flex-col items-center justify-center gap-xs"
+			style={{ animation: "content-swap 400ms ease both" }}
 		>
-			<span className="font-sans text-[clamp(9px,0.72vw,12px)] font-medium tracking-[0.2em] whitespace-nowrap text-foreground/55 transition-colors duration-200 group-hover/next:text-foreground">
+			<span className="font-label text-2xs whitespace-nowrap">
 				NEXT
 			</span>
 			{/* Drains left to right in real time. `scaleX` on a full-width fill rather
 			    than an animated width: it is one composited transform per frame
 			    instead of a layout pass, on a page still rendering two scenes. */}
-			<span className="block h-px w-full overflow-hidden bg-white/15">
+			<span className="block h-px w-full overflow-hidden bg-mark-16">
 				<span
-					className="block h-full w-full origin-left bg-foreground/70"
+					className="block h-full w-full origin-left bg-mark-64"
 					style={{ transform: `scaleX(${t})` }}
 				/>
 			</span>
-		</button>
+		</Button>
 	);
 }

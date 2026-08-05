@@ -50,7 +50,7 @@ const minimapWidth = (aspect: number, maxW: string, maxH: string) =>
 // small. Note vw/vh are WINDOW units, so in the side-by-side workspace both viewers
 // size to the window rather than to their own half — which is what you want, since
 // entering one expands it to the full width anyway.
-const MINIMAP_COMPACT = { w: "clamp(240px, 24vw, 460px)", h: "clamp(200px, 26vh, 400px)" };
+const MINIMAP_COMPACT = { w: "calc(var(--spacing-xl) * 7.9)", h: "calc(var(--spacing-xl) * 6.9)" };
 const MINIMAP_EXPANDED = { w: "clamp(420px, 56vw, 900px)", h: "clamp(340px, 72vh, 820px)" };
 
 // The bird's-eye minimap — the storey's slice, the zone names printed on it, a
@@ -126,15 +126,15 @@ export default function Minimap({
 	};
 
 	return (
-		<div className='rounded-md border border-white/10 bg-black/60 p-1.5 backdrop-blur'>
-			<div className='mb-1 flex items-center justify-between gap-2 px-0.5 text-[9px] uppercase tracking-wider text-neutral-400'>
+		<div className='rounded-md border border-mark-8 bg-ground/60 p-1.5 backdrop-blur'>
+			<div className='mb-1 flex items-center justify-between gap-2 px-0.5 text-[9px] uppercase tracking-wider text-ink-64'>
 				<span className='truncate'>{view.name ?? storey(levelWord, view.level)}</span>
 				<button
 					type='button'
 					onClick={() => setExpanded((v) => !v)}
 					title={expanded ? "collapse minimap" : "expand minimap"}
 					aria-label={expanded ? "collapse minimap" : "expand minimap"}
-					className='rounded px-1 text-[11px] leading-none text-neutral-300 transition hover:bg-white/10 hover:text-white'
+					className='rounded px-1 text-[11px] leading-none text-ink-64 transition hover:bg-mark-8 hover:text-ink'
 				>
 					{expanded ? "✕" : "⤢"}
 				</button>
@@ -221,12 +221,12 @@ export default function Minimap({
 							top: `${lab.topPct}%`,
 							// Floors so a crowded compact map stays legible, ceiling so an
 							// expanded one doesn't turn into signage.
-							fontSize: "clamp(9px, 4.2cqw, 17px)",
+							fontSize: "var(--text-xs)",
 							// A slice is a lit render, so a name over it needs its own
 							// contrast rather than borrowing the map's.
 							textShadow: "0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.8)",
 						}}
-						className='absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded px-1 py-0.5 text-center font-medium leading-tight text-white/95 transition hover:bg-cyan-400/25 hover:text-white'
+						className='absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded px-1 py-0.5 text-center font-medium leading-tight text-ink transition hover:bg-cyan-400/25 hover:text-ink'
 					>
 						{lab.label}
 					</button>
@@ -239,7 +239,7 @@ export default function Minimap({
 						<span
 							key={pt.index}
 							style={{ left: `${pt.leftPct}%`, top: `${pt.topPct}%` }}
-							className={`pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-cyan-400 ${
+							className={`pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-mark bg-cyan-400 ${
 								expanded ? "h-3.5 w-3.5" : "h-2.5 w-2.5"
 							} ${
 								flash
@@ -249,7 +249,7 @@ export default function Minimap({
 						/>
 					))}
 				{!onCurrentFloor && (
-					<div className='pointer-events-none absolute bottom-1 left-1 rounded bg-black/65 px-1 py-0.5 text-[8px] uppercase tracking-wider text-cyan-200'>
+					<div className='pointer-events-none absolute bottom-1 left-1 rounded bg-ground/65 px-1 py-0.5 text-[8px] uppercase tracking-wider text-cyan-200'>
 						{storey(levelWord, view.level)} · you are on {currentLevel + 1}
 					</div>
 				)}

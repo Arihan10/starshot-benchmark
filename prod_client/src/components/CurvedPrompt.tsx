@@ -36,12 +36,29 @@ const CENTRE = VB / 2;
 // moon under the tail of a "y" before the limb runs out.
 const INSET = 20;
 
-// How much of the circle the line may use, each side of the bottom. The limit is
+// How much of the circle the line may use, each side of the bottom.
+//
+// THE CEILING IS THE CAP'S DEPTH, and that is the real constraint. The arc's ends
+// climb R - (R-INSET)*cos(theta) above the disc's lowest point, so on a large disc
+// showing only a shallow sliver, a wide span walks the ends of the line off the top
+// of what is visible.
+//
+// AND THE ASCENDERS GO HIGHER THAN THE BASELINE, which is what caught this twice:
+// the arc's ends sat inside the cap by the geometry and the TYPE on them clipped off
+// the top of the window anyway. The span has to leave room for the letters, not just
+// for the path — and the taller the type, the more room, so raising FONT_MAX means
+// bringing this down with it. The two constants are one adjustment.
+//
+// It also MOVES WITH THE RADIUS, because the span is angular and the arc's length is
+// therefore a fraction of the disc. The moon is now small — it has to fit the gap
+// between the nav's inner pairs — so the same degrees buy far fewer pixels, and the
+// span has to open up to keep the prompt a readable length. It went to 12 while the
+// disc was briefly enormous and is back up now that it is not. The limit is
 // not the moon — it is the BAND: the disc is clipped to the masthead, so past this
 // the baseline climbs out of the visible cap and the ends of the prompt would be
 // set on black rather than on the moon. It also has to stop short of the label
 // above it, which is what sets this rather than the geometry.
-const HALF_SPAN_DEG = 24;
+const HALF_SPAN_DEG = 33;
 
 // The size range, in viewBox units — so, as thousandths of the moon's diameter.
 //
@@ -56,14 +73,23 @@ const HALF_SPAN_DEG = 24;
 // first; past that the tail clips, which is the honest failure and better than
 // type nobody can read.
 //
-// THE CEILING IS THE SPREAD. Only short prompts ever reach it — anything past
-// about six words fits at its own natural size well below — so this number is not
+// RAISED WHEN THE MOON GREW. The ceiling had been tuned against a much smaller arc,
+// and by the time the disc reached 690px even a SEVEN-WORD prompt was pinned at it —
+// measuring exactly FONT_MAX, which is the fitter reporting that the arc had room to
+// spare and the cap would not let it use any. A ceiling that the longest prompts hit
+// is not a ceiling on the spread, it is a cap on the type.
+//
+// THE CEILING IS THE SPREAD. Only short prompts should ever reach it — anything past
+// about six words should fit at its own natural size below — so this number is not
 // "how big is the prompt", it is "how much bigger is a two-word prompt than a
 // twelve-word one". Set high, the masthead changed scale every round; the moon and
 // the label around it stayed put while the one line between them swung, and the
 // page looked like it was zooming rather than turning. Lowering it tightens that
 // spread and leaves the long prompts, which never touched it, exactly as they were.
-const FONT_MAX = 38;
+// AND IT IS PER VOICE, because the two lines this draws are not the same size on
+// the same disc. See VOICE below: the arena's prompt keeps this ceiling, the
+// leaderboard's champion takes the comp's, which is a good deal smaller.
+const FONT_MAX = 54;
 const FONT_MIN = 17;
 
 // Leave the arc's last few percent empty at both ends. Text run to the very tip
@@ -92,15 +118,74 @@ function at(radius: number, deg: number): [number, number] {
  * its own shrunken width back into the next calculation and ratchet the size down
  * every time the prompt changed.
  */
+/**
+ * WHO IS SPEAKING, which is the only thing the two callers disagree about.
+ *
+ * `prompt` is the arena, and it is THE ONE SERIF ON THE PAGE, italic — everything
+ * else on this site is the product talking, and that line came from a person, so it
+ * is set the way a person writes rather than the way a system reports.
+ *
+ * `name` is the leaderboard, and it is not a sentence at all. It is a model's
+ * name — a label the benchmark produced — so it takes the interface face, bold, in
+ * line with every other name the site sets. An italic serif around a champion read
+ * as a quotation of something nobody said.
+ */
+/**
+ * WHAT EACH VOICE MAY GROW TO, in viewBox units, and the champion's is NOT a
+ * matter of taste — it is the comp's number, converted.
+ *
+ * The comp caps the champion at 42 units on a disc of radius 510, which is 42/1020
+ * of its DIAMETER. Our box is the diameter, a thousand units across, so the same
+ * proportion is 41. Reading the two numbers side by side is misleading: the comp's
+ * SVG is a shallow 680-wide crop of a much larger circle, ours is the whole disc,
+ * so 42 and 54 are not comparable until both are put over the diameter they sit on.
+ *
+ * Ours was arc-limited rather than cap-limited — the fitter was landing near 54 for
+ * a typical champion because the arc had room and nothing stopped it — which put
+ * the name about 30% larger than the design. At 41 the cap binds for short and
+ * medium names, exactly as the comp's own formula does, and a very long one still
+ * shrinks to fit the arc.
+ */
+const CEILING = { prompt: FONT_MAX, name: 41 } as const;
+
+const VOICE = {
+	prompt: {
+		fontFamily: "var(--font-instrument-serif), serif",
+		fontStyle: "italic",
+		fontWeight: 400,
+		letterSpacing: "0.01em",
+	},
+	name: {
+		fontFamily: "var(--font-sans), sans-serif",
+		fontStyle: "normal",
+		// THE COMP'S OWN WEIGHT AND TRACKING: Archivo 900 at −0.015em. This was 700
+		// at +0.02em on the reasoning that a line of capitals needs air — which is
+		// true of capitals in a sentence and wrong here. At 900 the counters are
+		// already tight and the sidebearings are generous, so positive tracking pulls
+		// the word apart into separate letters; the comp closes it up instead and the
+		// name reads as one mark struck on the disc. Heavier AND narrower, which
+		// sounds contradictory until you set it.
+		fontWeight: 900,
+		letterSpacing: "-0.015em",
+		// CAPITALS, and set in the STYLE rather than by upper-casing the string —
+		// which keeps `aria-label` reading as the model is actually written. The
+		// hidden gauge shares this object, so the fit is measured on the capitals
+		// that will be drawn rather than on the mixed case that will not.
+		textTransform: "uppercase",
+	},
+} as const;
+
 export default function CurvedPrompt({
 	text,
 	diameter,
 	className,
+	voice = "prompt",
 }: {
 	text: string;
 	/** The moon's diameter — the same CSS length the disc itself is given. */
 	diameter: string;
 	className?: string;
+	voice?: keyof typeof VOICE;
 }) {
 	const pathRef = useRef<SVGPathElement>(null);
 	const textRef = useRef<SVGTextElement>(null);
@@ -129,12 +214,17 @@ export default function CurvedPrompt({
 		if (!path || !target || !gauge) return;
 
 		const fit = () => {
-			// The gauge is held at FONT_MAX, so this is the width the prompt WANTS.
+			// The gauge is held at FONT_MAX, so this is the width the line WANTS. It
+			// stays at FONT_MAX whatever the ceiling is — it is a ruler, and shrinking
+			// the ruler would only cost precision.
 			const needed = gauge.getComputedTextLength();
 			if (!needed) return;
 			const usable = path.getTotalLength() * FIT_MARGIN;
 			const wanted = FONT_MAX * (usable / needed);
-			target.style.fontSize = `${Math.max(FONT_MIN, Math.min(FONT_MAX, wanted))}px`;
+			// The ceiling is the voice's, the floor is shared: below FONT_MIN nothing
+			// is legible whoever is speaking.
+			const ceiling = CEILING[voice];
+			target.style.fontSize = `${Math.max(FONT_MIN, Math.min(ceiling, wanted))}px`;
 		};
 
 		fit();
@@ -142,18 +232,11 @@ export default function CurvedPrompt({
 		// fallback face, whose widths differ enough to leave the fitted size visibly
 		// wrong — usually too small, since the fallback is wider.
 		document.fonts?.ready.then(fit).catch(() => {});
-	}, [text]);
+		// `voice` is in here because the two faces set the same string at very
+		// different widths: refitting is the whole reason the gauge exists.
+	}, [text, voice]);
 
-	// THE ONE SERIF ON THE PAGE, and italic. Everything else here is the product
-	// talking — grotesque for the interface, monospace for its labels — and this is
-	// the only line that came from a person, so it is set the way a person writes
-	// rather than the way a system reports.
-	const typeStyle = {
-		fontFamily: "var(--font-instrument-serif), serif",
-		fontStyle: "italic",
-		fontWeight: 400,
-		letterSpacing: "0.01em",
-	} as const;
+	const typeStyle = VOICE[voice];
 
 	return (
 		<svg

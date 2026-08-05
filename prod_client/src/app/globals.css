@@ -3,24 +3,331 @@
 /* SceneBench is black in both colour schemes — the viewers are 3D canvases and
    the site around them is dark, so there is no light variant to switch to. */
 :root {
-  --background: #000000;
-  --foreground: #ededed;
+  /* THE GROUND, AS CHANNELS. Held like the ink and the mark so all three of the
+     site's colours are adjustable in the same way: ink, mark and ground are the
+     whole palette, and every other value in this file is one of them at an
+     opacity. It was `#000000` written twice (here and in
+     the theme below), which is the same duplication `--ink-rgb` exists to prevent. */
+  --ground-rgb: 0 0 0;
+  --background: rgb(var(--ground-rgb));
+
+  /* THE INK, ONCE, AS CHANNELS. Everything white on this site is this value or an
+     opacity of it, and it is #ededed rather than #ffffff: pure white on pure black
+     is a contrast ratio nothing else on the page can live next to, and it blooms on
+     an OLED panel — which is most of what these viewers are read on. Two points off
+     the top is the difference between a page that is lit and a page that glares.
+
+     Held as bare channels so the ramp below can be written as one opacity each and
+     the value appears exactly once. Anything reaching for `#fff` instead of a token
+     is by definition a colour this file has not agreed to.
+
+     THIS LINE IS THE WHOLE PALETTE. Every white on the site — type, rules, borders,
+     the vote bar's slabs, the beam, the seam, the leaderboard's towers — is this
+     value or an opacity of it, so changing it here changes all of them and nothing
+     else needs touching. Proved by flipping it to yellow: one line recoloured every
+     page. The only things that did NOT follow were three hardcoded copies of it —
+     the moon's disc, the leaderboard's city and the viewer chrome — and all three
+     read the token now, so the next flip is genuinely total. */
+  --ink-rgb: 237 237 237;
+  --foreground: rgb(var(--ink-rgb));
+
+  /* WHAT THE SITE DRAWS, as opposed to what it SAYS.
+     
+     This was the same value as the ink, and that conflation is what made the
+     palette un-flippable: `--color-ink` generated `text-ink` AND `bg-ink` AND
+     `border-ink`, so the vote bar's slabs, the seam, the beam, the CTA and every
+     rule were all literally the type colour. Setting the ink back to white to keep
+     the type white therefore took every filled shape white with it.
+     
+     Type is READ; a slab, a rule, an edge and a body are DRAWN. They are different
+     jobs and now they are different tokens: `text-*` stays on the ink, everything
+     with a fill or an edge sits on this. The moon is the extreme case of a drawn
+     thing, so it hangs off this too. */
+  /* THE SAME VALUE AS THE INK, and still its own knob.
+     
+     A literal rather than `var(--ink-rgb)`: aliasing would read as "the mark is the
+     ink", which is the conflation the split was made to undo — and it would tie the
+     two together, and they are separate knobs precisely so one can move without
+     the other. They agree today; they are not the same thing. */
+  --mark-rgb: 237 237 237;
+
+  /* THE MOON IS THE ONE THING WITH A COLOUR OF ITS OWN.
+
+     Everything else on this page is light ON it — type, rules, edges — and reads as
+     one material, which is why they share `--ink-rgb`. The moon is a BODY: the only
+     object in the layout rather than a mark on it. That is what makes it the one
+     element that can take a hue without the page becoming a themed page.
+
+     Held apart from the ink deliberately. Running the whole site yellow turned the
+     wordmark and the vote buttons into a warning; the same yellow on the disc alone
+     reads as a moon. Its limb, its craters and its bloom all hang off this, so the
+     body and its own light can never come apart. */
+  --moon-rgb: var(--mark-rgb);
 }
 
+/* THE SYSTEM. Everything below is the whole vocabulary the site is allowed to
+   speak in, and the point of it is the SHORTNESS of the lists.
+
+   What it replaced: 54 distinct `clamp()` expressions for 60 sizes, 23 hex
+   colours, 20 different `/NN` opacities, four typefaces. Every one of those was
+   defensible where it was written and none of them agreed with each other, which
+   is what "carefully designed" is the absence of — not a lack of ideas, a lack of
+   a scale for them to be expressed in. A page whose sizes all nearly match reads
+   as approximate; one built from six sizes reads as drawn. */
 @theme inline {
+  /* --- colour: black, white, and one accent -------------------------------
+     THE GREYS ARE NOT COLOURS. Every value between the ground and the ink is
+     white at a fixed opacity, from a five-step ramp — so a border and a label and
+     a divider are provably the same family, and there is no way to reach for the
+     twelfth slightly-different grey because there isn't one to reach for. */
+  --color-ground: rgb(var(--ground-rgb));
+  --color-ink: rgb(var(--ink-rgb));
+  --color-ink-64: rgb(var(--ink-rgb) / 0.64);
+  --color-ink-40: rgb(var(--ink-rgb) / 0.4);
+  --color-ink-16: rgb(var(--ink-rgb) / 0.16);
+  --color-ink-8: rgb(var(--ink-rgb) / 0.08);
+
+  /* THE SAME FIVE STEPS, for the things that are drawn rather than read. Mirrored
+     rather than invented so a border and a label at the same strength still
+     provably match — see --mark-rgb. */
+  --color-mark: rgb(var(--mark-rgb));
+  --color-mark-64: rgb(var(--mark-rgb) / 0.64);
+  --color-mark-40: rgb(var(--mark-rgb) / 0.4);
+  --color-mark-16: rgb(var(--mark-rgb) / 0.16);
+  --color-mark-8: rgb(var(--mark-rgb) / 0.08);
+
+  /* THE SAME TWO GREYS, FLATTENED. These are exactly `ink-8` and `ink-16`
+     composited onto the ground — 237 × 0.08 and 237 × 0.16 — so they are not new
+     colours, they are the ramp with the transparency taken out. They move when the
+     ink moves; both dropped a step when it came off pure white.
+     
+     Opacity is a real constraint here rather than a preference: the vote bar
+     floats OVER the two scenes, and the winning one lights up behind it. A
+     translucent control lets that glow through and lets the panel divider draw a
+     line straight across the SKIP button, which is what these replaced. */
+  --color-surface: #131313;
+  --color-surface-lit: #262626;
+
+  /* --- the cosmic cast ----------------------------------------------------
+     THE THIRD COLOUR, and it is the mark's own. Sampled from logo.png, whose
+     palette measures as pale periwinkle (#dae9ff, #c6dafb) over a violet core
+     (#674878) with a salmon edge (#dd9289) — the same run of hues the GENERATE
+     button already sweeps through on hover.
+
+     Two stops rather than one, because the accent is doing two different jobs. The
+     PERIWINKLE is for anything that has to be read — a hovered control, a lit
+     edge — and is held pale enough to stay legible against white. The VIOLET is
+     the deep end, and it never carries type: it exists to tint the dark, which is
+     what turns a black page into a night sky rather than an off screen. */
+  --color-accent: #c3cdff;
+
+  /* WHICH WAY A RATING MOVED. These were stops of the mark's own sweep — a cool
+     periwinkle for a rise, a warm salmon for a fall — on the argument that a fall
+     here is not an error and should not read as one.
+
+     They are a green and a red now, because the comp is and because the argument
+     was wrong about what the column is FOR. The delta is the one figure on the
+     board a reader scans rather than reads: four columns of numbers and one column
+     of direction, and direction is what you want answered without stopping. Two
+     hues four steps apart on the wheel make you compare them; the two everyone
+     already knows do not. The glyph carries the sign as well (see StandingsTable),
+     so nothing here rests on colour alone. */
+  --color-rise: #35c46a;
+  --color-fall: #e5342b;
+
+  /* There were two more here — a purple for A and a blue for B — and they are
+     gone. The sides now light up in the mark's own sweep instead, which is both
+     what was asked for and the better answer: a fixed colour per side had to be
+     invented, and the gradient is already the site's. If a later screen needs to
+     tag a side (a rating row, a leaderboard), reach for a stop of `--accent-sweep`
+     rather than reintroducing a palette that only two elements ever used. */
+  --color-accent-deep: #6b4f9e;
+
+  /* --- what the moon is made of -------------------------------------------
+     Three declarations, because the crescent is three things: a body, the bloom
+     coming off it, and the light it throws on the room. Kept together here so the
+     three cannot be tuned apart — the moment the bloom stops matching the body it
+     stops being its glow and starts being a smudge behind it.
+
+     THE BODY IS FLAT WHITE — the comp draws the moon as a filled path, not as a
+     lit sphere, and that is why its prompt reads so much blacker than ours did: a
+     radial falloff puts the middle of the disc several percent under white, and the
+     black type sitting on it loses exactly that much contrast. A shape this shallow
+     shows almost none of the sphere anyway; the gradient was costing legibility for
+     a modelling cue nobody can see. Only the last percent softens, so the limb does
+     not alias against the page.
+
+     Historical, for the record: it was lavender for a while and much dimmer. Held at a
+     violet it read as a solid coloured shape — a purple band laid across the top
+     of the page rather than a body catching light — because a saturated fill is
+     the one thing that cannot look like illumination. The colour belongs in the
+     falloff (see the wash), not in the source.
+
+     It is still brighter at the rim than through the middle, because a sphere lit
+     from behind is: the limb catches the light almost edge-on and the ground
+     toward the terminator falls away. But the values are a third of what they
+     were. The navbar sits ON the moon — that is the brief — so every point of
+     brightness here is contrast taken from the wordmark laid over it, and the
+     crescent only has to be PRESENT, not bright. A sphere lit from
+     behind is: the limb catches the light almost edge-on while the ground toward
+     the terminator falls away. A flat fill reads as a paper cut-out of a moon.
+     `closest-side` so the falloff is measured on the circle rather than the box.
+
+     ON THE INK, not beside it. The three outer stops were near-white literals with
+     a faint blue cast (248 250 255, 240 244 255, 226 232 252) while the innermost
+     already read the token — so the body was the one large white shape on every
+     page that did NOT follow a change to `--ink-rgb`. The cast is what the BLOOM
+     and the WASH below are for, and they keep it; the body is described here as
+     flat white, so flat white is what it takes. */
+  /* THE DISC ITSELF, and it is the largest white shape on the site.
+
+     It was five literals living in Moon.tsx — #EDEDED at the centre (a hand-copy of
+     the ink) falling to #A4A7AE at the limb — which is why flipping `--ink-rgb`
+     recoloured every page except the moon sitting at the top of all of them.
+
+     MIXED TOWARD THE GROUND, not held at an opacity. The disc has to stay OPAQUE:
+     the navbar is laid over it and the arena's seam passes behind it, and either
+     would show through an alpha. The percentages are the original stops read as
+     fractions of the ink (237, 232, 216, 191, 167), so the shading is the one that
+     was drawn — it just follows the token now. */
+  --moon-surface: radial-gradient(
+    circle at 50% 44%,
+    rgb(var(--moon-rgb)) 0%,
+    color-mix(in srgb, rgb(var(--moon-rgb)) 98%, #000) 68%,
+    color-mix(in srgb, rgb(var(--moon-rgb)) 91%, #000) 88%,
+    color-mix(in srgb, rgb(var(--moon-rgb)) 81%, #000) 96.5%,
+    color-mix(in srgb, rgb(var(--moon-rgb)) 70%, #000) 100%
+  );
+
+  --moon-body: radial-gradient(
+    closest-side circle,
+    rgb(var(--moon-rgb) / 0.03) 80%,
+    rgb(var(--moon-rgb) / 0.12) 93%,
+    rgb(var(--moon-rgb) / 0.2) 98%,
+    rgb(var(--moon-rgb) / 0.13) 100%
+  );
+
+  /* THE BLOOM is the same shape, blurred — see Moon.tsx. Flat rather than
+     rim-lit, because a blur of forty-odd pixels erases any structure inside it
+     anyway and all that survives is the average. */
+  --moon-bloom: radial-gradient(
+    closest-side circle,
+    rgb(var(--moon-rgb) / 0.07) 70%,
+    rgb(var(--moon-rgb) / 0.09) 100%
+  );
+
+  /* THE WASH is what reaches everything else, and it is the one that has to stay
+     disciplined. FAINT: at four times these values it looked like moonlight and
+     ruined the page — screened over the panels it lifted the blacks out of both
+     renders, so a dark build had no dark left in it and the comparison happened
+     through a grey veil.
+
+     The violet sits in the MIDDLE stops rather than the brightest one. Colour in
+     the core tints the light itself, which reads as a lamp with a gel over it;
+     held out at the falloff it reads as the dark being coloured, which is what a
+     night sky actually is. */
+  --moon-wash: radial-gradient(
+    closest-side ellipse,
+    rgb(226 233 255 / 0.05) 0%,
+    rgb(174 176 246 / 0.038) 30%,
+    rgb(132 106 208 / 0.026) 56%,
+    rgb(92 68 156 / 0.011) 78%,
+    transparent 100%
+  );
+
+  /* Kept for the places the identity shows itself as a MOVING thing rather than a
+     flat one — the CTA on hover, the logo lockup, and the podium's plinths. A
+     gradient cannot be a colour token, so it lives beside them rather than among
+     them.
+
+     THE STOPS ARE BROKEN OUT because one of those places is not CSS. The podium
+     is drawn by WebGL, and an instanced cube cannot be given a background-image;
+     it has to be handed a colour per cube, sampled along this same ramp in JS.
+     Named individually, that code reads THESE — so the plinths and the buttons
+     cannot drift apart. Composed back into the gradient below, so nothing that
+     already uses `--accent-sweep` has to know. */
+  --sweep-0: rgb(var(--mark-rgb));
+  --sweep-1: #e6f0ff;
+  --sweep-2: #d8dcf5;
+  --sweep-3: #e6d5e6;
+  --sweep-4: #fbdcd2;
+  --accent-sweep: linear-gradient(
+    104deg,
+    var(--sweep-0) 0%,
+    var(--sweep-1) 24%,
+    var(--sweep-2) 46%,
+    var(--sweep-3) 68%,
+    var(--sweep-4) 88%,
+    var(--sweep-0) 100%
+  );
+
+  /* Held over: the page and body still speak in these, and every surface in the
+     app resolves to the two above. */
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  /* Named for the ROLE, not the face: markup asks for `font-display` or
-     `font-mono` and the typefaces behind them can change here without touching a
-     single call site.
 
-     `display` is the WORDMARK alone — Anton has one weight and no italic, so it
-     cannot carry a heading system even if something tried. Headings are Archivo
-     at a heavier cut, which is what `font-sans` already gives them. */
+  /* --- type: three faces, six sizes ---------------------------------------
+     Named for the ROLE, not the face, so the typeface behind a role can change
+     here without touching a call site.
+
+     `display` is the WORDMARK alone. `serif` is the PROMPT alone, the one human
+     sentence on the page. `mono` is the READOUT — column heads, lab names, vote
+     counts, the tally under the table — everything that labels a figure rather
+     than saying anything. Everything else is Archivo.
+
+     THE MONO IS BACK, and this is the second time it has been argued about. It
+     went out on the grounds that small tracked-out capitals are an EFFECT rather
+     than a typeface, which `.font-label` below then carried in the interface face.
+     That holds for a nav link. It does not hold for 9px beside a 21px figure,
+     which is where the leaderboard actually spends it: at that size Archivo's
+     proportional widths make a lab name read as shrunken body copy, and the
+     monospace makes it read as a machine's own annotation. Both are still here —
+     `.font-label` for the site's furniture, `font-mono` for the readout. */
   --font-display: var(--font-anton);
   --font-sans: var(--font-archivo);
-  --font-mono: var(--font-plex-mono);
+  --font-mono: var(--font-ibm-plex-mono);
   --font-serif: var(--font-instrument-serif);
+
+  /* SIX STEPS, and they are steps rather than a continuum — each is roughly 1.3x
+     the one under it, so two things at adjacent sizes are visibly different and
+     nothing lands in the dead zone where a reader cannot tell whether a
+     difference was meant. */
+  --text-2xs: clamp(9px, 0.72vw, 12px);
+  --text-xs: clamp(11px, 0.9vw, 14px);
+  --text-sm: clamp(13px, 1.1vw, 17px);
+  --text-base: clamp(16px, 1.45vw, 23px);
+  --text-lg: clamp(22px, 2.2vw, 34px);
+  --text-xl: clamp(34px, 3.6vw, 56px);
+
+  /* --- space: six steps, same idea ----------------------------------------
+     Named rather than numbered so `px-lg` says what it is at the call site, and
+     so nothing can quietly invent `px-[13px]` next to it. */
+  --spacing-2xs: clamp(3px, 0.3vw, 5px);
+  --spacing-xs: clamp(6px, 0.6vw, 9px);
+  --spacing-sm: clamp(9px, 0.95vw, 14px);
+  --spacing-md: clamp(14px, 1.5vw, 22px);
+  --spacing-lg: clamp(22px, 2.4vw, 36px);
+  --spacing-xl: clamp(34px, 3.8vw, 58px);
+
+  /* --- motion -------------------------------------------------------------
+     Two speeds. `quick` is a control acknowledging a pointer; `settle` is the
+     page changing its mind about something. Anything that needs a third duration
+     is telling a story and sets it locally, at the animation. */
+  --duration-quick: 110ms;
+  --duration-settle: 260ms;
+  --ease-out-soft: cubic-bezier(0.25, 0.8, 0.3, 1);
+}
+
+/* THE MACHINE VOICE, now a class instead of a typeface. Everything the old
+   monospace was doing — the byline, the nav, "WHO BUILT IT BETTER?", the MODEL
+   label — was really one effect: small capitals, tracked wide, so they read as
+   labelling the page rather than speaking in it. That effect is the signal, and
+   Archivo carries it. Defined once here so all four sites cannot drift apart. */
+@utility font-label {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
 }
 
 /* No font-family here — the `font-sans` utility on <body> sets it, so the
@@ -100,6 +407,10 @@ body {
 
    The angles are shared: 40° out, 40° in, so the moon's own texture turns 80° over
    the whole cycle and everything on the disc stays rigidly related. */
+/* COUNTER-CLOCKWISE, and the three turns below have to agree in sign or the
+   prompt would leave one way and arrive the other. The old words are carried UP
+   and off the visible cap, the disc follows them round, and the next line rises
+   into the same place from underneath. */
 @keyframes prompt-roll-out {
   0% {
     opacity: 1;
@@ -110,7 +421,7 @@ body {
   }
   100% {
     opacity: 0;
-    transform: rotate(40deg);
+    transform: rotate(-40deg);
   }
 }
 
@@ -122,7 +433,7 @@ body {
 @keyframes prompt-settle {
   0% {
     opacity: 0;
-    transform: rotate(-40deg);
+    transform: rotate(40deg);
   }
   26% {
     opacity: 1;
@@ -142,12 +453,28 @@ body {
     transform: rotate(0deg);
   }
   to {
-    transform: rotate(80deg);
+    transform: rotate(-80deg);
   }
 }
 
 /* Arena: the vote result rising into place — the percentage and the reveal cards
    both arrive this way, so the two readouts read as one moment. */
+/* THE BAR MUTATES; ONLY ITS CONTENTS CHANGE HANDS.
+   
+   A vote does not replace the control strip, it changes what the strip says — so
+   the boxes keep their place and morph (the width transition in VoteBar's Side),
+   and what is inside them swaps over. Held to opacity ALONE, with no delay: any
+   rise or scale here reads as a new object arriving on top of the old one, which
+   is the "disappear, then appear" this replaced. Short, so it is over well inside
+   the 620 ms the shapes take to finish moving. */
+@keyframes content-swap {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
 @keyframes arena-rise {
   from {
     opacity: 0;
@@ -172,12 +499,14 @@ body {
 
 /* The masthead moon's surface, turning behind the navbar. Only the crater layer
    spins — see components/Moon.tsx for why the lit disc underneath must not. */
+/* The surface's own idle turn, in the same direction as the cycle above — a
+   moon that drifted one way and stepped the other would read as two objects. */
 @keyframes moon-spin {
   from {
     transform: rotate(0deg);
   }
   to {
-    transform: rotate(360deg);
+    transform: rotate(-360deg);
   }
 }
 
@@ -224,5 +553,251 @@ body {
   }
   to {
     opacity: 1;
+  }
+}
+
+/* THE WIN-RATE BARS, drawing themselves in as the board arrives. `scaleX` from a
+   left origin rather than an animated width, so the whole column is one composited
+   transform instead of twenty-two elements relaying out sixty times a second.
+
+   `both` at the call site, which is what keeps the bar at zero until its delay is
+   up — without it every bar shows full-length for one frame first, which is the
+   answer arriving before the animation that was supposed to deliver it. */
+@keyframes bar-grow {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* THE BOARD'S SKY: a streak that crosses and is gone.
+
+   MOSTLY NOTHING, and that is what the keyframes encode. A shooting star that
+   arrives on a metronome is a loading spinner; the transform is pinned at the
+   origin for the first six sevenths of the cycle and the whole crossing happens in
+   what is left, so a long duration buys a long WAIT rather than a slow star.
+   Staggered delays keep two from ever setting off together.
+
+   EVERY ONE OF THESE MUST BE DECLARED `backwards` AT THE CALL SITE. During its
+   `animation-delay` an element is painted with its NORMAL styles, not with the
+   animation's first frame — so a star waiting nine seconds to set off sat on the
+   page at full opacity and perfectly still, then blinked out the instant its turn
+   came and it snapped to the 0% keyframe. It looked like the animation was broken.
+   It had not started.
+
+   THE SHAPE OF THE CROSSING, and every part of it is doing something:
+
+   IT STRETCHES. The streak comes in at half length and draws out to full as it
+   travels, scaled about its own tail — so the head runs ahead of the tail rather
+   than the whole mark sliding along rigidly, which is what a rigid one looks like:
+   a dash being dragged.
+
+   IT IS BRIGHTEST IN THE MIDDLE. Full opacity is reached early and given up over
+   the last fifth, so the star BURNS OUT on its way off rather than switching off.
+   A meteor that ends by vanishing at full brightness reads as a bug.
+
+   AND IT IS LINEAR. Nothing in the sky eases; a meteor that slowed on its way out
+   would read as a cursor. */
+@keyframes shooting-star {
+  0%,
+  80% {
+    opacity: 0;
+    transform: translate3d(0, 0, 0) scale(0.45);
+  }
+  84% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--shoot-x), var(--shoot-y), 0) scale(1.1);
+  }
+}
+
+/* Blocks adrift either side of the standings. Slow enough that nothing appears to
+   be MOVING when you look at it — you only notice it has moved. */
+@keyframes voxel-drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(var(--drift-x), var(--drift-y), 0);
+  }
+}
+
+/* And the slow turn that goes with the drift.
+
+   THE STANDALONE `rotate` PROPERTY, not a rotation inside `transform`. The drift
+   above already owns `transform`, and a property can only be animated by one
+   declaration — written as transforms, one of the two would simply win and the
+   blocks would either stop turning or stop moving. Kept as separate properties they
+   compose, which is what the standalone transform properties are for. */
+@keyframes voxel-turn {
+  from {
+    rotate: var(--turn-from);
+  }
+  to {
+    rotate: var(--turn-to);
+  }
+}
+
+/* Both are ornament, and ornament is the first thing to go for a reader who has
+   asked for less movement. Nothing here carries meaning, so nothing is lost. */
+@media (prefers-reduced-motion: reduce) {
+  [data-sky] * {
+    animation: none !important;
+  }
+}
+
+/* --- the about page --------------------------------------------------------
+   THE MOON HAS NO KEYFRAMES OF ITS OWN HERE, and that is the point. It used to
+   roll in from a screen and a half above the fold and spin three quarters of a
+   turn as it fell — which was a fine entrance for a disc drawn for this page, and
+   the wrong one for the site's moon. That one is already somewhere: hanging off
+   the top of whatever page the reader just left. So it travels DOWN from there
+   rather than arriving from nowhere, which is a tween between two poses and
+   belongs in script (see AboutStage) — a keyframe cannot know where the previous
+   page put it. Its own slow turn comes with it, from Moon. */
+
+/* ANYTHING ARRIVING: the moon.s type, a screen of copy, a board. One keyframe, so
+   everything that enters a page enters the same way.
+
+/* WHAT IS WRITTEN ON THE MOON, arriving. The disc itself is continuous across the
+   site — it travels between pages rather than being replaced — so its type cannot
+   simply appear on it: one object cannot have a caption cut onto it. It is written
+   after the moon has settled, and taken off again before it leaves.
+
+   A KEYFRAME RATHER THAN A TRANSITION for the way in, so the type still shows on a
+   page that never hydrates. The way OUT is a transition, because it has to be
+   interrupted mid-flight by a navigation. */
+@keyframes veil-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* A streak crossing the whole window on the diagonal. Unlike the board's, this one
+   composes its angle and its travel in ONE transform, because the angle never
+   changes — every star here runs on the same rake. The long tail of the keyframe is
+   dead air: it is what makes a 30s cycle a rare event rather than a slow one. */
+@keyframes about-shoot {
+  0% {
+    opacity: 0;
+    transform: rotate(38deg) translateX(-30vw);
+  }
+  2% {
+    opacity: 0.9;
+  }
+  13% {
+    opacity: 0.9;
+  }
+  18%,
+  100% {
+    opacity: 0;
+    transform: rotate(38deg) translateX(122vw);
+  }
+}
+
+/* Copy arriving under itself, staggered down the column. */
+@keyframes about-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The scroll hint, nudging the way it is asking you to go. */
+@keyframes about-nudge {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(5px);
+  }
+}
+
+/* THE CARET on the composer's typed-out placeholder. `steps(1)` rather than a
+   fade, because a cursor does not dim — it is on or it is off, and easing it is
+   the difference between a text field and a decoration that happens to pulse. */
+@keyframes caret-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* THE BEAM DRAWING THE VOTE BAR — one animation, because it is one movement with
+   three beats and a transition can only interpolate between two states.
+
+   Stacked transitions were the first attempt: expand on one clock, descend on
+   another, fade on a third. That can express "wide, then lower, then gone" but not
+   "…and on the way out, keep going" — so the rule reached the bottom edge and
+   blinked off, which is the jagged exit. A line that vanishes mid-stroke reads as a
+   dropped frame.
+
+   THE GEOMETRY IS THE POINT. The bar is an inverted trapezoid — full width along
+   its top, drawn in by one rake per side at the bottom — so the rule must narrow as
+   it descends or its ends hang off the shape into black. Both the distance and the
+   narrowing are measured from the bar itself and arrive as variables; nothing here
+   assumes a size.
+
+   Every animated property is a compositor property. That is not an optimisation —
+   it is why the ends stay on the slant instead of stepping.
+
+   The percentages are the sequence's own timings against the total: 300ms of
+   opening, 380 of descent, 180 of leaving, over 860. */
+@keyframes vote-rule {
+  0% {
+    scale: 0 1;
+    animation-timing-function: cubic-bezier(0.18, 0.82, 0.3, 1);
+  }
+  /* OPEN / BEAM_MS — see buildSequence. Open to both corners... */
+  41.94% {
+    scale: 1 1;
+  }
+  /* ...and hold there while the bar grows down from it. `vote-rule-hide` runs on
+     the same clock and cuts the line at 100%, by which point the bar has a top
+     edge of its own and the line has nothing left to stand in for. */
+  100% {
+    scale: 1 1;
+  }
+}
+
+/* THE CUT. `steps(1, end)`, so opacity holds at 1 for the whole beat and changes
+   exactly once, at the end — the line is there, and then it is not. Never a fade:
+   a line that dissolves reads as an effect ending rather than as an edge being
+   handed over. */
+@keyframes vote-rule-hide {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* The seam coming back out from behind the controls at the start of a round. Scaled
+   about its BOTTOM edge, so the head climbs from the vote bar toward the moon —
+   the exact reverse of the tuck that put it there. */
+@keyframes seam-untuck {
+  from {
+    scale: 1 0;
+  }
+  to {
+    scale: 1 1;
   }
 }

@@ -82,7 +82,7 @@ function Panel({
 	return (
 		<section
 			className={`relative h-full min-w-0 ${visible ? "flex-1" : "hidden"} ${
-				bordered ? "border-r border-white/10" : ""
+				bordered ? "border-r border-mark-8" : ""
 			}`}
 		>
 			<OrbitViewer scene={scene} onFocusedChange={onFocusedChange} />
@@ -92,7 +92,7 @@ function Panel({
 						aria-label='Select scene for this panel'
 						value={sceneId(scene)}
 						onChange={(e) => onSelect(e.target.value)}
-						className='max-w-[40vw] rounded-md border border-white/15 bg-black/60 px-2 py-1 text-xs text-neutral-200 outline-none backdrop-blur transition hover:border-white/30 focus:border-cyan-400'
+						className='max-w-[40vw] rounded-md border border-mark-16 bg-ground/60 px-2 py-1 text-xs text-ink outline-none backdrop-blur transition hover:border-mark-40 focus:border-cyan-400'
 					>
 						{scenes.map((s) => (
 							<option key={sceneId(s)} value={sceneId(s)}>
@@ -116,7 +116,7 @@ function Message({
 	return (
 		<div className='flex flex-1 items-center justify-center'>
 			<span
-				className={`text-sm ${error ? "text-red-400" : "text-neutral-500"}`}
+				className={`text-sm ${error ? "text-red-400" : "text-ink-40"}`}
 			>
 				{children}
 			</span>

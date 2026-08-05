@@ -31,7 +31,7 @@ export default function FullscreenButton({
 			title={label}
 			aria-label={label}
 			aria-pressed={isFullscreen}
-			className='absolute right-4 top-4 z-30 flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-black/40 text-neutral-300 opacity-40 backdrop-blur transition duration-200 hover:border-white/25 hover:bg-black/60 hover:text-white group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40'
+			className='absolute right-4 top-4 z-30 flex h-9 w-9 items-center justify-center rounded-lg border border-mark-8 bg-ground/40 text-ink-64 opacity-40 backdrop-blur transition duration-200 hover:border-mark-16 hover:bg-ground/60 hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-mark-40'
 		>
 			<svg
 				viewBox='0 0 24 24'

@@ -4,18 +4,20 @@ import {
     useCallback,
     useEffect,
     useMemo,
+    useRef,
     useState,
-    type ReactNode,
 } from "react";
 import ScenePanel, {
     SOLO_EASING,
     SOLO_TRANSITION_MS,
 } from "@/components/arena/ScenePanel";
-import { usePreloadRound } from "@/components/arena/usePreloadRound";
-import VoteBar from "@/components/arena/VoteBar";
+import { PairGate } from "@/components/arena/pairGate";
+import { buildStep } from "@/components/arena/buildSequence";
+import Composer from "@/components/arena/Composer";
 import CurvedPrompt from "@/components/CurvedPrompt";
-import LogoMark from "@/components/LogoMark";
-import Moon from "@/components/Moon";
+import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
+import { RAKE_PX } from "@/components/ui/Button";
+import Masthead, { MOON_DIAMETER, MoonArc } from "@/components/site/Masthead";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
 // SceneBench's comparison canvas: the same prompt-shaped task built by two
@@ -30,85 +32,16 @@ import { LOCAL_ROUNDS } from "@/lib/localScenes";
 // viewer and poisons the comparison; the cells still know (LocalCell.model), and
 // the reveal belongs after a vote rather than before one.
 
-
-// How far the moon's lower limb reaches past the navbar. This is the whole effect
-// — too little and the disc reads as a gradient behind the header, too much and it
-// stops being a horizon and becomes a shape on the page.
-//
-// IT IS NOT THE PROMPT'S SIZING KNOB. Reaching further down does buy the prompt
-// room, but it buys it by making the moon a bigger object on the page, which is a
-// change to the masthead to solve a problem belonging to one line of text. The
-// prompt fits itself instead: it is set to the arc it is given and scales with its
-// own LENGTH, so a long prompt sets smaller rather than asking the moon to grow.
-const MOON_PROTRUDE = "clamp(8px,1.2vh,16px)";
-
-// THE PROMPT TAKES NO GEOMETRY OF ITS OWN. It is given the moon's diameter and
-// anchored exactly as the disc is, and its baseline is then struck from the same
-// centre — see CurvedPrompt. Curvature that "matches" by having a similar radius
-// is not the same thing and does not survive: the arc used to hang from the top
-// of the masthead while the disc hung from the bottom, so the two were circles
-// about different points, and the line drifted off the limb as it crossed the
-// middle however carefully the radius was tuned.
-
-// Capped in BOTH directions. The vw term keeps the arc in proportion on a wide
-// display, and the ceiling stops it flattening into a straight edge on an
-// ultrawide one — past a certain size a circle cropped to a 100px band has no
-// visible curvature left, and the moon just looks like a light grey bar.
-//
-// The UPPER bound is also what keeps the disc clear of the mark and the nav. A
-// wider moon puts its limb straight through a nav label, and a word that is half
-// dark-on-moon and half light-on-black reads as broken rather than as blended —
-// the prompt in the middle is what the moon is here to sit behind, so the disc is
-// sized to hold that and nothing else.
-const MOON_DIAMETER = "min(54vw, 900px)";
-
-// THE ONLY COLOUR ON THE SITE, and it is not invented — these are the mark's own
-// hues (public/logo.png), in the order the artwork runs them: the pale ice of the
-// lit face, through the periwinkle and violet of the glass, into the warm rose
-// where the light comes out the other side. Anything wearing it reads as the same
-// material as the mark.
-//
-// PITCHED HIGH, near white. Sampling the artwork's mid-tones straight off gave a
-// gradient that sat DARKER than the cream it replaces, so the button dimmed on
-// hover — backwards for the one control the page wants pressed, which should feel
-// lit rather than shaded. These are the same five hues held at the top of their
-// range: the journey survives, the value does not drop, and black type stays hard
-// against all of it.
-const MARK_GRADIENT =
-    "linear-gradient(104deg, #ffffff 0%, #e6f0ff 24%, #d8dcf5 46%, #e6d5e6 68%, #fbdcd2 88%, #ffffff 100%)";
-
-// ONE DECLARATION, TWO COPIES. The glow is the wordmark drawn a second time
-// directly over the first, so the two have to set identically — same face, size,
-// tracking and leading. Sharing the string is what guarantees it: two lists that
-// merely looked alike would drift the moment either was touched, and a glow a
-// pixel off its letters reads as a printing error. The BLEND is not in here,
-// because the two copies want opposite ones — see where each is used.
-const WORDMARK_TYPE =
-    "font-display text-[clamp(15px,1.5vw,23px)] leading-none tracking-[0.08em] whitespace-nowrap";
-
-// The travelling window, in mask terms: opaque at its centre, feathered to nothing
-// well before either end. Everything inside it is lit, so the softness of these
-// edges IS the softness of the glow — a hard-edged window would switch letters on
-// and off as it passed.
-const GLOW_WINDOW =
-    "linear-gradient(100deg, transparent 26%, rgba(0,0,0,0.55) 40%, #000 50%, rgba(0,0,0,0.55) 60%, transparent 74%)";
-
 type Side = "a" | "b";
 /** A round ends one of three ways, and declining to choose is one of them. */
 type Vote = Side | "skip";
-
-// What the winner gains and the loser drops. A fixed swing rather than a real Elo
-// K-factor calculation: the ratings here are placeholders, so computing an exact
-// expected score off them would be arithmetic performed on fiction.
-// #TODO: the server owns this — it holds the ratings, and it is the only place
-// that can apply the result of a vote to them.
-const ELO_SWING = 12;
 
 // How long the outgoing prompt is given to be carried off the visible cap before
 // the round underneath it is swapped. It is the FIRST half of one 80° turn — see
 // `prompt-roll-out` and `moon-cycle`, which have to agree with this number or the
 // swap lands while the old words are still legible.
 const ROLL_OUT_MS = 420;
+
 
 export default function Page() {
     // The whole round is one piece of state. Everything downstream — who glows,
@@ -155,28 +88,100 @@ export default function Page() {
         return () => window.clearTimeout(timer);
     }, [turning]);
 
-    // The next pair's mesh and splat, fetched while the countdown between rounds
-    // is running — see usePreloadRound for why that window and not another.
-    const nextUp = LOCAL_ROUNDS[(target + 1) % LOCAL_ROUNDS.length];
-    usePreloadRound(nextUp, vote !== null);
+    // THE NEXT PAIR, SOLVED DURING THE COUNTDOWN — not just downloaded.
+    //
+    // This used to be `usePreloadRound`, which spent the wait on the BYTES and left
+    // the parse, the splat decode and the sightline solve on the swap. Measured,
+    // those were the whole cost: a 216 ms frame about 800 ms after the click,
+    // landing underneath the vote bar's own transition, which is where the lag was
+    // being seen. The engines can now solve a scene without disturbing the one they
+    // are showing (OrbitEngine.warmTour), so the countdown absorbs all of it and
+    // "next" is left holding nothing but a swap.
+    //
+    // The old hook is gone rather than kept alongside: it fetched exactly the two
+    // files the warm fetches, at the same moment, so running both had the pair
+    // downloaded TWICE over one connection. That contention alone stretched the
+    // warm to ~8 s — long enough that it was still unfinished when "next" was
+    // pressed, which looked like the warm not working at all.
+    //
+    // KEYED TO `shown`, NOT `target`. Pressing "next" moves `target` at once while
+    // the pair underneath stays up for the prompt's roll-out, so reading `target`
+    // flipped this to the round AFTER the incoming one at the exact moment the
+    // incoming one was wanted — clobbering the warm it had just built and
+    // destroying its staged splat. `shown` does not move until the swap, so the
+    // warm stays pointed at the pair that is actually next.
+    //
+    // AND NOT UNTIL THE REVEAL HAS STOPPED MOVING. Starting this on the vote put
+    // the whole warm — two GLB parses, two splat decodes, two sightline solves —
+    // underneath the cards expanding and the ratings counting up. Measured, a burst
+    // of 42/146/62 ms frames in the first 600 ms after the click, and identical for
+    // a SKIP, which shatters nothing: the reveal was the only thing on screen, so
+    // the reveal was what stuttered. That is the lag as the NEXT button arrives.
+    //
+    // The countdown is ~8 s and the warm needs about one, so it can afford to let
+    // the reveal have its second. `REVEAL_SETTLE_MS` comes from the reveal's own
+    // two stages, so retiming those moves this with them.
+    // ONE SIDE AT A TIME. The two panels are independent engines with independent
+    // work, and starting them together had both splat decodes and both scene
+    // solves resolving in the SAME frames — which is how two pieces that are each
+    // comfortably short still add up to a dropped one. Offsetting the second means
+    // each engine gets the main thread to itself.
+    //
+    // Long enough to clear the first side's solve, which measured ~500 ms of
+    // spread-out work; the countdown has seconds to spare either way.
+    // SHORTENED WITH THE ROUND. The reveal now settles at ~1.28 s and the countdown
+    // runs 3 s, so a 700 ms gap put the second panel's solve at 1.98 s with under a
+    // second left to finish in. At 420 it starts at ~1.7 s, which still gives each
+    // engine the main thread to itself and still lands ahead of the swap.
+    const WARM_STAGGER_MS = 420;
+    const nextUp = LOCAL_ROUNDS[(shown + 1) % LOCAL_ROUNDS.length];
+    // 0 = not yet, 1 = the left panel may warm, 2 = both may.
+    const [warmStep, setWarmStep] = useState(0);
+    // Cleared during render, armed from timers — same reason as the pair gate: a
+    // reset that waits for an effect hands the panels a stale "still warming" for
+    // one commit, and one commit is the whole event.
+    const [warmFor, setWarmFor] = useState(vote);
+    if (warmFor !== vote) {
+        setWarmFor(vote);
+        if (warmStep !== 0) setWarmStep(0);
+    }
+    useEffect(() => {
+        if (vote === null) return;
+        const first = window.setTimeout(() => setWarmStep(1), REVEAL_SETTLE_MS);
+        const second = window.setTimeout(
+            () => setWarmStep(2),
+            REVEAL_SETTLE_MS + WARM_STAGGER_MS,
+        );
+        return () => {
+            window.clearTimeout(first);
+            window.clearTimeout(second);
+        };
+    }, [vote]);
+    const warmA = warmStep >= 1 ? nextUp.cells[0].source : null;
+    const warmB = warmStep >= 2 ? nextUp.cells[1].source : null;
 
-    // WHICH ROUNDS HAVE ENGINES STANDING, which is at most two.
+    // BOTH SIDES CHANGE TOGETHER OR NEITHER DOES. The two panels finish loading
+    // whenever their own assets allow — measured ~550 ms apart, one cell carrying a
+    // 12 MB splat and the other none — so left alone the row shows one build from
+    // the new round beside one from the old. A gate per round holds the first
+    // swap until the second is ready and then runs both in one frame.
     //
-    // Fetching the next pair's bytes early only saves the transfer; the wait a
-    // viewer actually sees is the mesh being parsed and the splat decoded and
-    // uploaded, and nothing does that work until an engine exists to ask for it. So
-    // the next round is mounted off screen a whole countdown early and builds
-    // itself there.
+    // Keyed to the round being SHOWN: a new gate is what makes the next change a
+    // fresh pair rather than one already spent. The old one is cancelled, since a
+    // swap still held for a round nobody is on any more must not fire.
     //
-    // The target is kept alive THROUGH the turn as well: for the 420 ms the moon
-    // spends carrying the old prompt away, `round` is still the outgoing one — and
-    // dropping the incoming row for those few frames would throw away the very
-    // engines that were warmed, to rebuild them cold on the other side.
-    const incoming = LOCAL_ROUNDS[target % LOCAL_ROUNDS.length];
-    const liveRounds = useMemo(() => {
-        if (incoming.id !== round.id) return [round, incoming];
-        return vote !== null && nextUp.id !== round.id ? [round, nextUp] : [round];
-    }, [round, incoming, nextUp, vote]);
+    // Swapped DURING RENDER rather than in an effect — the same pattern as the
+    // viewer's `wasInside`. An effect would hand the panels the spent gate for one
+    // commit first, and one commit is the entire event.
+    const [gate, setGate] = useState(() => new PairGate(2));
+    const [gateFor, setGateFor] = useState(shown);
+    if (gateFor !== shown) {
+        setGateFor(shown);
+        gate.cancel();
+        setGate(new PairGate(2));
+    }
+    const commitA = useCallback((c: () => void) => gate.arrive("a", c), [gate]);
+    const commitB = useCallback((c: () => void) => gate.arrive("b", c), [gate]);
 
     // Which side has been stepped into, if either. A walkthrough is a place you
     // are standing, not a thumbnail: half a row is the wrong amount of frame for
@@ -188,6 +193,96 @@ export default function Page() {
     // the camera leaving the orbit that means "inside", and it leaves on more than
     // a click (and comes back on Escape, on the map, on a fly-out). One source of
     // truth, so the layout cannot get stuck open.
+    // Someone is writing a prompt of their own. The vote steps aside while they
+    // are: the two are alternative things to do with this page, and leaving the
+    // buttons up under an open composer asks the viewer to hold both questions at
+    // once — which of these two builds is better, and what would you build.
+    const [composing, setComposing] = useState(false);
+
+    // THE PAGE ASSEMBLES ITSELF ON ARRIVAL. `built` is false for exactly one frame
+    // after mount, so the ray leaves the moon and draws the controls out on load
+    // rather than the whole apparatus simply being there. Flipped from a rAF
+    // callback rather than the effect body — the browser has to paint the
+    // unbuilt state once, or the transition has nothing to travel from.
+    // WHERE THE RAY STOPS, and that is now the only thing here that has to be
+    // measured. The beam opens along the bar's top edge and stays, so its travel and
+    // its rake — which the descent needed — are gone with the descent.
+    //
+    // MEASURED, AND MEASURED WHEN IT MOVES. The stack is anchored to the bottom of
+    // the window, so when the composer grows, everything above it is lifted: the
+    // bar's top rises while its width and height do not change by a pixel. A
+    // ResizeObserver watching the BAR therefore never fired, and the ray went on
+    // ending where the controls used to start. The container is observed instead, so
+    // the growth itself is the trigger.
+    const barRef = useRef<HTMLDivElement>(null);
+    const rowRef = useRef<HTMLDivElement>(null);
+    const stackRef = useRef<HTMLDivElement>(null);
+    const [seamBreak, setSeamBreak] = useState(0);
+    const [seamUnder, setSeamUnder] = useState(0);
+    useEffect(() => {
+        const bar = barRef.current;
+        const row = rowRef.current;
+        if (!bar || !row) return;
+        const measure = () => {
+            const b = bar.getBoundingClientRect();
+            const r = row.getBoundingClientRect();
+            if (!b.height) return;
+            const next = r.bottom - b.top;
+            setSeamBreak((prev) => (Math.abs(prev - next) < 0.5 ? prev : next));
+            // Where the line ends once the round is answered: the bar's BOTTOM, so
+            // it runs the full height of the controls and is covered by them.
+            const under = r.bottom - b.bottom;
+            setSeamUnder((prev) => (Math.abs(prev - under) < 0.5 ? prev : under));
+        };
+        measure();
+        const observer = new ResizeObserver(measure);
+        observer.observe(bar);
+        observer.observe(row);
+        const stack = stackRef.current;
+        if (stack) observer.observe(stack);
+        return () => observer.disconnect();
+    }, []);
+
+    const [mounted, setMounted] = useState(false);
+    useEffect(() => {
+        const frame = requestAnimationFrame(() => setMounted(true));
+        return () => cancelAnimationFrame(frame);
+    }, []);
+    // TWO AUDIENCES FOR THE BUILD, and they are not the same.
+    //
+    // `built` drives the RAY and the VOTE — the things the beam draws and takes
+    // away. Reaching for the composer collapses those, which is the point: the page
+    // is clearing its throat so you can write.
+    //
+    // `composerBuilt` drives the composer, and it deliberately ignores `composing`.
+    // It was wired to `built` as well, so touching the field ran the collapse over
+    // the field itself — the thing you had just clicked into dissolved under the
+    // cursor. It assembles once on load and then stays, because it is the one
+    // control that has to survive its own focus.
+    // NOT UNTIL IT HAS BEEN MEASURED. The beam's travel and its narrowing both come
+    // from the bar's own box, and building before that measurement lands means
+    // descending zero pixels and then jumping when the real number arrives.
+    // The round the page opened on. Captured once, so "is this the first round" stays
+    // true to the session rather than to whatever is currently on screen.
+    // COUNTED, NOT COMPARED. This was `round.id !== firstId`, which asks "is this a
+    // different round from the one we opened on" — and with a short, cycling list the
+    // opening round COMES BACK. Every second turn matched the first id and the seam
+    // was told not to replay, so the ray drew itself on some turns and simply
+    // appeared on others. That is the nondeterminism, and it is also why it looked
+    // like a property of the NEXT BUTTON: the timer and the button both advance the
+    // same counter, but only every other turn showed the animation, and a viewer
+    // clicking early sees a different half of the alternation than one who waits.
+    //
+    // `shown` only ever goes up, so "have we turned at least once" is exactly what it
+    // says, and every turn after the first replays regardless of which pair it lands
+    // on.
+    const ready = mounted && seamBreak > 0;
+    const built = ready && !composing;
+    // Read ONCE and shared by both beam spans and both of their tracks, so the
+    // motion and the cut cannot be handed drifting values.
+    const { transitionDuration: d, transitionDelay: t } = buildStep("beam", built);
+    const composerBuilt = ready && vote === null;
+
     const [toured, setToured] = useState<Side | null>(null);
     // Per side and stable, because the viewer re-runs its report whenever this
     // identity changes; a closure rebuilt each render would re-fire it every render.
@@ -226,98 +321,132 @@ export default function Page() {
     );
 
     return (
-        <main className="relative h-dvh overflow-hidden bg-black">
-            {/* THE SCENES ARE THE PAGE. They fill the frame edge to edge and
-                everything else floats over them — no band of chrome holds a strip
-                of the viewport back, and the builds are the whole picture rather
-                than two thumbnails under a masthead. Everything below this layer is
-                an overlay, and each one hands back the pointer everywhere it is not
-                actually offering a control, so the scenes stay draggable to their
-                own edges. */}
-            {/* THE ROW SLIDES; THE PANELS ONLY RESIZE. Entering the first panel is
-                enough on its own — it grows to the full row and shoulders the second
-                one off the far edge. Entering the SECOND cannot work that way: it
-                would grow to the right, off the screen, with the first still sitting
-                in front of it. So the row itself travels one panel's width, which
-                carries the first out of frame the way it left and brings the second
-                up to the near edge. One transform, and the two directions stay
-                symmetrical.
-
-                Along the MAIN AXIS, whichever it is: the panels stack below `md`, so
-                there the same move is upwards. Both are a half of the row's own size,
-                which is what a percentage translate is measured in. */}
-            {/* ONE ROW PER LIVE ROUND, and only one of them on screen.
-                A WARM ROUND IS A BUILT ROUND, not a downloaded one. Having the next
-                pair's bytes in the HTTP cache (usePreloadRound) saves the transfer
-                and nothing else — what the "loading scene" overlay is actually
-                waiting on is the mesh being parsed, the splat being decoded and both
-                being uploaded to the GPU, and none of that can happen until
-                something has mounted an engine and asked for it. So the next round
-                is MOUNTED early, off screen, and does that work while the reader is
-                looking at the result of this one.
-
-                It then stays mounted THROUGH the swap: the row that was warming
-                simply becomes the row that is shown. Keying by round id is what
-                makes that possible — React keeps the subtree, so the engines,
-                contexts and uploaded scenes survive being revealed, and there is
-                nothing left to load at the moment of the change.
-
-                HIDDEN BY OPACITY, and it has to be opacity.
-
-                `visibility: hidden` was the obvious choice and it is the wrong one:
-                visibility is INHERITED, and a descendant is free to set itself back
-                to `visible`. The splat layer does exactly that — `setActive` writes
-                `visibility: visible` straight onto its own canvas (splatLayer.ts) —
-                so the moment a warm scene finished loading, its splat overrode the
-                hidden row and painted, on top, over the round being voted on. That
-                was the switching bug: the next pair appearing early and taking the
-                percentages with it, while the countdown was still running. It only
-                bit when the warm scenes finished inside the countdown, which is why
-                it came and went.
-
-                Opacity cannot be opted out of by a child — it applies to the subtree
-                as one group — and, unlike `display: none`, it keeps the row LAID OUT,
-                so both renderers still see a real size and can build against it. A
-                zero-sized row is a graphics device handed a zero-sized backbuffer and
-                a scene that never finishes framing. The z-index is belt and braces:
-                whatever any descendant does, the shown row is in front. */}
-            {liveRounds.map((live) => {
-                const shown = live.id === round.id;
-                return (
-                    <div
-                        key={live.id}
-                        aria-hidden={!shown}
-                        className={`absolute inset-0 flex flex-col md:flex-row ${
-                            shown ? "z-[1]" : "z-0 opacity-0 pointer-events-none"
-                        } ${
-                            shown && toured === "b"
-                                ? "-translate-y-1/2 md:translate-y-0 md:-translate-x-1/2"
-                                : ""
+        // A REAL PAGE, in bands, top to bottom: navbar, prompt, the two builds,
+        // the vote, the footer. It replaces a full-bleed arena that had the scenes
+        // filling the window edge to edge with every other element floating over
+        // them — which reads as a demo rather than as a site, because nothing has
+        // a place of its own and everything is a layer on top of the picture.
+        //
+        // `h-dvh` and a flex column: the page is exactly one screen and never
+        // scrolls, so the bands divide a KNOWN height between them. The four
+        // fixed bands take what they need and the scene row takes the rest, which
+        // is what lets the builds be as large as the furniture allows without
+        // anyone having to pick a number.
+        <main
+            className="relative flex h-dvh flex-col overflow-hidden bg-ground"
+            // WHERE THE SEAM ENDS: level with the composer's underline, which sits at
+            // the very bottom of the control stack. Published here rather than
+            // measured, because it is the same offset the stack itself is placed at —
+            // one number, used twice, so the vertical and the horizontal cannot drift
+            // out of line with each other.
+            style={{
+                // WHERE THE SEAM STOPS AND STARTS AGAIN. The controls sit in a break
+                // in the line rather than on top of it: the upper run ends at the top
+                // of the SKIP button, the vote and the composer occupy the gap, and
+                // the lower run picks up from the composer's own rule and carries on
+                // to the floor.
+                //
+                // `--seam-stop` is the composer's underline, which is exactly where
+                // the control stack is anchored — one number used twice, so the
+                // vertical and the horizontal cannot drift apart.
+                //
+                // `--seam-break` IS MEASURED, and it has to be exact. It used to
+                // overshoot on purpose — running the seam a few pixels into the
+                // opaque bar so the beam could never visibly fall short. That bought
+                // contact and cost the thing contact was for: the ray's tip ended up
+                // BELOW the bar's top edge, so the horizontal line formed partway
+                // along the beam instead of at its point, and on the way back the
+                // stub sat there with nothing to retract into. A tip that lands on
+                // the edge is not a tuning problem, it is a measurement.
+                ["--seam-stop" as string]: "var(--spacing-md)",
+                ["--seam-break" as string]: `${seamBreak}px`,
+                ["--seam-under" as string]: `${seamUnder}px`,
+            }}
+        >
+            {/* The arena writes the ROUND on the moon. Everything else about the
+                masthead — the disc, the navbar, the label — is the shared
+                component; only what is written on the arc differs by page. */}
+            {/* The masthead and the shadow it casts leave together — half of that
+                shadow IS the moon's, so keeping it while the disc goes would be a
+                shadow with nothing above it. */}
+            <div
+                className={`transition-opacity duration-500 ${
+                    toured !== null ? "pointer-events-none opacity-0" : "opacity-100"
+                }`}
+            >
+            <Masthead label="Who built it better?">
+                <MoonArc>
+                    <h1
+                        key={round.id}
+                        className={`${
+                            turning
+                                ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
+                                : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
                         }`}
-                        // `translate`, NOT `transform`. Tailwind's translate utilities
-                        // write the standalone `translate` property (`translate:
-                        // var(--tw-translate-x) …`), so a transition naming `transform`
-                        // covers nothing they do and the row jumps to its new position
-                        // in a single frame while the panel beside it takes the full
-                        // second to resize. Same clock and curve as that resize — the
-                        // slide, the growth and the camera's flight are one movement.
-                        style={{
-                            transitionProperty: "translate",
-                            transitionDuration: `${SOLO_TRANSITION_MS}ms`,
-                            transitionTimingFunction: SOLO_EASING,
-                        }}
                     >
-                        {live.cells.map((cell, i) => {
+                        <CurvedPrompt
+                            text={'\u201c' + round.prompt + '\u201d'}
+                            diameter={MOON_DIAMETER}
+                        />
+                    </h1>
+                </MoonArc>
+            </Masthead>
+            </div>
+
+            {/* --- the builds ---------------------------------------------------
+                `min-h-0` is load-bearing. A flex child's default `min-height:auto`
+                refuses to shrink below its content, and the content here is two
+                canvases that size themselves to their parent — so without it the
+                row wins every argument about height, pushes the vote bar and the
+                footer off the bottom of the screen, and the page silently stops
+                being one screen tall. */}
+            {/* THE SCENES ARE THE PAGE. They fill the frame top to bottom and the
+                masthead floats over them, so no band of chrome holds a strip of the
+                window back from the builds — which are the whole point of it. */}
+            <div ref={rowRef} className="relative min-h-0 flex-1">
+
+            {/* ONE ROW, FOR THE LIFE OF THE PAGE.
+                
+                This used to render a row PER LIVE ROUND, keyed by round id and each
+                panel keyed by cell id — so answering a round mounted two more
+                ScenePanels, two more OrbitViewers and four more canvases. Measured,
+                that is two fresh WebGL contexts and two engine constructions in the
+                frame the vote lands: ~165ms, and identical for a skip, which
+                shatters nothing. None of the things visibly moving were responsible.
+                
+                The engine has always been able to swap scenes in place —
+                useOrbitEngine builds it once on mount and calls `loadTour` when the
+                source changes. Nothing needed a new engine; it was the KEYS that
+                were throwing them away. Keyed by side instead, the two panels
+                outlive every round and a new pair is a load rather than a rebuild.
+                Canvas count stays at four for the session. */}
+                <div
+                    className={`absolute inset-0 flex flex-col md:flex-row ${
+                        toured === "b"
+                            ? "-translate-y-1/2 md:translate-y-0 md:-translate-x-1/2"
+                            : ""
+                    }`}
+                    // `translate`, NOT `transform`. Tailwind's translate utilities
+                    // write the standalone `translate` property, so a transition
+                    // naming `transform` covers nothing they do and the row jumps in
+                    // one frame while the panel beside it takes the full second.
+                    style={{
+                        transitionProperty: "translate",
+                        transitionDuration: `${SOLO_TRANSITION_MS}ms`,
+                        transitionTimingFunction: SOLO_EASING,
+                    }}
+                >
+                    {round.cells.map((cell, i) => {
                             const side: Side = i === 0 ? "a" : "b";
                             return (
                                 <ScenePanel
-                                    key={cell.id}
+                                    key={side}
                                     cell={cell}
                                     // A round nobody can see has no result and cannot be
                                     // toured: the treatments and the reporting belong to
                                     // the row on screen.
                                     outcome={
-                                        !shown || vote === null
+                                        vote === null
                                             ? null
                                             : vote === "skip"
                                                 ? "skipped"
@@ -327,20 +456,34 @@ export default function Page() {
                                     }
                                     share={
                                         side === "a"
-                                            ? live.leftShare
-                                            : 100 - live.leftShare
+                                            ? round.leftShare
+                                            : 100 - round.leftShare
                                     }
                                     align={side === "a" ? "left" : "right"}
                                     dividerRight={i === 0}
+                                    built={built}
+                                    // Every round but the first arrives with the seam
+                                    // tucked behind the controls by the round before
+                                    // it, so it has to come back out. The first one
+                                    // does not: on a cold page the beam descends from
+                                    // the moon, which is a different entrance and the
+                                    // only one that should play on load.
+                                    untuck={shown > 0}
+                                    // Keyed to the TURN, so a cycle back to a pair
+                                    // already seen is still a fresh element with a
+                                    // fresh animation to play.
+                                    roundKey={String(shown)}
+                                    warm={side === "a" ? warmA : warmB}
+                                    commitVia={side === "a" ? commitA : commitB}
                                     role={
-                                        !shown || toured === null
+                                        toured === null
                                             ? "paired"
                                             : toured === side
                                                 ? "expanded"
                                                 : "pushed"
                                     }
                                     onFocusedChange={
-                                        shown
+                                        true
                                             ? side === "a"
                                                 ? onTourA
                                                 : onTourB
@@ -349,306 +492,243 @@ export default function Page() {
                                 />
                             );
                         })}
-                    </div>
-                );
-            })}
-
-            {/* THE MASTHEAD, hanging over the scenes. The moon is clipped to exactly
-                this box and anchored to its bottom edge, so the padding below the
-                navbar is precisely how far the lower limb protrudes past it — and
-                because the box is now an overlay, the limb and its glow fall onto
-                the scenes instead of stopping at the top of them.
-
-                `isolate` is load-bearing, not tidiness: the chrome inside blends in
-                `difference` mode, and blending only reaches a backdrop inside the
-                same stacking context. Isolated, a label crossing the moon inverts
-                against it, while the same label over open scene has no backdrop to
-                fight and simply stays light. Without it, every one of them would
-                blend against whatever the two renderers happened to be drawing. */}
-            <div
-                className="pointer-events-none absolute inset-x-0 top-0 isolate z-30"
-                style={{ paddingBottom: MOON_PROTRUDE }}
-            >
-                {/* THE NAVBAR SETS THE BAND'S HEIGHT, and the disc is clipped to
-                    that box — so MOON_PROTRUDE is measured from the bottom of the
-                    navbar and means exactly what it says. It used to be the PROMPT
-                    that sized the band, which made the limb chase the prompt down
-                    the page: a longer prompt curved deeper, the band grew, and the
-                    moon swung far below the chrome it was supposed to sit behind.
-
-                    The clip lives INSIDE Moon rather than here, because only part
-                    of the moon wants clipping: the disc does, its glow does not
-                    (see Moon.tsx). This box still decides the crop — Moon anchors
-                    to it — it just no longer imposes it on the light as well. */}
-                <Moon diameter={MOON_DIAMETER} cycle={target} />
-                {/* The header itself takes NO pointer events — only the two clusters
-                    do. A full-width bar that swallowed them would put a dead strip
-                    across the top of both scenes, in the exact place you reach to
-                    drag the camera up. */}
-                <header className="pointer-events-none relative flex items-start justify-between gap-[clamp(8px,1.4vw,24px)] px-[clamp(12px,1.5vw,26px)] pb-[clamp(10px,1.5vh,18px)] pt-[clamp(9px,1.4vh,16px)]">
-                    <div className="pointer-events-auto flex min-w-0 items-center gap-[clamp(8px,1.1vw,17px)]">
-                        {/* THE MARK AND THE NAME ARE ONE TARGET — the same statement,
-                            so reaching for either lights the glass. `group/mark` is
-                            what LogoMark's whole effect hangs off; About and FAQ are
-                            deliberately outside it, being a different subject. */}
-                        {/* TIGHT, and tighter than it looks. The artwork carries its
-                            own transparent margin — the disc fills about seven tenths
-                            of the square it is drawn in — so the box has to run right
-                            up against the wordmark for the two to read as one lockup,
-                            and the box has to be bigger than the type it stands
-                            beside to match its weight. */}
-                        {/* A CONTROL, not a decoration that happens to react. The
-                            glass lighting up under the pointer already promises
-                            something will happen if you press — so it is a real
-                            button, it takes the pointer cursor that promise implies,
-                            and it can be reached and fired from the keyboard like
-                            everything else in this bar. */}
-                        {/* #TODO: no destination yet. This becomes the way back to a
-                            fresh round (or home, once there is more than one page) —
-                            the same #TODO as its neighbours. */}
-                        <button
-                            type="button"
-                            onClick={() => {}}
-                            aria-label="SceneBench by Starshot Labs"
-                            className="group/mark flex min-w-0 cursor-pointer items-center gap-[clamp(1px,0.25vw,5px)] text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
-                        >
-                            <LogoMark className="size-[clamp(40px,4.2vw,60px)] flex-none" />
-                            <div className="flex min-w-0 flex-col justify-center gap-[clamp(2px,0.35vh,5px)]">
-                                {/* The one place Anton appears. `mix-blend-difference`
-                                    so the wordmark inverts if the moon reaches it. */}
-                                <span className="relative inline-block">
-                                    <span className={`${WORDMARK_TYPE} mix-blend-difference`}>
-                                        SCENEBENCH
-                                    </span>
-                                    {/* THE GLOW. The same word again, in white, with a
-                                        bloom around the letters — and a soft window
-                                        travelling along it, so only the stretch of the
-                                        name inside the window is lit. Nothing is laid
-                                        over the type: the letters ARE the light, and
-                                        the word stays exactly as readable during the
-                                        pass as before it.
-
-                                        `plus-lighter` ADDS the light to what is
-                                        already there rather than replacing it, which
-                                        is the difference between a letter glowing and
-                                        a letter being repainted. And no
-                                        `mix-blend-difference` here — the copy beneath
-                                        has already inverted itself against whatever it
-                                        sits on; inverting the glow as well would
-                                        subtract exactly the light being added. */}
-                                    <span
-                                        aria-hidden
-                                        className={`pointer-events-none absolute inset-0 text-white opacity-0 mix-blend-plus-lighter group-hover/mark:animate-[wordmark-glow_820ms_cubic-bezier(0.4,0,0.55,1)_60ms] ${WORDMARK_TYPE}`}
-                                        style={{
-                                            textShadow:
-                                                "0 0 5px rgba(255,255,255,0.9), 0 0 13px rgba(255,255,255,0.5), 0 0 26px rgba(255,255,255,0.28)",
-                                            maskImage: GLOW_WINDOW,
-                                            WebkitMaskImage: GLOW_WINDOW,
-                                            // TALLER THAN THE TEXT, on purpose. The bloom
-                                            // spills well above and below the letters, and
-                                            // a mask only the height of the box cut it off
-                                            // flat at both — which drew a lit RECTANGLE
-                                            // around the word instead of a halo on it.
-                                            // Centred vertically so the overspill is
-                                            // covered on both sides.
-                                            maskSize: "260% 420%",
-                                            WebkitMaskSize: "260% 420%",
-                                            maskRepeat: "no-repeat",
-                                            WebkitMaskRepeat: "no-repeat",
-                                            maskPosition: "100% 50%",
-                                            WebkitMaskPosition: "100% 50%",
-                                        }}
-                                    >
-                                        SCENEBENCH
-                                    </span>
-                                    {/* THE SPARK, where the gleam runs out: above the
-                                        last letter, outside the word rather than over
-                                        it, timed to land as the light leaves. */}
-                                    <span
-                                        aria-hidden
-                                        className="pointer-events-none absolute -top-[0.42em] -right-[0.3em] size-[clamp(8px,0.78vw,12px)] text-foreground opacity-0 group-hover/mark:animate-[star-twinkle_620ms_cubic-bezier(0.3,1.4,0.4,1)_600ms]"
-                                    >
-                                        <svg
-                                            viewBox="0 0 24 24"
-                                            fill="currentColor"
-                                            className="size-full"
-                                        >
-                                            {/* A four-point spark with concave sides —
-                                                the shape a point of light makes, not the
-                                                five-point badge on a sheriff. */}
-                                            <path d="M12 0c0 6.6 5.4 12 12 12-6.6 0-12 5.4-12 12 0-6.6-5.4-12-12-12 6.6 0 12-5.4 12-12z" />
-                                        </svg>
-                                    </span>
-                                </span>
-                                <span className="font-mono text-[clamp(7px,0.68vw,10px)] font-bold leading-none tracking-[0.18em] whitespace-nowrap text-[#6f6f6f]">
-                                    BY STARSHOT LABS
-                                </span>
-                            </div>
-                        </button>
-                        {/* BESIDE THE MARK, not over with the CTA. These two are
-                            about the project rather than about the round in front of
-                            you, so they belong with the name that owns them — and it
-                            leaves the right-hand side holding nothing but the two
-                            things the page actually wants you to do. */}
-                        <div className="flex items-center gap-[clamp(10px,1.5vw,22px)] pl-[clamp(4px,0.9vw,14px)]">
-                            <SubLink onClick={() => {}}>ABOUT</SubLink>
-                            <SubLink onClick={() => {}}>FAQ</SubLink>
-                        </div>
-                    </div>
-
-                    {/* Two items, one row, and nothing else on this side. Both are
-                        about the round in front of you — where this one ranks, and
-                        how to start your own — which is why About and FAQ went to
-                        live beside the wordmark instead. */}
-                    <nav className="pointer-events-auto flex flex-none items-center gap-[clamp(10px,1.9vw,28px)]">
-                        {/* #TODO: no destinations yet. These become <Link>s the moment
-                            /leaderboard, /about and /faq exist; they are buttons only
-                            because there is nowhere to point them. */}
-                        {/* Underlined on hover by an inset shadow rather than a border:
-                            a border would take its space in the layout whether it was
-                            being shown or not, and nudge the row every time the
-                            pointer crossed it. */}
-                        <button
-                            type="button"
-                            onClick={() => {}}
-                            className="cursor-pointer px-0.5 py-2.5 font-sans text-[clamp(11px,0.95vw,14px)] font-black tracking-[0.05em] whitespace-nowrap text-foreground shadow-[inset_0_-3px_0_rgba(255,255,255,0)] transition-shadow duration-200 hover:shadow-[inset_0_-3px_0_var(--color-foreground)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
-                        >
-                            LEADERBOARD
-                        </button>
-                        {/* The page inverted: the site's foreground becomes the
-                            button's ground and its background the text.
-
-                            THE HOVER IS THE MARK'S OWN GLASS. The whole page is
-                            black, white and the greys between, and the single place
-                            any colour lives is the logo — so the one colour the site
-                            has is what lights up on the one thing it wants you to
-                            press, and pressing it feels like the same object as the
-                            name in the corner. Sampled from the artwork rather than
-                            invented (see MARK_GRADIENT). It is a light gradient, so
-                            the label stays black on it; white text on those pales
-                            would fail its contrast where the ice blue is. */}
-                        <button
-                            type="button"
-                            // #TODO: no action yet. This should take a prompt from the
-                            // user and queue a build on both models.
-                            onClick={() => {}}
-                            className="group/cta relative cursor-pointer bg-foreground px-[clamp(13px,1.6vw,24px)] py-[clamp(10px,1.15vw,16px)] font-sans text-[clamp(11px,0.98vw,15px)] font-black tracking-[0.04em] whitespace-nowrap text-background transition-transform duration-200 hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 focus-visible:ring-offset-2 focus-visible:ring-offset-black active:translate-y-0"
-                        >
-                            {/* A LAYER, not a background swap: `background-image` does
-                                not interpolate, so a gradient set on hover would snap
-                                in while the lift eased. Fading a copy over the cream
-                                is the only way the two arrive together. */}
-                            <span
-                                aria-hidden
-                                className="absolute inset-0 opacity-0 transition-opacity duration-200 group-hover/cta:opacity-100"
-                                style={{ backgroundImage: MARK_GRADIENT }}
-                            />
-                            <span className="relative">GENERATE YOUR OWN</span>
-                        </button>
-                    </nav>
-                </header>
-
-                {/* THE PROMPT IS THE BAND'S ONLY FLOW CONTENT, so it — not the
-                    navbar — decides how tall the masthead is, and it centres on the
-                    page rather than on whatever gap the chrome leaves. The top
-                    padding is what holds it clear of the floating navbar above.
-
-                    PAINTED, NOT BLENDED. This used to blend in `difference` so it
-                    would survive crossing the moon's limb, but that mode operates
-                    on the antialiased edge pixels too: every letter's outline
-                    resolved to muddy mid-greys and the type read as soft. Ink on
-                    the disc is worth more than the edge case, so the colour is
-                    chosen outright — which is only safe because the arc is sized to
-                    keep the text inside the disc. */}
-                <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center px-[clamp(12px,1.5vw,26px)] pt-[clamp(4px,0.7vh,9px)] text-center">
-                    {/* Clearly SECONDARY to the prompt — roughly half its height — or
-                        the masthead has two headlines and neither leads. */}
-                    <span className="font-mono text-[clamp(8px,0.72vw,13.5px)] tracking-[0.24em] whitespace-nowrap text-[#0b0d12]/55">
-                        WHO BUILT IT BETTER?
-                    </span>
                 </div>
-
-                {/* ANCHORED EXACTLY AS THE DISC IS — bottom edge on the bottom of
-                    this box, horizontally centred — and given the disc's own
-                    diameter. That is the whole of the alignment: two square boxes
-                    pinned to the same corner have the same centre, so the baseline
-                    CurvedPrompt strikes about its viewBox centre is struck about the
-                    moon's centre, and the two curves are one curve.
-
-                    SOLID BLACK. It was set two-thirds strength for a while, on the
-                    argument that ink darker than the moon's own terminator reads as
-                    a hole punched through the disc rather than as a mark on it — but
-                    that treats the prompt as texture, and it is the headline. At
-                    this size, on a body this bright, the greyed version simply read
-                    as washed out. The drop shadow stays (a filter, since text-shadow
-                    does not reach SVG glyphs); it is what seats the type on the
-                    surface now that the value alone no longer does. */}
-                {/* THE PROMPT TURNS WITH THE MOON. Because the SVG is the disc's own
-                    square, rotating it about its centre carries the text ALONG THE
-                    LIMB — the line does not slide sideways off the moon, it travels
-                    round it, which is the one motion a word written on a sphere can
-                    make. That is the whole reason the prompt is anchored this way;
-                    the alignment was the first payoff, this is the second.
-
-                    KEYED BY THE ROUND, so a new prompt is a new element and its
-                    entrance plays from the start. It comes in already turning and
-                    slows into place — see `prompt-settle`. */}
-                <h1
-                    // Keyed by what is SHOWN, so the settle plays once per arrival.
-                    // While the wheel is carrying the old prompt away the key does
-                    // not change — the same element simply picks up the other
-                    // animation and rides out on it.
-                    key={round.id}
-                    className={`pointer-events-none absolute left-1/2 top-full origin-center -translate-x-1/2 -translate-y-full text-black filter-[drop-shadow(0_2px_9px_rgba(9,11,16,0.18))] ${
-                        turning
-                            ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
-                            : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
-                    }`}
-                >
-                    <CurvedPrompt text={`"${round.prompt}"`} diameter={MOON_DIAMETER} />
-                </h1>
             </div>
 
-            {/* THE VOTE, floating clear of the bottom edge rather than sitting in a
-                strip of its own. Centred and only as wide as it needs to be, so the
-                scenes run underneath it and the two builds stay the full picture.
-                The row hands the pointer back everywhere except the bar itself. */}
-            <div className="pointer-events-none absolute inset-x-0 bottom-[clamp(18px,3.4vh,52px)] z-30 flex justify-center px-[clamp(12px,1.5vw,26px)]">
-                <div className="pointer-events-auto">
+            {/* --- the vote, over the scenes -----------------------------------
+                Overlaid rather than banded. A row of its own was tidier and it
+                cost the builds a strip of the window they could have been filling;
+                floating gives that back, and the scenes are what the page is for.
+
+                The engine knows: SAFE_BOTTOM reserves the strip this occupies so
+                no build is ever framed with its near corner under a button. Those
+                two numbers have to agree — see engine.ts. */}
+            <div
+                ref={stackRef}
+                // OUT OF THE WAY WHILE A BUILD IS BEING WALKED THROUGH. Stepping
+                // inside used to take the browser's screen, which hid the site by
+                // hiding everything; it does not any more (see OrbitViewer), so the
+                // site has to clear its own furniture. Faded rather than unmounted:
+                // the bar keeps its measured height, so the seam and the ray that
+                // are pinned to it do not jump the moment someone steps in, and it
+                // is all still there when they come back out.
+                className={`pointer-events-none absolute inset-x-0 bottom-md z-30 flex flex-col items-center gap-0 px-lg transition-opacity duration-500 ${
+                    toured !== null ? "opacity-0" : "opacity-100"
+                }`}
+            >
+                {/* THE VOTE KEEPS ITS SPACE WHILE IT LEAVES. Fading and sinking
+                    rather than unmounting, so the composer beneath it does not jump
+                    up the screen the instant the field is touched — the point of
+                    the movement is that the page makes room quietly, and a layout
+                    shift is the loudest thing it could do. Sinking as it goes, so
+                    it reads as stepping back rather than switching off. */}
+                {/* THE BEAM TURNS, THEN DESCENDS.
+                    
+                    `sweepRule` is the white line itself: it opens out of the seam's
+                    landing point to both corners, then travels down the bar's height.
+                    The bar is wiped in behind it — `inset(0 0 100% 0)` retreating to
+                    zero — so the buttons are uncovered in the rule's wake and the line
+                    is visibly the thing drawing them, rather than a cue that fires a
+                    fade somewhere else.
+                    
+                    The two share one step (`wipe`) deliberately: a rule on one clock
+                    and a reveal on another drift apart within a few frames, and the
+                    illusion depends entirely on the edge of the wipe sitting exactly
+                    under the line at every instant. */}
+                <div className="pointer-events-auto relative">
+                    {/* One step read once, so the two tracks and both spans
+                        cannot be given drifting values. */}
+                    <span
+                        aria-hidden
+                        // REMOUNTED ON EVERY DIRECTION CHANGE, and this is the whole
+                        // reason the sequence held together on paper and not on
+                        // screen.
+                        //
+                        // A CSS animation starts its clock when it is APPLIED, and
+                        // changing `animation-delay` or `animation-direction` does not
+                        // restart it. Every other stage here is a transition, and a
+                        // transition starts when its value changes. So the two kinds
+                        // of stage were being timed from two different origins:
+                        //
+                        //  - ON LOAD the animation began ticking at first paint while
+                        //    the ray waited for `mounted`, which lands only after two
+                        //    WebGL contexts have initialised. The beam spent its delay
+                        //    during that gap and opened while the ray was still on its
+                        //    way down — the horizontal appearing before the line that
+                        //    is supposed to create it.
+                        //  - ON RE-ENTRY its currentTime was already past the end, so
+                        //    flipping direction only re-resolved a finished animation.
+                        //    It snapped to its last frame, which is why the opening and
+                        //    the descent arrived as one movement instead of two.
+                        //
+                        // A key change tears the element down and builds it again in
+                        // the SAME commit that changes the transitions, so the beam and
+                        // the ray start from one origin by construction. Nothing here
+                        // holds state or focus, so remounting it costs nothing.
+                        key={built ? "build" : "collapse"}
+                        className="absolute inset-x-0 top-0 z-20 h-[3px] origin-center bg-mark"
+                        style={{
+                            // The resting state, for the frame before the first build:
+                            // closed to nothing at the bar's top edge. The animation
+                            // fills over this the moment there is one.
+                            scale: "0 1",
+                            // `scale` AND `translate`, AND NOTHING ELSE. This drew its
+                            // narrowing with `left`/`right` first, which is correct
+                            // geometry animated the wrong way: insets are layout, so
+                            // the browser relaid the line every frame and snapped its
+                            // ends to whole pixels while the descent ran smoothly on
+                            // the compositor. The ends stepped, the body glided, and
+                            // the two came apart — the jagged edge.
+                            //
+                            // Scaled about the centre, the ends track the rake exactly
+                            // at every frame, not just at the two ends of the travel:
+                            // at depth t the width is W(1 + (sx-1)t), so each end sits
+                            // W(1-sx)t/2 = RAKE*t inside — which is the slant.
+                            // ONE PART, BOTH DIRECTIONS. The delay used to be read
+                            // from `sweep` when building and `wipe` when collapsing —
+                            // two stages for one element, which is how the opening
+                            // came to start before the ray had landed. `beam` is the
+                            // whole stroke, and its start is derived from the ray's
+                            // end, so it cannot begin early.
+                            // Not run at all until the page is ready to build. Without
+                            // this the first render would mount a COLLAPSE animation and
+                            // play it, drawing a line in order to take it away again.
+// TWO ANIMATIONS, ONE CLOCK: the motion, and the cut.
+                            //
+                            // Visibility is a separate track run on `steps(1, end)`
+                            // so it holds at full strength for the whole beat and
+                            // changes exactly once, at the end. Put on the motion
+                            // track it would have to be a fade, and a beam that
+                            // dissolves after landing reads as an effect finishing
+                            // rather than as a line becoming the edge it drew.
+                            animationName: ready
+                                ? "vote-rule, vote-rule-hide"
+                                : "none",
+                            animationDuration: `${d}, ${d}`,
+                            animationDelay: `${t}, ${t}`,
+                            animationDirection: built
+                                ? "normal, normal"
+                                : "reverse, reverse",
+                            animationFillMode: "both, both",
+                            // Per-BEAT easing lives in the keyframes; one curve here
+                            // would be re-applied to every segment and make the line
+                            // hesitate at each of its own stops.
+                            animationTimingFunction: "linear, steps(1, end)",
+                        }}
+                    />
+                    {/* THE LINE CROSSES SKIP AGAIN, and the mask that stopped it is
+                        gone.
+
+                        There used to be a black span here, exactly SKIP's width and
+                        the rule's height, sitting at z-20 on the bar's top edge. Its
+                        argument was that SKIP has no edge of its own — it is the black
+                        cut between two white slabs — so a white rule laid across its
+                        top would be drawing a border it does not have.
+
+                        SKIP HAS ONE NOW (see VoteBar, where it carries hairlines on
+                        its horizontals), so the mask was hiding the very thing it is
+                        supposed to have. Worse, it was doing it silently: the border
+                        computed correctly at 1px solid ink and simply never appeared,
+                        because a z-20 span was painted over it. Measured down through
+                        SKIP's centre, the BOTTOM rule showed at full strength and the
+                        top read pure black — an asymmetry with no cause anywhere in
+                        the button, which is what gave the mask away.
+
+                        With it removed the beam runs the full width of the bar and
+                        lands on SKIP's own top rule, so the three segments share one
+                        continuous edge instead of two white slabs and a gap. */}
+
+                    <div
+                        ref={barRef}
+                        // THE WHOLE BUTTON IS DRAWN BY THE LINE, text included. The
+                        // clip travels with the beam — measured, the uncovered
+                        // fraction equals the beam's depth to the decimal — so
+                        // everything inside is revealed exactly as the edge passes it.
+                        //
+                        // The labels were briefly held back and faded in after the
+                        // sweep landed. That is a defensible effect and it was the
+                        // wrong one: the text is the part of a button you actually
+                        // read, so holding it made the control look like it appeared
+                        // late rather than like it was being drawn. Nothing overrides
+                        // the clip now.
+                        style={{
+                            // OPACITY IS NOT PART OF THE REVEAL — the clip is.
+                            //
+                            // These shared one duration, so while the line uncovered
+                            // the bar the bar was ALSO fading up from zero, reaching
+                            // full strength only as the sweep landed. Captured
+                            // mid-descent the buttons were dark grey, then lighter,
+                            // then finally the palette white — revealed on time and
+                            // drawn late, which is exactly the gap between the line
+                            // and the control it is supposed to be drawing.
+                            //
+                            // Opacity now switches at the start of the beat and the
+                            // clip does all the drawing, so whatever the line has
+                            // passed is already at full strength behind it.
+                            // THE CLIP IS THE WHOLE MOVEMENT, in both directions.
+                            //
+                            // Opacity used to ride alongside it. Sharing the clip's
+                            // duration it made the bar fade up WHILE being uncovered,
+                            // so the buttons ghosted in behind the line; switched
+                            // instantly instead, it fixed the build and broke the
+                            // collapse — the bar blinked out before the clip could
+                            // close, so entering the composer removed the controls
+                            // rather than un-drawing them.
+                            //
+                            // It is gone. `inset(0 0 100% 0)` already hides the bar
+                            // completely, so opacity was never carrying anything the
+                            // clip was not, and one property animating in one
+                            // direction is reversible by construction: the bar grows
+                            // down from the line, and closes back up into it.
+                            transitionProperty: "clip-path",
+                            transitionDuration: buildStep("wipe", built)
+                                .transitionDuration,
+                            transitionDelay: buildStep("wipe", built).transitionDelay,
+                            transitionTimingFunction: buildStep("wipe", built)
+                                .transitionTimingFunction,
+                            clipPath: built ? "inset(0 0 0 0)" : "inset(0 0 100% 0)",
+                            pointerEvents: composing ? "none" : "auto",
+                        }}
+                    >
                     <VoteBar
                         cells={round.cells}
                         vote={vote}
-                        swing={ELO_SWING}
                         onVote={setVote}
                         onNext={nextPair}
                         // Standing inside one of the scenes stops the clock: see
                         // NextTimer for why the round must not turn over under you.
                         paused={toured !== null}
-                    />
+                        />
+                    </div>
+                </div>
+
+                {/* THE INVITATION, under the vote. It is the last thing in the
+                    column deliberately: a viewer's job on this page is to answer
+                    the question above it, and asking them to write a prompt of
+                    their own before they have done that is the page interrupting
+                    itself. Below the vote it reads as what comes next. */}
+                {/* GONE WHILE THE ROUND FINISHES. Between the vote and the next pair
+                    the page is telling you something — who made what, how the crowd
+                    split, how long until the next one — and an invitation to go and
+                    do something else is the one thing that should not be on screen
+                    for it. It comes back when the next pair does.
+
+                    Faded and sunk rather than unmounted, so the field keeps its
+                    typed text and its scroll position through the round change and
+                    does not replay its typewriter every few seconds. */}
+                <div
+                    className="transition-[opacity,translate]"
+                    style={{
+                        ...buildStep("composer", composerBuilt),
+                        opacity: composerBuilt ? 1 : 0,
+                        translate: vote !== null ? "0 var(--spacing-lg)" : "0 0",
+                        pointerEvents: composerBuilt ? "auto" : "none",
+                    }}
+                >
+                    <Composer onOpenChange={setComposing} built={composerBuilt} />
                 </div>
             </div>
-        </main>
-    );
-}
 
-// The quiet rank of header item, set in the machine voice beside the wordmark:
-// small tracked-out mono capitals, grey until you reach for them. About and FAQ
-// are things a reader goes looking for rather than things the page offers, so
-// they are findable without ever being the first thing found.
-function SubLink({
-    children,
-    onClick,
-}: {
-    children: ReactNode;
-    onClick: () => void;
-}) {
-    return (
-        <button
-            type="button"
-            onClick={onClick}
-            className="cursor-pointer py-1 font-mono text-[clamp(8px,0.75vw,11px)] tracking-[0.18em] whitespace-nowrap text-[#7a7a7a] transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
-        >
-            {children}
-        </button>
+        </main>
     );
 }

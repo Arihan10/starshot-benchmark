@@ -49,11 +49,11 @@ export default function ObjectMenu({
 			ref={ref}
 			style={{ left, top }}
 			onContextMenu={(e) => e.preventDefault()}
-			className='fixed z-50 min-w-42.5 select-none rounded-md border border-white/10 bg-neutral-900/95 p-1 text-xs shadow-2xl backdrop-blur'
+			className='fixed z-50 min-w-42.5 select-none rounded-md border border-mark-8 bg-surface/95 p-1 text-xs shadow-2xl backdrop-blur'
 		>
 			{menu.label && (
 				<>
-					<div className='mb-1 max-w-60 truncate border-b border-white/10 px-2 py-1.5 font-semibold text-cyan-200'>
+					<div className='mb-1 max-w-60 truncate border-b border-mark-8 px-2 py-1.5 font-semibold text-cyan-200'>
 						{menu.label}
 					</div>
 					<MenuButton onClick={() => engine.current?.toggleMenuTargetHidden()}>
@@ -62,7 +62,7 @@ export default function ObjectMenu({
 					<MenuButton onClick={() => engine.current?.toggleMenuTargetOutline()}>
 						{menu.outlined ? "remove outline" : "highlight outline"}
 					</MenuButton>
-					{hasExtras && <div className='my-1 h-px bg-white/10' />}
+					{hasExtras && <div className='my-1 h-px bg-mark-8' />}
 				</>
 			)}
 			{menu.hiddenCount > 0 && (
@@ -84,7 +84,7 @@ function MenuButton({ onClick, children }: { onClick: () => void; children: Reac
 		<button
 			type='button'
 			onClick={onClick}
-			className='block w-full rounded px-2 py-1.5 text-left text-neutral-200 transition hover:bg-cyan-500/20 hover:text-white'
+			className='block w-full rounded px-2 py-1.5 text-left text-ink transition hover:bg-cyan-500/20 hover:text-ink'
 		>
 			{children}
 		</button>

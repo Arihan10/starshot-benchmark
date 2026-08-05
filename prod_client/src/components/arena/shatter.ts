@@ -27,8 +27,8 @@ function addSweep(fx: HTMLElement, w: number, h: number) {
 		transformOrigin: "0 50%",
 		transform: rotated(`-${diag}px`),
 		background:
-			"linear-gradient(90deg, rgba(237,237,237,0) 0%, rgba(237,237,237,0.25) 62%, rgba(237,237,237,0.95) 92%, #fff 100%)",
-		filter: "drop-shadow(0 0 10px rgba(237,237,237,0.85))",
+			"linear-gradient(90deg, rgb(var(--mark-rgb) / 0) 0%, rgb(var(--mark-rgb) / 0.25) 62%, rgb(var(--mark-rgb) / 0.95) 92%, rgb(var(--mark-rgb)) 100%)",
+		filter: "drop-shadow(0 0 10px rgb(var(--mark-rgb) / 0.85))",
 		opacity: "0",
 	});
 	fx.appendChild(star);
@@ -51,8 +51,8 @@ function addSweep(fx: HTMLElement, w: number, h: number) {
 		height: "1px",
 		transformOrigin: "0 50%",
 		transform: `rotate(${angle}deg) scaleX(0)`,
-		background: "rgba(237,237,237,0.75)",
-		filter: "drop-shadow(0 0 6px rgba(237,237,237,0.6))",
+		background: "rgb(var(--mark-rgb) / 0.75)",
+		filter: "drop-shadow(0 0 6px rgb(var(--mark-rgb) / 0.6))",
 	});
 	fx.appendChild(seam);
 	seam.animate(
@@ -166,32 +166,88 @@ export function shatter(
 	fx.replaceChildren();
 	addSweep(fx, width, height);
 
-	for (const tri of triangulate()) {
-		const cx = (tri[0][0] + tri[1][0] + tri[2][0]) / 3;
-		const cy = (tri[0][1] + tri[1][1] + tri[2][1]) / 3;
+	let cancelled = false;
+	let url: string | null = null;
+	let timer: ReturnType<typeof setTimeout> | null = null;
 
-		const shard = document.createElement(snapshot ? "canvas" : "div");
-		if (snapshot && shard instanceof HTMLCanvasElement) {
-			shard.width = snapshot.width;
-			shard.height = snapshot.height;
-			shard.getContext("2d")?.drawImage(snapshot, 0, 0);
+	// ONE TEXTURE, TWENTY-FOUR VIEWS OF IT.
+	//
+	// Every shard used to be its own `<canvas>`. Cropping them to their triangles
+	// cut the pixels, but not the thing that actually cost: twenty-four canvases are
+	// twenty-four separate textures for the compositor to allocate and upload, in
+	// the frame the vote lands. The capture was already a single readback — the
+	// slicing is what multiplied it back out.
+	//
+	// Encoded once and handed to plain divs as a shared background, the browser
+	// decodes and uploads it ONCE; each shard is then a cheap layer that references
+	// the same image at a different offset. Same picture, same break, one upload.
+	const build = (src: string | null) => {
+		if (cancelled) return;
+		for (const tri of triangulate()) {
+			const cx = (tri[0][0] + tri[1][0] + tri[2][0]) / 3;
+			const cy = (tri[0][1] + tri[1][1] + tri[2][1]) / 3;
+
+			// The triangle's own box, as percentages of the panel.
+			const xs = [tri[0][0], tri[1][0], tri[2][0]];
+			const ys = [tri[0][1], tri[1][1], tri[2][1]];
+			const x0 = Math.min(...xs);
+			const y0 = Math.min(...ys);
+			const bw = Math.max(...xs) - x0;
+			const bh = Math.max(...ys) - y0;
+
+			const shard = document.createElement("div");
+			Object.assign(shard.style, {
+				position: "absolute",
+				left: `${x0.toFixed(3)}%`,
+				top: `${y0.toFixed(3)}%`,
+				width: `${bw.toFixed(3)}%`,
+				height: `${bh.toFixed(3)}%`,
+				// The image is laid out at PANEL size inside each shard and slid so
+				// the shard's own region lands in its box — which is what makes this
+				// one picture seen through twenty-four windows rather than
+				// twenty-four pictures.
+				backgroundImage: src ? `url("${src}")` : "none",
+				backgroundSize: `${width}px ${height}px`,
+				backgroundPosition: `${(-(x0 / 100) * width).toFixed(2)}px ${(-(y0 / 100) * height).toFixed(2)}px`,
+				backgroundColor: src ? "transparent" : "rgba(150,155,170,0.22)",
+				// Re-expressed against the shard's own box rather than the panel's.
+				clipPath: `polygon(${tri
+					.map(
+						(p) =>
+							`${(((p[0] - x0) / bw) * 100).toFixed(2)}% ${(((p[1] - y0) / bh) * 100).toFixed(2)}%`,
+					)
+					.join(", ")})`,
+				willChange: "transform, opacity",
+			});
+			fx.appendChild(shard);
+			launch(shard, cx, cy, height);
 		}
-		Object.assign(shard.style, {
-			position: "absolute",
-			inset: "0",
-			width: "100%",
-			height: "100%",
-			backgroundColor: snapshot ? "transparent" : "rgba(150,155,170,0.22)",
-			clipPath: `polygon(${tri.map((p) => `${p[0].toFixed(2)}% ${p[1].toFixed(2)}%`).join(", ")})`,
-			willChange: "transform, opacity",
-		});
-		fx.appendChild(shard);
-		launch(shard, cx, cy, height);
+		timer = setTimeout(() => fx.replaceChildren(), CLEANUP_MS);
+	};
+
+	if (snapshot) {
+		// `toBlob` rather than `toDataURL`: the encode runs off the main thread and
+		// there is no megabyte-long base64 string to parse back. WebP because it is
+		// the cheapest encode that keeps the picture, and the shards are tumbling and
+		// fading within a second — nobody is inspecting them.
+		snapshot.toBlob(
+			(blob) => {
+				if (cancelled) return;
+				if (!blob) return build(null);
+				url = URL.createObjectURL(blob);
+				build(url);
+			},
+			"image/webp",
+			0.9,
+		);
+	} else {
+		build(null);
 	}
 
-	const timer = setTimeout(() => fx.replaceChildren(), CLEANUP_MS);
 	return () => {
-		clearTimeout(timer);
+		cancelled = true;
+		if (timer) clearTimeout(timer);
+		if (url) URL.revokeObjectURL(url);
 		fx.replaceChildren();
 	};
 }
