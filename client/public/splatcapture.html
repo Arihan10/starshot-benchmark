@@ -47,6 +47,71 @@
     </head>
     <body>
         <div id="status">splat capture: starting…</div>
+        <!-- LAST-RESORT FAILURE REPORTER. It has to live here, inline and
+             classic (non-module), because the thing it exists to catch is the
+             module graph itself failing: a `type="module"` script whose import
+             404s, or any module that throws while evaluating, never reaches
+             splatcapture.js's own try/catch. The page then just sits there —
+             the host sees no error, no frames, and only notices ~3 minutes
+             later when the boot watchdog fires with nothing to report. One
+             missing file baked into the capture image is enough to cause that,
+             so make it loud: surface the error on the page AND tell the job,
+             using the same token/finish endpoint the capture uses. -->
+        <script>
+            (function () {
+                var reported = false;
+                function report(what) {
+                    if (reported) return;
+                    reported = true;
+                    var el = document.getElementById("status");
+                    if (el) {
+                        el.innerHTML +=
+                            '\n<span class="err">page failed before capture: ' +
+                            String(what).replace(/[<&]/g, "?") +
+                            "</span>";
+                    }
+                    try {
+                        var q = new URLSearchParams(location.search);
+                        var api = (q.get("api") || "").replace(/\/$/, "");
+                        var run = q.get("run");
+                        var slot = q.get("slot");
+                        var model = q.get("model");
+                        var token = q.get("token");
+                        if (!api || !run || !slot || !model || !token) return;
+                        fetch(
+                            api +
+                                "/runs/" +
+                                encodeURIComponent(run) +
+                                "/splat/stage5/" +
+                                encodeURIComponent(slot) +
+                                "/" +
+                                encodeURIComponent(model) +
+                                "/finish?token=" +
+                                encodeURIComponent(token),
+                            {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ error: String(what) }),
+                                keepalive: true,
+                            },
+                        ).catch(function () {});
+                    } catch (e) {
+                        /* nothing left to report to */
+                    }
+                }
+                addEventListener("error", function (e) {
+                    // Resource errors (a 404'd module) carry no `message`; name the
+                    // URL that failed, since that IS the diagnosis.
+                    var t = e.target;
+                    if (t && (t.src || t.href)) report("failed to load " + (t.src || t.href));
+                    else report((e.error && e.error.message) || e.message || "script error");
+                }, true);
+                addEventListener("unhandledrejection", function (e) {
+                    var r = e.reason;
+                    report((r && r.message) || r || "unhandled rejection");
+                });
+            })();
+        </script>
         <script type="module" src="/js/splatcapture.js"></script>
     </body>
 </html>

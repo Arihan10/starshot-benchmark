@@ -12,6 +12,10 @@ import { ZSTDDecoder } from "three/addons/libs/zstddec.module.js";
 const FRAME_MAGIC = 0x31465a53; // "SZF1" read as little-endian u32 (S=0x53,Z=0x5a,F=0x46,1=0x31)
 const HEADER_BYTES = 16;
 const FILTER_SUBLEFT = 1;
+// Stream codec (header byte 7 — see splat/stage5.py). 0 = zstd, written by the host;
+// 1 = raw deflate, written by the capture page when it encodes frames itself.
+const CODEC_ZSTD = 0;
+const CODEC_DEFLATE = 1;
 const DEPTH_CODE_MAX = 65535; // matches stage5._DEPTH_CODE_MAX; code 0 = background
 // Rig kinds of the single-shot camera plan (transforms.json frames[].kind).
 // Older reference sets may still carry fill/station kinds; those views simply
@@ -68,6 +72,15 @@ function unfilterDepth(codes, res) {
     }
 }
 
+// Raw deflate (no zlib/gzip wrapper), the browser-native counterpart to the
+// capture page's CompressionStream("deflate-raw").
+async function inflateRaw(comp) {
+    const stream = new Blob([comp]).stream().pipeThrough(
+        new DecompressionStream("deflate-raw"),
+    );
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
 // Parse one SZF buffer and decompress only the requested planes. Returns
 // { res, rgba: Uint8Array|null, depth: Uint16Array|null }.
 async function decodeFrame(buf, { rgba: wantRgba = true, depth: wantDepth = true } = {}) {
@@ -77,25 +90,37 @@ async function decodeFrame(buf, { rgba: wantRgba = true, depth: wantDepth = true
     }
     const res = dv.getUint16(4, true);
     const filter = dv.getUint8(6);
+    const codec = dv.getUint8(7);
     const rgbaClen = dv.getUint32(8, true);
     const depthClen = dv.getUint32(12, true);
     if (buf.byteLength !== HEADER_BYTES + rgbaClen + depthClen) {
         throw new Error("truncated SZF frame");
     }
-    const dec = await ensureDecoder();
+    if (codec !== CODEC_ZSTD && codec !== CODEC_DEFLATE) {
+        throw new Error(`unknown SZF codec ${codec}`);
+    }
+    // zstd needs three's WASM decoder and wants the exact output size up front;
+    // deflate is native and sizes itself.
     const bytes = new Uint8Array(buf);
+    let inflate;
+    if (codec === CODEC_ZSTD) {
+        const dec = await ensureDecoder();
+        inflate = (comp, outLen) => dec.decode(comp, outLen);
+    } else {
+        inflate = (comp) => inflateRaw(comp);
+    }
 
     let rgba = null;
     if (wantRgba) {
         const comp = bytes.subarray(HEADER_BYTES, HEADER_BYTES + rgbaClen);
-        rgba = dec.decode(comp, res * res * 4);
+        rgba = await inflate(comp, res * res * 4);
         if (filter === FILTER_SUBLEFT) unfilterRgba(rgba, res);
     }
     let depth = null;
     if (wantDepth) {
         const off = HEADER_BYTES + rgbaClen;
         const comp = bytes.subarray(off, off + depthClen);
-        const raw = dec.decode(comp, res * res * 2);
+        const raw = await inflate(comp, res * res * 2);
         depth = new Uint16Array(raw.buffer, raw.byteOffset, res * res);
         if (filter === FILTER_SUBLEFT) unfilterDepth(depth, res);
     }

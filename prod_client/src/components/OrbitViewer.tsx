@@ -993,6 +993,17 @@ function hudContent(state: OrbitState): ReactNode {
 					{hover.occluded ? " · out of sight" : ""}
 				</>
 			);
+		// Naming what the cursor is resting on takes precedence over the key hints:
+		// the outline is already drawn, and the label is what says which thing it is.
+		if (objectHover)
+			return (
+				<>
+					<strong>{objectHover}</strong> ·{" "}
+					<span className='text-neutral-400'>
+						{currentName ?? currentId}
+					</span>
+				</>
+			);
 		return (
 			<>
 				<strong>{currentName ?? currentId}</strong> ·{" "}

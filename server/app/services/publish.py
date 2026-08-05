@@ -7,6 +7,7 @@ proxies/, tours/). Assets are keyed per cell — run/slot/model, NOT versioned:
   tours/<run>/<slot>/<model>/tour.json
   proxies/<run>/<slot>/<model>/proxy.glb
   panoramas/<run>/<slot>/<model>/<anchor>.jpg
+  panoramas/<run>/<slot>/<model>/<anchor>.sid   (object-ID mask, beside its pano)
 
 so re-publishing a cell overwrites its objects (and its D1 row) in place. The
 dollhouse is baked from whichever raw build the cell's source preference selects
@@ -50,6 +51,9 @@ _CONTENT_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
+    # Per-pixel object-ID mask (SID1; see client/public/js/idmask.js) — already
+    # deflate-compressed inside the container, so it ships as opaque bytes.
+    ".sid": "application/octet-stream",
 }
 
 
@@ -273,9 +277,11 @@ async def publish_cell(
     tour_json = tour_dir / "tour.json"
     proxy_glb = tour_dir / "proxy.glb"
     panos = sorted(tour_dir.glob("*.jpg")) if tour_dir.is_dir() else []
-    # Bird's-eye minimap slices (one PNG per Y level) ride under the same pano
-    # prefix, so the manifest's `minimaps[].file` resolves like a pano filename.
+    # Bird's-eye minimap slices (one PNG per Y level) and the per-pixel object-ID
+    # masks (one .sid per anchor) ride under the same pano prefix, so the
+    # manifest's `minimaps[].file` and `panos[].mask` resolve like a pano filename.
     minimaps = sorted(tour_dir.glob("minimap-*.png")) if tour_dir.is_dir() else []
+    masks = sorted(tour_dir.glob("*.sid")) if tour_dir.is_dir() else []
 
     keys = scene_keys(run, slot, model)
     preview_key = keys["preview_key"]
@@ -294,6 +300,7 @@ async def publish_cell(
             "pano_prefix": pano_prefix,
             "pano_count": len(panos),
             "minimap_count": len(minimaps),
+            "mask_count": len(masks),
             "base_url": _PUBLIC_BASE,
             "dry_run": True,
         }
@@ -308,7 +315,7 @@ async def publish_cell(
     for p in panos:
         uploads.append(r2.put_file(f"{pano_prefix}{p.name}", p, _content_type(p)))
     if pano_prefix:
-        for p in minimaps:
+        for p in (*minimaps, *masks):
             uploads.append(r2.put_file(f"{pano_prefix}{p.name}", p, _content_type(p)))
     await asyncio.gather(*uploads)
 
@@ -335,6 +342,7 @@ async def publish_cell(
         "pano_prefix": pano_prefix,
         "pano_count": len(panos),
         "minimap_count": len(minimaps),
+        "mask_count": len(masks),
         "published_at": published_at,
         "base_url": _PUBLIC_BASE,
     }

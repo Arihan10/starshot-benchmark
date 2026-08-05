@@ -5,9 +5,21 @@ and usable standalone:
 
     python -m splat.modal_sync probe                          # WebGL renderer on the GPU box
     python -m splat.modal_sync run    --cell runs/R/S/M       # push + spawn + record job
+    python -m splat.modal_sync run    --cell runs/R/S/M --reuse captures   # retrain only
     python -m splat.modal_sync watch  --cell runs/R/S/M       # follow heartbeat, pull when done
     python -m splat.modal_sync status --cell runs/R/S/M
+    python -m splat.modal_sync state  --cell runs/R/S/M       # what the Volume already holds
     python -m splat.modal_sync pull   --cell runs/R/S/M [--no-ply]
+
+REUSE (retraining without re-doing the expensive stages):
+  * Every stage's output already persists on the Volume, so a re-run can START
+    from any of them. `remote_cell_state` reports what is there (inputs, camera
+    plan, captures, trained model) and `remote_pushed` hands `spawn_cell` the
+    identity block it would otherwise get from a push — so a run can skip the
+    upload, skip stage 4, or skip stages 4+5 and train alone. Nothing local is
+    read on that path, so a cell whose local artifacts are gone still retrains.
+  * `push_cameras` is the one-file variant for the other direction: keep the
+    Volume's inputs but render from the LOCAL camera plan.
 
 TRANSMISSION (the whole point):
   * The mesh tier uploads into a CONTENT-ADDRESSED store (`objects/{sha}.glb`
@@ -38,6 +50,7 @@ import os
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,6 +71,29 @@ _TIER_CANDIDATES = (
 )
 # Artifacts pulled back after a run; refs stay remote.
 _PULL_ALWAYS = ("cameras.json", "status.json")
+_CAMERAS_NAME = "cameras.json"
+# The cell inputs `run_cell` materializes, mapping its `input_sha` key -> the
+# file name (which is also the key it is hashed under in `inputs/manifest.json`).
+# Transport may add a `.zst` suffix (see `push_cell`), so presence checks accept
+# either spelling.
+_INPUT_FILES = {
+    "freespace": "freespace.npz",
+    "skin": "freespace.npz.skin.npy",
+    "cloud": "cloud.ply",
+    "scene": "scene.json",
+}
+# Failures that mean "we could not ASK Modal", never "the run failed" — Modal's
+# client transport raises these (a socket error or an RPC deadline inside
+# `FunctionCall.get` is re-wrapped as its own ConnectionError), whereas a
+# container that genuinely died delivers ITS exception class through the call.
+# Reading one of these as a failure kills a healthy multi-hour train over a
+# single dropped packet, so `job_status` reports them as `unreachable` instead.
+_UNREACHABLE = (
+    modal.exception.ConnectionError,
+    modal.exception.ServiceError,
+    modal.exception.InternalError,
+    modal.exception.ClientClosed,
+)
 
 
 def _zstd():
@@ -183,6 +219,23 @@ def _remote_inputs_manifest(vol: modal.Volume, cell_key: str) -> dict[str, str]:
         return {}
 
 
+def _remote_entries(vol: modal.Volume, remote_dir: str) -> dict[str, Any]:
+    """`{basename: entry}` for one Volume directory, NON-recursively; empty when
+    the directory doesn't exist. Non-recursive matters: `splat/refs` holds tens of
+    thousands of frames, and every caller here only needs the names beside them."""
+    try:
+        return {Path(e.path).name: e for e in vol.listdir(remote_dir)}
+    except Exception:
+        return {}
+
+
+def _remote_json(vol: modal.Volume, remote: str) -> dict[str, Any]:
+    try:
+        return json.loads(b"".join(vol.read_file(remote)).decode("utf-8"))
+    except Exception:
+        return {}
+
+
 def push_cell(
     cell_dir: Path, tier_dir: Path | None = None, quiet: bool = False,
     include_cameras: bool = False,
@@ -237,7 +290,17 @@ def push_cell(
 
     vol = _volume()
     have = _existing_cas_shas(vol)
-    missing = [p for p in glbs if hashes[p] not in have]
+    # One put per unique BLOB, not per file. The destination is content-addressed,
+    # so a scene that repeats geometry (a tiled facade here places ONE mesh 405
+    # times) would enqueue the same remote path hundreds of times in a single
+    # batch — Modal keys its per-file upload progress by path, so the copies race
+    # on one shared record, and they PUT one identical block concurrently until
+    # the remote resets the connection.
+    missing: dict[str, Path] = {}
+    for p in glbs:
+        sha = hashes[p]
+        if sha not in have:
+            missing.setdefault(sha, p)
     remote_manifest = _remote_inputs_manifest(vol, cell_key)
 
     inputs_prefix = f"/cells/{cell_key}/inputs"
@@ -245,8 +308,7 @@ def push_cell(
     uploaded_bytes = 0
     try:
         with vol.batch_upload(force=True) as batch:
-            for p in missing:
-                sha = hashes[p]
+            for sha, p in missing.items():
                 batch.put_file(p, f"/objects/{sha[:2]}/{sha}.glb")
                 uploaded_bytes += p.stat().st_size
 
@@ -317,6 +379,134 @@ def push_cell(
             "tier_dir": tier.name}
 
 
+def push_cameras(cell_dir: Path) -> str:
+    """Upload JUST the local Stage-4 plan to the cell's `splat/` dir on the Volume
+    — where `run_cell`'s stage 5 reads it. This is the one file the 'render from my
+    LOCAL camera plan' path needs, so it can be sent without the full `push_cell`
+    when the rest of the inputs are being reused. Returns the plan's sha256."""
+    run, slot, model = _cell_parts(cell_dir)
+    cameras = cell_dir / "splat" / _CAMERAS_NAME
+    if not cameras.is_file():
+        raise FileNotFoundError(f"{cameras} missing — run stage 4 locally first")
+    vol = _volume()
+    with vol.batch_upload(force=True) as batch:
+        batch.put_file(cameras, f"/cells/{run}/{slot}/{model}/splat/{_CAMERAS_NAME}")
+    return _hash_files([cameras])[cameras]
+
+
+# --- reuse: what the Volume already holds -------------------------------------------
+
+
+def remote_pushed(cell_dir: Path) -> dict[str, Any]:
+    """The identity block `spawn_cell` normally gets from `push_cell`, read off the
+    inputs ALREADY on the Volume — the seam that lets a re-run skip the upload
+    entirely (no tier hashing, no CAS listing, no batch upload) and keeps
+    `run_cell`'s `input_sha` describing what is genuinely there.
+
+    Raises FileNotFoundError when the cell was never pushed (or the manifest is
+    incomplete), so the caller can say so instead of failing inside the container
+    when `_ensure_input` finds nothing."""
+    run, slot, model = _cell_parts(cell_dir)
+    cell_key = f"{run}/{slot}/{model}"
+    vol = _volume()
+    manifest = _remote_inputs_manifest(vol, cell_key)
+    names = set(_remote_entries(vol, f"/cells/{cell_key}/inputs"))
+    absent = [
+        name
+        for name in (*_INPUT_FILES.values(), "tier.json")
+        if name not in names and f"{name}.zst" not in names
+    ]
+    unhashed = [name for name in _INPUT_FILES.values() if not manifest.get(name)]
+    if absent or unhashed or not manifest.get("tier"):
+        raise FileNotFoundError(
+            f"cells/{cell_key}/inputs is not a complete push"
+            + (f" — missing {', '.join(absent)}" if absent else "")
+            + (f" — unhashed {', '.join(unhashed)}" if unhashed else "")
+        )
+    input_sha = {key: manifest[name] for key, name in _INPUT_FILES.items()}
+    input_sha["tier"] = manifest["tier"]
+    return {"run": run, "slot": slot, "model": model, "input_sha": input_sha,
+            "tier_dir": manifest.get("tier_dir")}
+
+
+def remote_cell_state(cell_dir: Path) -> dict[str, Any]:
+    """What of this cell's pipeline is ALREADY on the Volume, per reusable stage:
+    the pushed inputs, the Stage-4 camera plan, the Stage-5 captures and the
+    Stage-6/7 models — each with the recorded summary + completion time. This is
+    what the client's reuse toggles are gated and labelled on.
+
+    Cheap by construction: three non-recursive listdirs + two small JSON reads. It
+    NEVER reads `refs/transforms.json` (tens of MB at 60k frames) — capture counts
+    come from the stage summaries `run_cell` recorded instead."""
+    run, slot, model = _cell_parts(cell_dir)
+    cell_key = f"{run}/{slot}/{model}"
+    vol = _volume()
+    inputs = _remote_entries(vol, f"/cells/{cell_key}/inputs")
+    splat = _remote_entries(vol, f"/cells/{cell_key}/splat")
+    refs = _remote_entries(vol, f"/cells/{cell_key}/splat/refs")
+    manifest = _remote_inputs_manifest(vol, cell_key)
+    tier = _remote_json(vol, f"cells/{cell_key}/inputs/tier.json")
+    stages = _remote_json(vol, f"cells/{cell_key}/splat/status.json").get("stages") or {}
+
+    def rec(n: int) -> dict[str, Any]:
+        return (stages.get(str(n)) or {}).get("summary") or {}
+
+    # Project each stage record down to the few facts a reuse decision needs. The
+    # records themselves carry every dataclass param the stage ran with (kilobytes
+    # each), and their field names differ by trainer and by vintage — brush counts
+    # `splats`, the gsplat loop `splats_final`; captures gained `img_per_s` after
+    # some of these cells were rendered — so read both spellings here rather than
+    # in the UI, and don't ship what nobody reads.
+    def at(n: int) -> str | None:
+        return (stages.get(str(n)) or {}).get("done_at")
+
+    cams, caps, tr = rec(4), rec(5), rec(6)
+    heal = rec(7).get("heal") or {}
+    missing = [
+        name
+        for name in (*_INPUT_FILES.values(), "tier.json")
+        if name not in inputs and f"{name}.zst" not in inputs
+    ]
+    return {
+        "cell": cell_key,
+        "inputs": {
+            "available": not missing and bool(manifest.get("tier")),
+            "missing": missing,
+            "pushed_at": manifest.get("pushed_at"),
+            "tier_dir": manifest.get("tier_dir"),
+            "meshes": len(tier) or None,
+        },
+        # The plan stage 5 renders from, and the captures stage 6 trains on.
+        "cameras": {
+            "available": _CAMERAS_NAME in splat,
+            "at": at(4),
+            "views": cams.get("cameras") or cams.get("views"),
+        },
+        "captures": {
+            "available": "transforms.json" in refs,
+            "at": at(5),
+            "views": caps.get("views"),
+            "seconds": caps.get("seconds"),
+            "rate": (
+                caps.get("img_per_s")
+                or (caps.get("capture_stats") or {}).get("views_per_s")
+            ),
+        },
+        "trained": {
+            "available": "trained.ply" in splat,
+            "at": at(6),
+            "splats": tr.get("splats") or tr.get("splats_final"),
+            "trainer": tr.get("trainer") or ("gsplat" if tr else None),
+            "iterations": tr.get("iterations"),
+        },
+        "healed": {
+            "available": "healed.ply" in splat,
+            "at": at(7),
+            "splats": heal.get("splats_final"),
+        },
+    }
+
+
 # --- spawn / status / pull -----------------------------------------------------------
 
 
@@ -341,7 +531,12 @@ def spawn_cell(
     `trainer` picks the stage-6 back-end: "brush" (the upstream binary, tuned by
     `brush`) or "gsplat" (the in-house loop, tuned by `train`). The unused
     back-end's params ride along harmlessly — `run_cell` keys its cache on the
-    selected one only."""
+    selected one only.
+
+    A `force` carries a per-spawn token, which is what makes it INVALIDATE-ONCE in
+    the container: Modal retries a preempted run with this exact spec, and without
+    the token the retry would drop the frames / checkpoint the first attempt
+    produced and start over (see `run_cell`)."""
     spec = {
         "run": pushed["run"], "slot": pushed["slot"], "model": pushed["model"],
         "stages": stages,
@@ -353,6 +548,8 @@ def spawn_cell(
         "quant": quant or {},
         "force": force,
     }
+    if force:
+        spec["force_token"] = uuid.uuid4().hex
     fn = modal.Function.from_name(APP_NAME, "run_cell")
     call = fn.spawn(spec)
     record = {
@@ -367,9 +564,15 @@ def spawn_cell(
 
 
 def job_status(cell_dir: Path) -> dict[str, Any]:
-    """{state: running|done|failed, heartbeat, result|error} for the cell's
-    recorded job. `heartbeat` is the live stage/done/total the container last
-    published (survives across retries; `t` is its wall-clock timestamp)."""
+    """{state: running|done|failed|unreachable, heartbeat, result|error} for the
+    cell's recorded job. `heartbeat` is the live stage/done/total the container
+    last published (survives across retries; `t` is its wall-clock timestamp).
+
+    `unreachable` means the POLL failed, not the run: the container is untouched
+    by a dropped RPC and keeps going, so the caller must retry rather than treat
+    the cell as failed. The two can't be confused — a container that really died
+    reports its own exception class through the call, while everything in
+    `_UNREACHABLE` is raised by Modal's client transport."""
     record = json.loads(_job_path(cell_dir).read_text(encoding="utf-8"))
     run, slot, model = _cell_parts(cell_dir)
     out: dict[str, Any] = {"call_id": record["call_id"]}
@@ -385,6 +588,9 @@ def job_status(cell_dir: Path) -> dict[str, Any]:
         out["state"] = "done"
     except TimeoutError:
         out["state"] = "running"
+    except _UNREACHABLE as exc:
+        out["state"] = "unreachable"
+        out["error"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         out["state"] = "failed"
         out["error"] = f"{type(exc).__name__}: {exc}"
@@ -423,23 +629,13 @@ def pull_samples(cell_dir: Path) -> list[str]:
     vol = _volume()
     remote = f"cells/{run}/{slot}/{model}/splat/refs/samples"
     local = cell_dir / "splat" / "refs" / "samples"
-    try:
-        entries = {Path(e.path).name: e for e in vol.listdir(f"/{remote}")}
-    except Exception:
+    entries = _remote_entries(vol, f"/{remote}")
+    if not entries:
         return []  # samples dir not created yet
-    local.mkdir(parents=True, exist_ok=True)
-    for name in sorted(entries):
-        if not name.endswith(".png"):
-            continue
-        dst = local / name
-        size = getattr(entries[name], "size", None)
-        if size is not None and dst.is_file() and dst.stat().st_size == size:
-            continue
-        tmp = dst.with_suffix(dst.suffix + ".tmp")
-        with tmp.open("wb") as f:
-            for chunk in vol.read_file(f"{remote}/{name}"):
-                f.write(chunk)
-        tmp.replace(dst)
+    _download(
+        vol, remote, local, entries,
+        sorted(n for n in entries if n.endswith(".png")), quiet=True,
+    )
     return sorted(p.name for p in local.glob("*.png"))
 
 
@@ -461,6 +657,72 @@ def read_cell_artifact(run: str, slot: str, model: str, relpath: str) -> bytes:
         raise FileNotFoundError(remote) from exc
 
 
+def _download(
+    vol: modal.Volume, remote: str, local: Path, entries: dict[str, Any],
+    names: list[str], quiet: bool, force: bool = False,
+) -> list[str]:
+    """Fetch `names` from one Volume dir into `local`, skipping same-size files
+    unless `force`. Returns the names actually transferred.
+
+    VERIFIED. A `read_file` stream that ends early yields a SHORT file, and a
+    truncated splat is not a failed download — it is a plausible-looking one. The
+    `.ply` still declares its full vertex count, so a loader reads the missing tail
+    as zeros: 1-metre mid-grey Gaussians stacked at the origin (log-scale 0 → 1 m,
+    SH DC 0 → 0.5 grey) plus a degenerate quaternion that NaNs the sort. It renders
+    as a grey sphere in the middle of an otherwise wrecked scene, which reads
+    exactly like a bad TRAINING run — the one failure the size is enough to catch.
+    So every transfer is checked against the listed size, and a short one is
+    retried once before failing loudly rather than replacing a good artifact."""
+    local.mkdir(parents=True, exist_ok=True)
+    got: list[str] = []
+    for name in names:
+        dst = local / name
+        size = getattr(entries[name], "size", None)
+        if not force and size is not None and dst.is_file() and dst.stat().st_size == size:
+            continue
+        tmp = dst.with_suffix(dst.suffix + ".tmp")
+        for attempt in (1, 2):
+            with tmp.open("wb") as f:
+                for chunk in vol.read_file(f"{remote}/{name}"):
+                    f.write(chunk)
+            wrote = tmp.stat().st_size
+            if size is None or wrote == size:
+                break
+            if attempt == 2:
+                tmp.unlink(missing_ok=True)
+                raise OSError(
+                    f"{remote}/{name}: truncated download — got {wrote:,} of "
+                    f"{size:,} bytes twice; the local copy was left untouched"
+                )
+            if not quiet:
+                print(
+                    f"short read on {name} ({wrote:,} of {size:,} bytes) — retrying",
+                    flush=True,
+                )
+        tmp.replace(dst)
+        got.append(name)
+        if not quiet:
+            print(f"pulled {name} ({dst.stat().st_size / 1e6:.1f} MB)", flush=True)
+    return got
+
+
+def pull_plan(cell_dir: Path, quiet: bool = True) -> bool:
+    """Download JUST the Volume's Stage-4 plan (+ the stage record beside it), so a
+    run that REUSES the remote plan shows the camera overlay for the plan actually
+    being rendered. Returns whether a plan is local afterwards.
+
+    Unconditional (not same-size-skipped): a locally planned `cameras.json` that
+    happened to match the remote one in byte length would otherwise shadow it and
+    the overlay would show a plan that never rendered."""
+    run, slot, model = _cell_parts(cell_dir)
+    vol = _volume()
+    remote = f"cells/{run}/{slot}/{model}/splat"
+    entries = _remote_entries(vol, f"/{remote}")
+    names = [n for n in _PULL_ALWAYS if n in entries]
+    _download(vol, remote, cell_dir / "splat", entries, names, quiet, force=True)
+    return (cell_dir / "splat" / _CAMERAS_NAME).is_file()
+
+
 def pull_cell(cell_dir: Path, include_ply: bool = True, quiet: bool = False) -> list[str]:
     """Download the run's artifacts into the local `splat/` dir: plan + status
     + every `.sqz`, plus the plys unless `include_ply` is off — the RAW Stage-6
@@ -470,7 +732,6 @@ def pull_cell(cell_dir: Path, include_ply: bool = True, quiet: bool = False) -> 
     vol = _volume()
     remote = f"cells/{run}/{slot}/{model}/splat"
     local = cell_dir / "splat"
-    local.mkdir(parents=True, exist_ok=True)
     entries = {Path(e.path).name: e for e in vol.listdir(f"/{remote}")}
 
     wanted = [n for n in _PULL_ALWAYS if n in entries]
@@ -482,22 +743,7 @@ def pull_cell(cell_dir: Path, include_ply: bool = True, quiet: bool = False) -> 
             if n in ("trained.ply", "healed.ply")
             or (n.endswith(".ply") and (".lod" in n) and n.startswith(("trained", "healed")))
         ]
-
-    got: list[str] = []
-    for name in wanted:
-        dst = local / name
-        size = getattr(entries[name], "size", None)
-        if size is not None and dst.is_file() and dst.stat().st_size == size:
-            continue
-        tmp = dst.with_suffix(dst.suffix + ".tmp")
-        with tmp.open("wb") as f:
-            for chunk in vol.read_file(f"{remote}/{name}"):
-                f.write(chunk)
-        tmp.replace(dst)
-        got.append(name)
-        if not quiet:
-            print(f"pulled {name} ({dst.stat().st_size / 1e6:.1f} MB)", flush=True)
-    return got
+    return _download(vol, remote, local, entries, wanted, quiet)
 
 
 # --- CLI -----------------------------------------------------------------------------
@@ -542,11 +788,16 @@ def _main() -> None:
 
     p = sub.add_parser("run", help="push + spawn stages on the GPU box")
     add_cell(p, tier=True)
-    p.add_argument("--stages", type=_parse_stages, default=[4, 5, 6, 7],
-                   help="e.g. 4-7, 4, or 6,7 (default 4-7)")
-    p.add_argument("--with-cameras", action="store_true",
-                   help="upload the LOCAL splat/cameras.json and skip stage 4 "
-                        "('continue on modal'); pair with --stages 5-7")
+    p.add_argument("--stages", type=_parse_stages, default=None,
+                   help="e.g. 4-7, 4, or 6,7 (default: derived from --reuse + --trainer)")
+    p.add_argument("--reuse", choices=("none", "assets", "cameras", "captures"),
+                   default="none",
+                   help="reuse what the Volume already holds: 'assets' skips the "
+                        "upload, 'cameras' also skips stage 4, 'captures' also skips "
+                        "stage 5 (train only)")
+    p.add_argument("--plan-source", choices=("volume", "local"), default="volume",
+                   help="whose stage-4 plan stage 5 renders: the Volume's, or the "
+                        "LOCAL splat/cameras.json (uploaded, and stage 4 skipped)")
     p.add_argument("--trainer", choices=("brush", "gsplat"), default="brush",
                    help="stage-6 back-end (default brush)")
     p.add_argument("--plan-json", default="{}", help="PlanParams overrides")
@@ -557,6 +808,11 @@ def _main() -> None:
                    help="re-run the stage window even when signatures match")
 
     p = sub.add_parser("status", help="one-shot job state + heartbeat")
+    add_cell(p)
+
+    p = sub.add_parser(
+        "state", help="what the Volume already holds for this cell (reuse targets)"
+    )
     add_cell(p)
 
     p = sub.add_parser("watch", help="follow the heartbeat; pull when done")
@@ -588,9 +844,27 @@ def _main() -> None:
         return
 
     if args.cmd == "run":
-        pushed = push_cell(args.cell, args.tier, include_cameras=args.with_cameras)
+        # `--plan-source local` means "render MY plan", which skips stage 4 by
+        # definition — the same window `--reuse cameras` asks for, differing only
+        # in whose plan gets rendered.
+        local_plan = args.plan_source == "local"
+        reuse_assets = args.reuse != "none"
+        if reuse_assets:
+            pushed = remote_pushed(args.cell)
+            print(f"reusing the Volume's inputs (tier {pushed.get('tier_dir')})")
+            if local_plan:
+                push_cameras(args.cell)
+        else:
+            pushed = push_cell(args.cell, args.tier, include_cameras=local_plan)
+        stages = args.stages or list(
+            range(
+                6 if args.reuse == "captures" else
+                5 if args.reuse == "cameras" or local_plan else 4,
+                (6 if args.trainer == "brush" else 7) + 1,
+            )
+        )
         call_id = spawn_cell(
-            args.cell, pushed, args.stages,
+            args.cell, pushed, stages,
             plan=json.loads(args.plan_json),
             train=json.loads(args.train_json),
             quant=json.loads(args.quant_json),
@@ -598,7 +872,7 @@ def _main() -> None:
             trainer=args.trainer,
             brush=json.loads(args.brush_json),
         )
-        print(f"spawned {call_id} (stages {args.stages}) — "
+        print(f"spawned {call_id} (stages {stages}) — "
               f"`watch --cell {args.cell}` to follow")
         return
 
@@ -606,11 +880,20 @@ def _main() -> None:
         print(json.dumps(job_status(args.cell), indent=1, default=str))
         return
 
+    if args.cmd == "state":
+        print(json.dumps(remote_cell_state(args.cell), indent=1, default=str))
+        return
+
     if args.cmd == "watch":
         while True:
             st = job_status(args.cell)
             if st["state"] == "running":
                 print(_fmt_heartbeat(st.get("heartbeat")), flush=True)
+                time.sleep(10)
+                continue
+            if st["state"] == "unreachable":
+                print(f"lost contact with Modal ({st.get('error')}) — "
+                      f"the run continues; retrying", flush=True)
                 time.sleep(10)
                 continue
             if st["state"] == "failed":

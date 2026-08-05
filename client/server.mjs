@@ -248,6 +248,11 @@ const server = createServer(async (req, res) => {
     if (path === "/tours" || path === "/tours/" || path === "/tours.html") {
         return serveIndex(res, "tours.html");
     }
+    // The tour mask inspector: a captured tour's panos + their per-pixel
+    // object-ID masks, hovered exactly the way the prod walkthrough will.
+    if (path === "/tourview" || path === "/tourview/" || path === "/tourview.html") {
+        return serveIndex(res, "tourview.html");
+    }
     // Splat asset catalogue for the playground picker.
     if (path === "/api/assets") return sendJson(res, { assets: listAssets() });
 
@@ -276,6 +281,7 @@ server.listen(PORT, "127.0.0.1", () => {
   const viewerUrl = `http://127.0.0.1:${PORT}${VIEWER_PATH}`;
   console.log(`[client] viewer at ${viewerUrl} (server=${SERVER_URL})`);
   console.log(`[client] SOG-LOD playground at http://127.0.0.1:${PORT}/playground`);
+  console.log(`[client] tour mask inspector at http://127.0.0.1:${PORT}/tourview`);
   openBrowser(viewerUrl);
 });
 

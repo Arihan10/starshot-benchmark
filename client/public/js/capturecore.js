@@ -10,6 +10,11 @@
 //   • The matterport tour (tourcapture.js) renders SIX 90° cube faces per anchor
 //     and stitches them into an equirectangular panorama.
 //
+// The tour takes one further pass per face — the flat per-pixel object-ID mask
+// that drives its hover + highlight (idmask.js). It goes through this module's
+// camera for exactly the reason everything else is shared: a mask that rasterized
+// differently from its pano would sit off the image it labels.
+//
 // Everything else is shared and must stay shared: the renderer configuration
 // (linear HDR, no global tone mapping, frozen shadow map), the per-object
 // material prep (reflective.js's matte discriminator + oit.js's transparent-mesh
@@ -34,6 +39,9 @@ import {
     decorateOITLights,
     bakeShadowMap,
 } from "./oit.js";
+// The per-pixel object-ID pass (the tour's hover/highlight masks). It rides on
+// THIS module's camera so the mask rasterizes exactly like the colour image.
+import { attachIdMaterials, createIdRenderer } from "./idmask.js";
 
 export const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
 
@@ -42,6 +50,110 @@ export const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
 // reflection bake, and the render passes must all read the SAME object, so it
 // lives here as the module's singleton rather than being threaded through.
 export const oitPass = { value: 0 };
+
+// PER-PASS cost, which is the only way to tell a scene that is expensive to
+// RASTERIZE from one that is merely expensive to WALK. Each `renderer.render()`
+// traverses the whole scene graph to build its render list, so a pass that draws ten
+// objects out of eight hundred still pays for all eight hundred — and that cost is
+// invisible in a single wall-clock number for the frame.
+//
+//   cpu    ms on the JS thread: traversal + material setup + draw submission.
+//   gpu    ms the device actually spent (SAMPLED — see below).
+//   calls  draw calls issued.
+//
+// High cpu + high calls + low gpu = submission-bound, and the fix is fewer, bigger
+// draws (merge/instance) or fewer passes. High gpu = genuinely fill-bound, and the
+// fix is fewer pixels or cheaper shading. Those two want opposite changes, which is
+// why guessing between them is expensive.
+//
+// GPU timing is SAMPLED one view in `gpuEvery`, because TIME_ELAPSED_EXT permits
+// only one query in flight at a time: timing every pass of every view would
+// serialize the very passes it is measuring. `gpuStatus` says whether the extension
+// was there at all — Chromium needs --enable-webgl-draft-extensions for it.
+export const renderProfile = {
+    enabled: false,
+    gpuEvery: 64,
+    cpu: Object.create(null),
+    gpu: Object.create(null),
+    calls: Object.create(null),
+    views: 0,
+    gpuViews: 0,
+    gpuStatus: "off",
+};
+
+// Wraps each pass with CPU/draw-call accounting and, on sampled views, a GPU timer
+// query. A no-op unless `renderProfile.enabled`, so the tour capture and the debug
+// viewers pay nothing.
+function makePassProfiler(renderer) {
+    const gl = renderer.getContext();
+    let ext = null;
+    let probed = false;
+    const free = [];
+    const live = []; // { pass, query } — results arrive some frames later
+    let open = null;
+    let sampling = false;
+    let t0 = 0;
+
+    function probe() {
+        probed = true;
+        // WebGL1 contexts expose a different, incompatible extension; we are always
+        // WebGL2 here, so only the _webgl2 spelling is worth asking for.
+        ext = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+        renderProfile.gpuStatus = ext ? "timer-query" : "unavailable";
+    }
+
+    // Reap whatever finished. GPU_DISJOINT means the device rescheduled mid-measure
+    // and every timing in flight is meaningless, so they all go on the floor.
+    function drain() {
+        if (!ext) return;
+        if (gl.getParameter(ext.GPU_DISJOINT_EXT)) {
+            for (const e of live) free.push(e.query);
+            live.length = 0;
+            return;
+        }
+        for (let i = live.length - 1; i >= 0; i--) {
+            const e = live[i];
+            if (!gl.getQueryParameter(e.query, gl.QUERY_RESULT_AVAILABLE)) continue;
+            const ns = gl.getQueryParameter(e.query, gl.QUERY_RESULT);
+            renderProfile.gpu[e.pass] = (renderProfile.gpu[e.pass] || 0) + ns / 1e6;
+            free.push(e.query);
+            live.splice(i, 1);
+        }
+    }
+
+    function beginView() {
+        if (!renderProfile.enabled) return;
+        if (!probed) probe();
+        drain();
+        renderProfile.views += 1;
+        sampling = !!ext && renderProfile.views % renderProfile.gpuEvery === 0;
+        if (sampling) renderProfile.gpuViews += 1;
+    }
+
+    function begin() {
+        if (!renderProfile.enabled) return;
+        t0 = performance.now();
+        if (!sampling || open) return;
+        open = free.pop() || gl.createQuery();
+        gl.beginQuery(ext.TIME_ELAPSED_EXT, open);
+    }
+
+    // Called immediately after the pass's `renderer.render()`, which is when
+    // `info.render.calls` still holds that pass's count (three.js resets it at the
+    // START of each render).
+    function end(pass) {
+        if (!renderProfile.enabled) return;
+        renderProfile.cpu[pass] = (renderProfile.cpu[pass] || 0) + (performance.now() - t0);
+        renderProfile.calls[pass] =
+            (renderProfile.calls[pass] || 0) + renderer.info.render.calls;
+        if (!open) return;
+        gl.endQuery(ext.TIME_ELAPSED_EXT);
+        live.push({ pass, query: open });
+        open = null;
+    }
+
+    return { beginView, begin, end };
+}
 
 // The capture renderer: the scene is shaded in LINEAR light into a half-float
 // target and the present pass owns the whole display transform (ACES + sRGB), so
@@ -73,13 +185,23 @@ export function createCaptureRenderer({ onContextLost, previewSize = 256 } = {})
 }
 
 // Per-loaded-object prep, in the order the pipeline requires: stamp the object's
-// id (emissive.js / reflective.js match on it), decide reflectivity BEFORE the OIT
-// patch (matteNonReflective keeps the curated reflective names and mattes the
-// rest), then route transparent meshes onto the OIT layer.
-export function prepareCaptureObject(root, id) {
+// id (emissive.js / reflective.js / transmissive.js all match on it), decide
+// reflectivity BEFORE the OIT patch (matteNonReflective keeps the curated
+// reflective names and mattes the rest), then route genuinely see-through meshes
+// onto the OIT layer. Returns prepareOITScene's `{ oitMeshes, forcedOpaque }` so
+// the caller can report how the transmissivity gate classified the scene.
+//
+// `idIndex` (the tour's 1-based global object index — see idmask.js) additionally
+// builds this object's ID materials. It must happen AFTER the OIT gate, since the
+// layer a mesh lands on decides the alpha cutoff its mask uses; ordering it here
+// is what keeps that invariant off the call sites. Stage 5 passes no index and
+// allocates nothing.
+export function prepareCaptureObject(root, id, idIndex = 0) {
     root.userData.objectId = id;
     matteNonReflective(root, id);
-    prepareOITScene(root, oitPass);
+    const gate = prepareOITScene(root, oitPass);
+    if (idIndex > 0) attachIdMaterials(root, idIndex);
+    return gate;
 }
 
 // The light / shadow / reflection bakes, in the order they depend on each other:
@@ -122,6 +244,7 @@ export function createCapture(
     background,
     exposure = 1.0,
 ) {
+    const prof = makePassProfiler(renderer);
     const depthTexture = new THREE.DepthTexture(width, height);
     depthTexture.type = THREE.FloatType;
     const targetOpts = {
@@ -318,7 +441,9 @@ export function createCapture(
         renderer.autoClear = true;
         renderer.setClearColor(bg, 0);
         renderer.setRenderTarget(rtScene);
+        prof.begin();
         renderer.render(scene, cam);
+        prof.end("opaque");
         // glass sub-passes (layer 1); keep the opaque colour/depth (no auto-clear).
         renderer.autoClear = false;
         cam.layers.set(OIT_LAYER);
@@ -328,7 +453,9 @@ export function createCapture(
             m.colorWrite = false;
         }
         renderer.setRenderTarget(accumTarget);
+        prof.begin();
         renderer.render(scene, cam);
+        prof.end("glass");
         oitPass.value = 0; // accumulate (additive), depth-tested, no depth write
         for (const m of oitMats) {
             m.depthWrite = false;
@@ -338,18 +465,24 @@ export function createCapture(
         renderer.setRenderTarget(accumTarget);
         renderer.setClearColor(0x000000, 0);
         renderer.clear(true, false, false);
+        prof.begin();
         renderer.render(scene, cam);
+        prof.end("glass");
         oitPass.value = 1; // revealage: dst *= (1 − α)
         for (const m of oitMats) setOITBlend(m, false);
         renderer.setRenderTarget(revealTarget);
         renderer.setClearColor(0xffffff, 1);
         renderer.clear(true, false, false);
+        prof.begin();
         renderer.render(scene, cam);
+        prof.end("glass");
         // composite over opaque → rtColor (ACES + sRGB + coverage alpha).
         cam.layers.set(0);
         renderer.autoClear = true;
         renderer.setRenderTarget(rtColor);
+        prof.begin();
         renderer.render(compositeScene, fsCamera);
+        prof.end("present");
     }
 
     // Render `scene` through ANY camera into rtColor (+ rtDepth). This is the one
@@ -357,18 +490,25 @@ export function createCapture(
     // orthographic slices both come through here, so nothing can diverge.
     function renderCamera(scene, cam) {
         if (oitMats === null) oitMats = collectOITMaterials(scene);
+        prof.beginView();
         if (oitMats.length === 0) {
             // Opaque scene: one lit pass → present. Unchanged fast path.
             renderer.setClearColor(bg, 0); // alpha 0 = empty coverage
             renderer.setRenderTarget(rtScene);
+            prof.begin();
             renderer.render(scene, cam); // lit, linear HDR + depth
+            prof.end("opaque");
             renderer.setRenderTarget(rtColor);
+            prof.begin();
             renderer.render(presentScene, fsCamera); // ACES + sRGB → 8-bit
+            prof.end("present");
         } else {
             renderOIT(scene, cam);
         }
         renderer.setRenderTarget(rtDepth);
+        prof.begin();
         renderer.render(packScene, fsCamera); // depth → log-u16 codes
+        prof.end("depth");
     }
 
     const lookTarget = new THREE.Vector3();
@@ -378,7 +518,7 @@ export function createCapture(
     // (`z = 2·n·f / (f + n − zndc·(f − n))` is FOV-independent), so nothing but
     // the projection matrix has to change — and it is only rebuilt when the angle
     // actually differs, since consecutive views often share one.
-    function renderView(scene, pos, face, viewFov) {
+    function aimCamera(pos, face, viewFov) {
         if (viewFov && Math.abs(viewFov - camera.fov) > 1e-6) {
             camera.fov = viewFov;
             camera.updateProjectionMatrix();
@@ -389,7 +529,32 @@ export function createCapture(
             .set(face.forward[0], face.forward[1], face.forward[2])
             .add(camera.position);
         camera.lookAt(lookTarget);
+    }
+
+    function renderView(scene, pos, face, viewFov) {
+        aimCamera(pos, face, viewFov);
         renderCamera(scene, camera);
+    }
+
+    // The object-ID twin of renderView: the same pose and the same projection
+    // matrix, rendered flat into idmask.js's own RGBA8 target (returned, for the
+    // caller to read back). Built on first use, so a capture that never asks for
+    // masks — Stage 5 — allocates nothing. Sharing `camera` is the point: the mask
+    // and the pano cannot rasterize differently if they can't disagree on a pose.
+    //
+    // `idSize` is deliberately NOT the colour face size. The ID pass is rendered
+    // supersampled so the stitch can measure sub-texel coverage (ids themselves
+    // can't be antialiased — see idmask.js), and since a 90° frustum is the same
+    // frustum at any resolution, only the target changes.
+    let idPass = null;
+    function renderIdView(scene, pos, face, idSize) {
+        if (idPass && idPass.size !== idSize) {
+            idPass.dispose();
+            idPass = null;
+        }
+        if (!idPass) idPass = createIdRenderer(renderer, idSize);
+        aimCamera(pos, face);
+        return idPass.render(scene, camera);
     }
 
     function setLinear(on) {
@@ -401,11 +566,21 @@ export function createCapture(
     function dispose() {
         for (const t of [rtScene, rtColor, rtDepth, accumTarget, revealTarget]) t?.dispose();
         depthTexture.dispose();
+        idPass?.dispose();
         for (const m of [presentMaterial, packMaterial, compositeMaterial]) m.dispose();
         for (const g of fsGeometries) g.dispose();
     }
 
-    return { rtColor, rtDepth, renderView, renderCamera, camera, setLinear, dispose };
+    return {
+        rtColor,
+        rtDepth,
+        renderView,
+        renderIdView,
+        renderCamera,
+        camera,
+        setLinear,
+        dispose,
+    };
 }
 
 // Read an 8-bit RGBA target back TOP-DOWN (GL rows arrive bottom-up). `opaque`

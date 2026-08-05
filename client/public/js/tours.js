@@ -97,6 +97,12 @@ function row(t) {
         ),
         el("td", {}, ...stateTags(t)),
         el("td", { class: "num", text: String(t.panos ?? 0) }),
+        // Masks trail the panos only on a cell captured before object-ID masks
+        // existed (or with them switched off), so the gap is the useful signal.
+        el("td", {
+            class: `num${(t.masks ?? 0) < (t.panos ?? 0) ? " stale" : ""}`,
+            text: String(t.masks ?? 0),
+        }),
         el("td", { class: "num", text: String(t.minimaps ?? 0) }),
         el("td", {}, yesNo(!!t.proxy)),
         el(

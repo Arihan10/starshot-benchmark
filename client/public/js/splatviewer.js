@@ -150,6 +150,15 @@ let modalPlanShown = false; // one-time: revealed the camera overlay when the pl
 // colour and authored opacity (glass included). "points" is the default because
 // it's the configuration validated standalone; "surfels" is the A/B, and the
 // same split `gsplat`'s TrainParams.init already offers.
+// `reuse*` picks where the remote run STARTS. Every stage's output persists on the
+// Modal Volume, so a re-run can take the inputs, the camera plan and even the
+// rendered captures from there instead of redoing them — which is the whole cost of
+// retraining (stage 5 is hours of picture-taking; stage 6 is the part we actually
+// iterate on). They are independent switches, not a strict ladder: keeping the plan
+// while re-uploading new meshes is a real A/B. `planSource` chooses whose stage-4
+// plan stage 5 renders once stage 4 is skipped — the Volume's, or the local
+// `splat/cameras.json`, uploaded on its own. All default OFF on every cell open:
+// reuse skips the container's signature checks, so it stays a deliberate choice.
 let modalTrainCfg = {
     trainer: "brush",
     representation: "2dgs",
@@ -157,7 +166,23 @@ let modalTrainCfg = {
     batch: 1,
     maxSplats: 2000000,
     init: "points",
+    reuseAssets: false,
+    reuseCameras: false,
+    reuseCaptures: false,
+    planSource: "volume",
 };
+
+// What the open cell already holds on the Volume (api.splatModalState) — the gate
+// and the labels for the reuse toggles, plus the local-side staleness warnings.
+// Fetched on cell open / after a run / on the panel's refresh, never on the 1.2s
+// stage poll: it costs Volume round trips.
+let modalRemote = null;
+let modalRemoteErr = null;
+let modalRemoteBusy = false;
+
+// Reuse rungs, coarsest first. Checking one implies everything above it; unchecking
+// clears everything below.
+const REUSE_RUNGS = ["reuseAssets", "reuseCameras", "reuseCaptures"];
 
 // Below this, Brush's init subsampling starts throwing away surface prior on a
 // typical room-scale cell (Stage-3 clouds land in the 10^5-10^6 range), so the
@@ -1966,6 +1991,7 @@ function buildControls(summary) {
     inputs._overlay = overlay;
     inputs._stepper = el("div", { class: "svc-stepper" });
     inputs._coverage = el("div", { class: "svc-coverage" });
+    inputs._reuse = el("div", { class: "svc-coverage" });
     inputs._modal = el("div", { class: "svc-coverage" });
     inputs._log = el("pre", { class: "svc-log" });
     Object.assign(inputs._log.style, {
@@ -2022,6 +2048,7 @@ function buildControls(summary) {
         inputs._stepper,
         inputs._coverage,
         el("div", { class: "svc-title", text: "splat on modal" }),
+        inputs._reuse,
         inputs._modal,
         inputs._log,
         el("div", { class: "svc-title", text: "view" }),
@@ -3123,6 +3150,7 @@ function renderStepper() {
         box.appendChild(row);
     }
     box.appendChild(renderRunAll(cell));
+    renderModalReuse(); // locks the toggles while a run holds the cell
     renderModal(cell);
     renderCoverage();
     updateSourceAvail();
@@ -3149,6 +3177,329 @@ function renderRunAll(cell) {
         }),
     );
     return row;
+}
+
+// ---- reuse from the Modal Volume --------------------------------------------
+
+const fmtWhen = (iso) => {
+    if (!iso) return null;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime())
+        ? null
+        : d.toLocaleString(undefined, {
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+          });
+};
+
+const fmtDur = (s) => {
+    if (!s || !Number.isFinite(s)) return null;
+    const m = Math.round(s / 60);
+    return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+};
+
+// Reset on every cell open — see the `modalTrainCfg` note on why reuse never
+// follows you from the previous cell.
+function resetModalReuse() {
+    modalTrainCfg.reuseAssets = false;
+    modalTrainCfg.reuseCameras = false;
+    modalTrainCfg.reuseCaptures = false;
+    modalTrainCfg.planSource = "volume";
+}
+
+// The remote-state view of one rung: can it be reused, and what is it. Order
+// matches REUSE_RUNGS.
+function reuseRungs() {
+    const r = modalRemote || {};
+    const inputs = r.inputs || {};
+    const cams = r.cameras || {};
+    const caps = r.captures || {};
+    const localPlan = (r.local || {}).plan;
+    return [
+        {
+            label: "assets",
+            available: !!inputs.available,
+            detail: inputs.available
+                ? [
+                      inputs.meshes ? `${fmtInt(inputs.meshes)} meshes` : null,
+                      inputs.tier_dir,
+                      fmtWhen(inputs.pushed_at) && `pushed ${fmtWhen(inputs.pushed_at)}`,
+                  ]
+                      .filter(Boolean)
+                      .join(" · ") || "on the volume"
+                : "not on the volume",
+            title:
+                "skip the upload: use the meshes + Stage-1–3 outputs already on the " +
+                "volume. Nothing local is read, so this works even with the cell's " +
+                "splat/ dir gone.",
+        },
+        {
+            // The plan may also come from local disk, which needs no remote plan.
+            available: !!cams.available || !!localPlan,
+            label: "cameras",
+            detail: cams.available
+                ? [cams.views ? `${fmtInt(cams.views)} views` : null, fmtWhen(cams.at)]
+                      .filter(Boolean)
+                      .join(" · ") || "a plan is on the volume"
+                : localPlan
+                  ? "volume has none — local plan only"
+                  : "no plan on the volume",
+            title:
+                "skip Stage 4: render an already-planned camera set instead of " +
+                "re-planning. Pick whose plan below.",
+        },
+        {
+            label: "captures",
+            available: !!caps.available,
+            detail: caps.available
+                ? [
+                      caps.views ? `${fmtInt(caps.views)} frames` : null,
+                      fmtDur(caps.seconds),
+                      caps.rate ? `${caps.rate} img/s` : null,
+                      fmtWhen(caps.at),
+                  ]
+                      .filter(Boolean)
+                      .join(" · ") || "references are on the volume"
+                : "no references on the volume",
+            title:
+                "skip Stage 5: train straight onto the reference frames already " +
+                "rendered. This is the retrain loop — the hours of picture-taking " +
+                "are what it buys back.",
+        },
+    ];
+}
+
+// Drop any reuse the Volume turns out not to serve, so the toggles can never send
+// a request the server has to reject.
+function clampModalReuse() {
+    const r = modalRemote || {};
+    reuseRungs().forEach((rung, i) => {
+        if (!rung.available) modalTrainCfg[REUSE_RUNGS[i]] = false;
+    });
+    // Settle on whichever plan actually exists, so skipping Stage 4 can never
+    // point at a plan that isn't there.
+    const hasLocal = !!(r.local || {}).plan;
+    const hasRemote = !!(r.cameras || {}).available;
+    if (modalTrainCfg.planSource === "local" && !hasLocal) {
+        modalTrainCfg.planSource = "volume";
+    } else if (!hasRemote && hasLocal) {
+        modalTrainCfg.planSource = "local";
+    }
+}
+
+function setModalReuse(idx, on) {
+    const rungs = reuseRungs();
+    if (on) {
+        for (let i = 0; i <= idx; i++) {
+            if (rungs[i].available) modalTrainCfg[REUSE_RUNGS[i]] = true;
+        }
+    } else {
+        for (let i = idx; i < REUSE_RUNGS.length; i++) {
+            modalTrainCfg[REUSE_RUNGS[i]] = false;
+        }
+    }
+    renderModalReuse();
+    renderModal(cellStatus); // the button's window + gating follow the selection
+}
+
+// The stage window the current selection implies, as (first, last).
+function modalWindow() {
+    return [
+        modalTrainCfg.reuseCaptures ? 6 : modalTrainCfg.reuseCameras ? 5 : 4,
+        modalTrainCfg.trainer === "brush" ? 6 : 7,
+    ];
+}
+
+// Why a launch can't go, or null. Reusing the assets moves every prerequisite onto
+// the Volume; otherwise the local Stage-1–3 outputs are what gets pushed, and
+// rendering the local plan needs that plan too.
+function modalBlockReason(cell) {
+    const c = modalTrainCfg;
+    if (c.reuseAssets) {
+        if (!modalRemote) return "read the volume first (⟳)";
+        if (!(modalRemote.inputs || {}).available) {
+            return "the volume has no inputs for this cell — untick “assets”";
+        }
+    } else if (!stageDone(cell, 3)) {
+        return "sample the surfel cloud first (Stage 3)";
+    }
+    if (
+        c.reuseCameras && !c.reuseCaptures && c.planSource === "local"
+        && !stageDone(cell, 4)
+    ) {
+        return "plan cameras locally first (Stage 4), or render the volume's plan";
+    }
+    return null;
+}
+
+// "Reuse from volume": one checkbox per reusable stage, each labelled with what is
+// actually there (count + when), disabled when the Volume has nothing to offer.
+// Rendered on its OWN container so the per-second stage poll never rebuilds it.
+function renderModalReuse() {
+    const box = inputs && inputs._reuse;
+    if (!box) return;
+    box.replaceChildren();
+    const running = !!(cellStatus && cellStatus.modal && cellStatus.modal.status === "running");
+
+    const head = el("div", { class: "svc-step" });
+    head.appendChild(el("span", { class: "svc-step-n muted", text: "↺" }));
+    head.appendChild(
+        el("span", { class: "svc-step-label", text: "reuse from volume" }),
+    );
+    head.appendChild(
+        el("button", {
+            class: "splat-stage2-btn",
+            text: modalRemoteBusy ? "…" : "⟳",
+            disabled: modalRemoteBusy,
+            title: "re-read what the volume holds for this cell",
+            onclick: () => void refreshModalRemote(true),
+        }),
+    );
+    box.appendChild(head);
+
+    if (modalRemoteErr) {
+        box.appendChild(
+            el("div", {
+                class: "muted",
+                text: `volume unreadable — ${modalRemoteErr}`,
+                style: "font-size:11px;color:var(--red)",
+            }),
+        );
+        return;
+    }
+    if (!modalRemote) {
+        box.appendChild(
+            el("div", {
+                class: "muted",
+                text: modalRemoteBusy ? "reading the volume…" : "not read yet",
+                style: "font-size:11px",
+            }),
+        );
+        return;
+    }
+
+    reuseRungs().forEach((rung, i) => {
+        const on = !!modalTrainCfg[REUSE_RUNGS[i]];
+        const input = el("input", { type: "checkbox" });
+        input.checked = on;
+        input.disabled = !rung.available || running || runningAll;
+        input.onchange = () => setModalReuse(i, input.checked);
+        const row = el(
+            "label",
+            { class: "svc-check", title: rung.title },
+            input,
+            el("span", { text: rung.label }),
+        );
+        if (!rung.available) row.style.opacity = "0.45";
+        box.appendChild(row);
+        box.appendChild(
+            el("div", {
+                class: "muted",
+                text: rung.detail,
+                style: "font-size:10px;margin:-2px 0 3px 20px",
+            }),
+        );
+    });
+
+    // Whose plan stage 5 renders — only a question while stage 4 is skipped AND
+    // stage 5 still runs.
+    if (modalTrainCfg.reuseCameras && !modalTrainCfg.reuseCaptures) {
+        const hasLocal = !!(modalRemote.local || {}).plan;
+        const hasRemote = !!(modalRemote.cameras || {}).available;
+        const seg = el("div", { class: "svc-seg" });
+        for (const [value, label, ok] of [
+            ["volume", "volume plan", hasRemote],
+            ["local", "local plan", hasLocal],
+        ]) {
+            seg.appendChild(
+                el("button", {
+                    class: `svc-seg-btn${modalTrainCfg.planSource === value ? " on" : ""}`,
+                    text: label,
+                    disabled: !ok || running || runningAll,
+                    title:
+                        value === "volume"
+                            ? "render the plan already on the volume"
+                            : "upload splat/cameras.json and render that instead",
+                    onclick: () => {
+                        modalTrainCfg.planSource = value;
+                        renderModalReuse();
+                    },
+                }),
+            );
+        }
+        box.appendChild(seg);
+    }
+
+    // Reuse bypasses the container's signature checks, so anything that moved on
+    // here has to be said out loud rather than silently trained through.
+    const loc = modalRemote.local || {};
+    const warn = (text) =>
+        box.appendChild(
+            el("div", {
+                class: "muted",
+                text,
+                style: "font-size:10px;color:var(--amber);margin-top:2px",
+            }),
+        );
+    if (loc.tier_mismatch) {
+        warn(
+            `⚠ volume holds ${modalRemote.inputs.tier_dir}; this cell now uses ` +
+                `${loc.tier_dir}`,
+        );
+    }
+    if ((loc.stale || []).length) {
+        warn(`⚠ changed since that upload: ${loc.stale.join(", ")}`);
+    }
+    // The current model, for context: what a retrain is about to replace.
+    const trained = modalRemote.trained || {};
+    if (trained.available) {
+        box.appendChild(
+            el("div", {
+                class: "muted",
+                text: [
+                    "on volume:",
+                    trained.trainer || "trained",
+                    trained.splats && `${fmtInt(trained.splats)} splats`,
+                    trained.iterations && `${fmtInt(trained.iterations)} steps`,
+                    fmtWhen(trained.at),
+                ]
+                    .filter(Boolean)
+                    .join(" · "),
+                style: "font-size:10px;margin-top:3px",
+            }),
+        );
+    }
+}
+
+async function refreshModalRemote(refresh = false) {
+    if (!current) return;
+    const seq = openSeq;
+    modalRemoteBusy = true;
+    renderModalReuse();
+    try {
+        const state = await api.splatModalState(
+            current.run,
+            current.slot,
+            current.model,
+            refresh,
+        );
+        if (seq !== openSeq) return;
+        modalRemote = state;
+        modalRemoteErr = null;
+        clampModalReuse();
+    } catch (e) {
+        if (seq !== openSeq) return;
+        modalRemote = null;
+        modalRemoteErr = e.message;
+    } finally {
+        if (seq === openSeq) {
+            modalRemoteBusy = false;
+            renderModalReuse();
+            renderModal(cellStatus);
+        }
+    }
 }
 
 // The client-owned training-policy controls (convergence bounds + plateau
@@ -3268,7 +3619,13 @@ function modalCfgControls(disabled) {
     const box = el(
         "div",
         { class: "svc-modal-cfg" },
-        select("trainer", ["brush", "gsplat"], trainerTitle, ["brush", "gsplat"], syncScope),
+        // The trainer also decides where the window ENDS (brush stops at 6, gsplat
+        // heals in 7), so the row above is re-rendered with it — nothing polls while
+        // the cell is idle, and a stale window readout would misstate the run.
+        select("trainer", ["brush", "gsplat"], trainerTitle, ["brush", "gsplat"], () => {
+            syncScope();
+            renderModal(cellStatus);
+        }),
         select("init", ["points", "surfels"], initTitle, ["brush"]),
         select("representation", ["2dgs", "3dgs"], repTitle, ["gsplat"]),
         numRow(
@@ -3309,18 +3666,20 @@ function modalCfgControls(disabled) {
     return box;
 }
 
-// Remote-train row + live log. One "train on modal" button runs stages 4-6 on
-// the GPU box (cameras → references → fine-tune) and pulls trained.ply back; its
-// live phase (push / spawn / plan / refs / train / pull) + the training
-// heartbeat (`stage · step/total · loss=… it/s`) arrive through the same cells
-// poll, and on completion the "trained" view auto-opens.
+// Remote-train row + live log. One "train on modal" button runs the stage window
+// the reuse selection implies (see `renderModalReuse`) on the GPU box and pulls
+// trained.ply back; its live phase (push / spawn / plan / refs / train / pull) +
+// the training heartbeat (`stage · step/total · loss=… it/s`) arrive through the
+// same cells poll, and on completion the "trained" view auto-opens.
 function renderModal(cell) {
     const box = inputs && inputs._modal;
     if (!box) return;
     const st = (cell && cell.modal) || {};
     const status = st.status || "idle";
     const running = status === "running";
-    const s3done = stageDone(cell, 3);
+    const [first, last] = modalWindow();
+    const span = first === last ? `stage ${first}` : `stages ${first}–${last}`;
+    const blocked = modalBlockReason(cell);
     box.replaceChildren();
     const row = el("div", { class: "svc-step" });
     row.appendChild(el("span", { class: "svc-step-n muted", text: "△" }));
@@ -3345,28 +3704,15 @@ function renderModal(cell) {
             title: "training on the GPU box — see the live log below",
         });
     } else {
-        // Two placements. "continue on modal" renders + trains from the LOCAL
-        // Stage-4 plan (stages 5–7; keeps cameras.json); "train on modal" lets
-        // Modal (re)plan cameras and overwrite the local plan (stages 4–7).
-        const s4done = stageDone(cell, 4);
-        const contBtn = el("button", {
-            class: "splat-stage2-btn",
-            disabled: !s4done || runningAll,
-            text: "continue on modal",
-            title: s4done
-                ? "render references + build the COLMAP model + 2DGS fine-tune on the GPU box from the LOCAL camera plan (stages 5–7); keeps cameras.json"
-                : "plan cameras locally first (Stage 4)",
-            onclick: () => startModalTrain(true, "continue"),
-        });
-        row.appendChild(contBtn);
         btn = el("button", {
             class: `splat-stage2-btn${status === "done" ? " view" : ""}`,
-            disabled: !s3done || runningAll,
+            disabled: !!blocked || runningAll,
             text: status === "done" ? "re-train" : "train on modal",
-            title: s3done
-                ? "(re)plan cameras + render references + 2DGS fine-tune on the GPU box (stages 4–7), overwriting the local plan"
-                : "sample the surfel cloud first (Stage 3)",
-            onclick: () => startModalTrain(status === "done", "train"),
+            title:
+                blocked ||
+                `run ${span} on the GPU box, forced fresh; anything earlier is ` +
+                    `taken from the volume untouched`,
+            onclick: () => startModalTrain(status === "done"),
         });
     }
     if (status === "error") {
@@ -3379,7 +3725,7 @@ function renderModal(cell) {
     // Client-owned training policy — editable while idle (hidden mid-run). These
     // values are the ONLY source of training-length defaults; the server forwards
     // them untouched.
-    if (!running) box.appendChild(modalCfgControls(!s3done || runningAll));
+    if (!running) box.appendChild(modalCfgControls(!!blocked || runningAll));
 
     const info =
         status === "done"
@@ -3388,9 +3734,7 @@ function renderModal(cell) {
               ? st.error || "remote train failed"
               : running
                 ? `${st.phase || "running"}${st.msg ? ` — ${st.msg}` : ""}`
-                : s3done
-                  ? "ready — runs stages 4–6 on the GPU box"
-                  : "needs the surfel cloud (Stage 3)";
+                : blocked || `ready — runs ${span} on the GPU box`;
     const sub = el("div", { class: "muted", text: info });
     sub.style.fontSize = "12px";
     box.appendChild(sub);
@@ -3474,6 +3818,9 @@ function renderModal(cell) {
     // trained view if the heal stage didn't run.
     if (modalPrev === "running" && status === "done") {
         updateSourceAvail();
+        // The run just changed what the volume holds — the next reuse is offered
+        // against this run's plan/captures/model, not the previous one's.
+        void refreshModalRemote(true);
         if (healedUrl) void setView("healed");
         else if (trainedUrl) void setView("trained");
     }
@@ -3481,15 +3828,15 @@ function renderModal(cell) {
 }
 
 // Launch the Modal remote splat for the open cell, then poll — the cells status
-// streams its live phase + training heartbeat. `mode` is "continue" (render +
-// train from the local Stage-4 plan, stages 5–7) or "train" (Modal replans
-// cameras too, stages 4–7).
-async function startModalTrain(restart = false, mode = "train") {
+// streams its live phase + training heartbeat. The reuse selection decides which
+// stage the remote window starts at and whether anything is uploaded at all.
+async function startModalTrain(restart = false) {
     if (!current) return;
     modalLog = [];
     modalPlanShown = false;
+    const [first, last] = modalWindow();
     setStatus(
-        `${restart ? "restarting" : "starting"} modal (${mode})…`,
+        `${restart ? "restarting" : "starting"} modal (stages ${first}–${last})…`,
         "var(--purple)",
     );
     try {
@@ -3498,13 +3845,16 @@ async function startModalTrain(restart = false, mode = "train") {
         // can't perturb the run or its signature.
         await api.splatModalStart(current.run, current.slot, current.model, {
             restart,
-            mode,
             trainer: modalTrainCfg.trainer,
             init: modalTrainCfg.init,
             representation: modalTrainCfg.representation,
             iterations: modalTrainCfg.iterations,
             batch: modalTrainCfg.batch,
             max_splats: modalTrainCfg.maxSplats,
+            reuse_assets: modalTrainCfg.reuseAssets,
+            reuse_cameras: modalTrainCfg.reuseCameras,
+            reuse_captures: modalTrainCfg.reuseCaptures,
+            plan_source: modalTrainCfg.planSource,
         });
     } catch (e) {
         setStatus(`remote splat failed to start: ${e.message}`, "var(--red)");
@@ -3692,6 +4042,10 @@ export async function openSplatViewer(opts) {
     modalPrev = null;
     modalLog = [];
     modalPlanShown = false;
+    modalRemote = null;
+    modalRemoteErr = null;
+    modalRemoteBusy = false;
+    resetModalReuse();
     overlay.classList.add("open");
     subEl.textContent =
         opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
@@ -3700,6 +4054,7 @@ export async function openSplatViewer(opts) {
     renderStepper();
     void refreshAssetSource();
     void refreshTour(seq);
+    void refreshModalRemote();
     if (opts.url) {
         cloudLoaded = true;
         setStatus("loading…", "var(--purple)");

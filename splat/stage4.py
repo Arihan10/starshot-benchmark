@@ -100,6 +100,7 @@ poses convert via `opencv_c2w`.
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -179,9 +180,32 @@ _ORB_CUBE_DIRS = np.asarray(
      [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
     dtype=np.float64,
 )
-# Marginal gain is represented with small integers: a patch with zero distinct
-# baseline cells is worth much more than one missing only its final station.
-_ORB_DEFICIT_WEIGHTS = np.asarray([16, 4, 1], dtype=np.int32)
+# THE DEMAND LEDGER's relative weights. A patch with no baseline at all is worth
+# far more than one missing only its last station, so the station term decays
+# geometrically; the frame and sector terms are flat top-ups that keep a patch
+# in demand after its station count is met but its appearance conditioning or
+# its angular spread is not.
+_ORB_STATION_W0 = 64.0
+_ORB_STATION_DECAY = 0.4
+_ORB_FRAME_W = 6.0
+_ORB_SECTOR_W = 8.0
+# Popcount for the uint8 octant mask (which directions a patch has been seen
+# from). Eight octants of the direction sphere; a patch can only be seen from
+# its front hemisphere, so three distinct octants already means real spread.
+_ORB_POPCOUNT = np.asarray([bin(i).count("1") for i in range(256)], dtype=np.int32)
+
+
+# Memory ceiling for the candidate visibility cache. Not a quality knob: an open
+# scene's 90° face can see thousands of bricks, so the cache scales with sightline
+# length as well as candidate count and has to be bounded by the machine.
+_ORB_HIT_BUDGET_BYTES = 256 * 1024**2
+
+
+def _station_weight_table(n_target: int) -> np.ndarray:
+    """Geometric station-deficit weights, indexed by `min(stations, target)`.
+    The last entry is zero: at target, the station column is satisfied."""
+    w = [_ORB_STATION_W0 * (_ORB_STATION_DECAY**i) for i in range(max(1, n_target))]
+    return np.asarray([*w, 0.0], dtype=np.float32)
 
 ProgressCb = Callable[[int, int, str], None]
 
@@ -205,7 +229,13 @@ class PlanParams:
     detail_px: float = 6.0
     ball_min: int = 8
     min_ball_views: int = 128
-    max_ball_views: int = 3000
+    # SAFETY VALVE, not a quota. This was 3000, which is a number in units of
+    # "cameras per scene" — and any such number forces every scene toward the
+    # same total no matter how much surface it has. It was most of the constant
+    # term that made a one-room suite and a seven-room house plan to within a
+    # factor of two of each other. The per-object derivation above already
+    # scales with area and object count; let it.
+    max_ball_views: int = 60000
     # Base standoff: frame the object (`frac` × diag), floored so tiny props
     # aren't macro-photographed past their texture information. No upper
     # bound beyond the scene cap — when the space can't fit the distance the
@@ -219,20 +249,26 @@ class PlanParams:
     dedupe_spacing: float = 0.4
     # Root establishing orbit.
     shell_views: int = 128
-    # INTERIOR FLOOD-FILL (stacked on the balls): fill the reachable free space
-    # with look-around cameras for the wall / floor / ceiling + baked-shadow
-    # coverage the object-centric darts miss. The lattice cell scales with the
-    # scene (`flood_spacing_frac`·diag, floored by `flood_spacing_min`) so the
-    # cell COUNT is scene-size-stable; `flood_dirs` Fibonacci looks per cell;
-    # `flood_clear` is the min standoff from any surface (no jammed views); the
-    # two caps bound the layer on big scenes by deterministic subsample.
-    flood: bool = False
+    # EXTERIOR FLOOD — look-around stations in the OPEN air, and the exact
+    # complement of what ORB serves. ORB only places stations where the escape
+    # fraction says "enclosed", so a cliff face, a dock, or the outside of a
+    # house falls outside its objective entirely and gets written off; with this
+    # layer off, all that surface was left to the inward object shells alone,
+    # which is why exteriors started reading as cloud against the void. Positions
+    # here are the ones ORB REJECTS (`enclosure < orb_enclosure_min`), so the two
+    # partition free space instead of duplicating each other.
+    #
+    # A fan in open air points mostly at sky, and the PRESENT test drops those
+    # directions, so an exterior station self-limits to the handful of looks that
+    # actually see the scene. The lattice cell scales with the scene, so the
+    # station count follows scene size; the caps are safety valves.
+    flood: bool = True
     flood_spacing_frac: float = 0.05
     flood_spacing_min: float = 0.6
     flood_dirs: int = 24
     flood_clear: float = 0.3
-    flood_max_positions: int = 512
-    flood_max_views: int = 512
+    flood_max_positions: int = 4096
+    flood_max_views: int = 20000
     # LARGE-FLAT SURFACE SWEEP (targeted, NOT a global density bump): a big flat
     # target (ceiling / floor / wall / panel) has a huge AABB diagonal, so its
     # per-object standoff can't fit the room and the room-side (looking-AT-it)
@@ -273,13 +309,40 @@ class PlanParams:
     orb: bool = True
     orb_min_clear: float = 0.12
     orb_candidate_spacing: float = 1.0
-    orb_candidate_cap: int = 4096
-    orb_enclosure_min: float = 0.85
     orb_escape_dirs: int = 12
-    orb_target_stations: int = 3
+    # THE CUBE FACE ANGLE, and it is not negotiable per camera. Six 90° frames
+    # tile the sphere exactly; below 90° the axis-aligned faces stop touching and
+    # a station leaves holes it was credited for covering. This must therefore be
+    # EXEMPT from the subject-distance FOV rule, which derives narrow angles for
+    # distant subjects and so silently punched gaps in exactly the open rooms and
+    # exteriors that need the coverage most. Slightly over 90° so a patch landing
+    # on a seam falls comfortably inside at least one frame rather than at two
+    # frames' worst-sampled edge; the ~10% redundancy is the price of tiling.
+    orb_face_fov_deg: float = 95.0
+    # THE LEDGER's targets — the definition of "done" for one patch of surface,
+    # in physical units rather than image counts. `orb_target_stations` is
+    # distinct optical centres (parallax; frames sharing one centre are ONE
+    # observation however many there are), `orb_target_frames` total images
+    # (degree-3 SH is 48 coefficients per Gaussian — a handful of frames cannot
+    # condition it), `orb_target_sectors` distinct octants those stations sat in
+    # (angular spread, so a wall is never supervised from one side only).
+    orb_target_stations: int = 4
+    orb_target_frames: int = 12
+    orb_target_sectors: int = 3
     orb_min_face_gain: float = 1.0
-    orb_max_views: int = 8000
     orb_measure_rays: int = 8
+    # STOPPING is a knee, not a budget. Greedy gains over a submodular objective
+    # are non-increasing, so the run stops when the best remaining station
+    # retires less than this fraction of what the FIRST station retired. That is
+    # scale-free: the threshold is relative to the scene's own opening gain, so
+    # a studio and a mansion stop for the same reason at different sizes. The
+    # caps below are SAFETY VALVES — if one fires it means the ledger or the
+    # write-off logic is wrong, not that the scene was large, and the summary
+    # says so.
+    orb_knee_frac: float = 0.01
+    orb_enclosure_min: float = 0.35
+    orb_candidate_cap: int = 65536
+    orb_max_views: int = 120000
     # PER-CAMERA FOV. One angle for a whole plan is a compromise between two
     # opposed needs: a wide frame sees more of a room per render (and its rays
     # cross more of the air that has to be proven empty), while a narrow frame
@@ -300,6 +363,10 @@ class PlanParams:
     fov_ref_px: float = 16.0
     fov_deg: float = 70.0
     render_resolution: int = 1024
+    # Extra frames only help if the trainer digests them: at one step per view a
+    # 30k-view plan gets a single epoch. The plan reports the step count its own
+    # size implies (`recommended_steps`), so the two can't drift apart silently.
+    steps_per_view: float = 6.0
     seed: int = 0
 
     def as_summary(self) -> dict[str, Any]:
@@ -331,14 +398,19 @@ class PlanParams:
             "sweep_max_views": self.sweep_max_views,
             "orb": self.orb,
             "orb_min_clear": self.orb_min_clear,
+            "orb_face_fov_deg": self.orb_face_fov_deg,
             "orb_candidate_spacing": self.orb_candidate_spacing,
             "orb_candidate_cap": self.orb_candidate_cap,
             "orb_enclosure_min": self.orb_enclosure_min,
             "orb_escape_dirs": self.orb_escape_dirs,
             "orb_target_stations": self.orb_target_stations,
+            "orb_target_frames": self.orb_target_frames,
+            "orb_target_sectors": self.orb_target_sectors,
+            "orb_knee_frac": self.orb_knee_frac,
             "orb_min_face_gain": self.orb_min_face_gain,
             "orb_max_views": self.orb_max_views,
             "orb_measure_rays": self.orb_measure_rays,
+            "steps_per_view": self.steps_per_view,
             "fov_derive": self.fov_derive,
             "fov_min_deg": self.fov_min_deg,
             "fov_max_deg": self.fov_max_deg,
@@ -522,8 +594,10 @@ def _cover_brick_centers(fs: FreeSpace) -> np.ndarray:
     nyz = int(fs.dims[1]) * int(fs.dims[2])
     nz = int(fs.dims[2])
     parts: list[np.ndarray] = []
-    for i in range(0, fs.occ_lin.size, 1 << 24):
-        lin = fs.occ_lin[i : i + (1 << 24)]
+    # 4M keys per pass — the decode below builds several int64 temporaries of
+    # this length, so the chunk is what sets peak memory (see `_brick_fields`).
+    for i in range(0, fs.occ_lin.size, 1 << 22):
+        lin = fs.occ_lin[i : i + (1 << 22)]
         x = lin // nyz
         rem = lin % nyz
         y, z = rem // nz, rem % nz
@@ -862,20 +936,48 @@ def _flood_cameras(
         )
         pos0 = pos0[sel]
 
+    # OPEN-AIR ONLY: keep the positions ORB will reject, so the two layers
+    # partition free space. Escape fraction is the same measure ORB admits on.
+    esc = _fib_sphere(max(int(params.orb_escape_dirs), 6))
+    esc_far = float(np.linalg.norm(fs.dims.astype(np.float64) * fs.pitch)) + 1.0
+    enclosed = np.empty(len(pos0))
+    chunk = max(1, 200_000 // len(esc))
+    for c0 in range(0, len(pos0), chunk):
+        q = pos0[c0 : c0 + chunk]
+        hit, _ = _ray_probe(
+            fs, np.repeat(q, len(esc), axis=0), np.tile(esc, (len(q), 1)),
+            np.full(len(q) * len(esc), esc_far),
+        )
+        enclosed[c0 : c0 + len(q)] = np.isfinite(hit).reshape(len(q), len(esc)).mean(axis=1)
+    pos0 = pos0[enclosed < params.orb_enclosure_min]
+    if pos0.shape[0] == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+
     dirs = _fib_sphere(max(int(params.flood_dirs), 1))
     pos = np.repeat(pos0, len(dirs), axis=0)
     fwd = np.tile(dirs, (pos0.shape[0], 1))
+    pidx = np.repeat(np.arange(pos0.shape[0]), len(dirs))
 
-    # PRESENT: some cover (opaque or glass) along the ray within the scene.
+    # PRESENT: some cover (opaque or glass) along the ray within the scene. In
+    # open air this is what discards the sky-facing majority of each fan.
     t_max = np.full(pos.shape[0], scene_diag + 2.0, dtype=np.float64)
     _, any_hit = _ray_probe(fs, pos, fwd, t_max)
     keep = np.isfinite(any_hit)
-    pos, fwd = pos[keep], fwd[keep]
-    if pos.shape[0] > params.flood_max_views:
+    pos, fwd, pidx = pos[keep], fwd[keep], pidx[keep]
+
+    # Cap by STATION, never by view. The candidate list is position-major, so
+    # striding it keeps roughly ONE direction per station — which is what turned
+    # this layer into disconnected single rays instead of look-around coverage.
+    # Subsample whole positions and keep every survivor's full surviving fan.
+    if len(pos) > params.flood_max_views:
+        per = np.bincount(pidx, minlength=pos0.shape[0])
+        live = np.nonzero(per)[0]
+        n_fit = max(1, int(params.flood_max_views / max(per[live].mean(), 1.0)))
         sel = np.unique(
-            np.linspace(0, pos.shape[0] - 1, params.flood_max_views).astype(np.int64)
+            np.linspace(0, len(live) - 1, min(n_fit, len(live))).astype(np.int64)
         )
-        pos, fwd = pos[sel], fwd[sel]
+        take = np.isin(pidx, live[sel])
+        pos, fwd = pos[take], fwd[take]
     return pos, fwd
 
 
@@ -976,8 +1078,12 @@ def _brick_fields(fs: FreeSpace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
 
     def to_bricks(lin: np.ndarray) -> np.ndarray:
         out = np.zeros(n, dtype=bool)
-        for i in range(0, lin.size, 1 << 24):
-            s = lin[i : i + (1 << 24)]
+        # 4M keys per pass: the index expression below builds several int64
+        # temporaries of this length, so the chunk sets peak memory. A larger
+        # one is marginally faster and costs hundreds of megabytes at the peak,
+        # which is the difference between planning and dying on a loaded box.
+        for i in range(0, lin.size, 1 << 22):
+            s = lin[i : i + (1 << 22)]
             x = s // nyz
             rem = s % nyz
             out[((x >> 3) * bd[1] + ((rem // nz) >> 3)) * bd[2] + ((rem % nz) >> 3)] = True
@@ -1116,21 +1222,35 @@ def _plan_orbs(
     _, take = np.unique(cell, axis=0, return_index=True)
     take.sort()
     free_ids, xyz = free_ids[take], xyz[take]
-    if len(free_ids) > params.orb_candidate_cap:
-        sel = np.unique(
-            np.linspace(0, len(free_ids) - 1, params.orb_candidate_cap).astype(np.int64)
-        )
+    # Pool size follows the SURFACE there is to serve, not a fixed number: one
+    # candidate per handful of servable patches is already a dense superset of
+    # the stations any scene will select, and it grows with the scene instead of
+    # truncating large ones. `orb_candidate_cap` is only the outer safety valve.
+    n_max = int(np.clip(n_surface // 8, 2048, max(params.orb_candidate_cap, 2048)))
+    if len(free_ids) > n_max:
+        sel = np.unique(np.linspace(0, len(free_ids) - 1, n_max).astype(np.int64))
         free_ids, xyz = free_ids[sel], xyz[sel]
 
     # Enclosure = one minus escape solid angle. A sampled ray escapes when it
     # leaves the Stage-2 grid before an opaque hit. Outdoors score near zero;
     # rooms / corridors / furnished pockets score near one.
     esc_dirs = _fib_sphere(max(int(params.orb_escape_dirs), 6))
-    esc_pos = np.repeat(xyz, len(esc_dirs), axis=0)
-    esc_fwd = np.tile(esc_dirs, (len(xyz), 1))
-    t_max = np.full(len(esc_fwd), float(np.linalg.norm(fs.dims * fs.pitch)) + edge)
-    hit, _ = _ray_probe(fs, esc_pos, esc_fwd, t_max)
-    enclosed = np.isfinite(hit).reshape(len(xyz), len(esc_dirs)).mean(axis=1)
+    esc_far = float(np.linalg.norm(fs.dims * fs.pitch)) + edge
+    enclosed = np.empty(len(xyz), dtype=np.float64)
+    # Chunked: the pool now scales with the scene, so materialising every escape
+    # ray at once would make peak memory a function of scene size.
+    esc_chunk = max(1, 200_000 // len(esc_dirs))
+    for c0 in range(0, len(xyz), esc_chunk):
+        q = xyz[c0 : c0 + esc_chunk]
+        hit, _ = _ray_probe(
+            fs,
+            np.repeat(q, len(esc_dirs), axis=0),
+            np.tile(esc_dirs, (len(q), 1)),
+            np.full(len(q) * len(esc_dirs), esc_far),
+        )
+        enclosed[c0 : c0 + len(q)] = (
+            np.isfinite(hit).reshape(len(q), len(esc_dirs)).mean(axis=1)
+        )
     keep = enclosed >= params.orb_enclosure_min
     free_ids, xyz, enclosed = free_ids[keep], xyz[keep], enclosed[keep]
     if not len(free_ids):
@@ -1140,9 +1260,43 @@ def _plan_orbs(
         }
 
     k = max(4, int(params.orb_measure_rays))
-    # Existing cameras count by DISTINCT baseline cells, not images. Hash one
-    # metre cells; overlapping frames from one optical centre contribute once.
-    station_count = np.zeros(len(cover), dtype=np.int16)
+    n_bricks = len(cover)
+    n_st = max(1, int(params.orb_target_stations))
+    n_fr = max(1, int(params.orb_target_frames))
+    n_sec = max(1, int(params.orb_target_sectors))
+    station_w = _station_weight_table(n_st)
+
+    # THE LEDGER — one row per surface patch, three columns, because "how many
+    # images saw it" conflates three different things a splat needs separately.
+    stations = np.zeros(n_bricks, dtype=np.int32)   # distinct optical centres
+    frames = np.zeros(n_bricks, dtype=np.int32)     # total images
+    sectors = np.zeros(n_bricks, dtype=np.uint8)    # octants they sat in
+
+    def post(pos: np.ndarray, per_image: list[np.ndarray], union: np.ndarray) -> None:
+        """Credit one STATION against the ledger.
+
+        `frames` is credited PER IMAGE, from each image's own hit list — not by
+        adding the station's face count to every patch in its union. That
+        shortcut gave a patch caught by one face of a six-face station six
+        frames, inflating the column up to 6x and letting the selector's knee
+        fire while the frame demand was only nominally met. The octant is taken
+        from the patch's point of view (which way the camera lay), so spread
+        means real angular diversity rather than merely distant optical centres."""
+        if not len(union):
+            return
+        stations[union] += 1
+        for h in per_image:
+            if len(h):
+                frames[h] += 1
+        d = pos[None, :] - _brick_centers_at(union, bd, fs)
+        sectors[union] |= (
+            1 << ((d[:, 0] > 0) * 4 + (d[:, 1] > 0) * 2 + (d[:, 2] > 0))
+        ).astype(np.uint8)
+
+    # Everything already planned is posted first, grouped into one-metre optical
+    # centre cells: the inward-facing layers frequently stack many frames on one
+    # spot, and counting those as many observations is what let the old planner
+    # believe a patch was covered when it had no baseline at all.
     if placed:
         ppos = np.asarray([c["pos"] for c in placed], dtype=np.float64)
         pfwd = np.asarray([c["forward"] for c in placed], dtype=np.float64)
@@ -1153,22 +1307,28 @@ def _plan_orbs(
         phits = _camera_hits(fs, bd, opaque, ppos, pfwd, pup, pfov, k)
         pcell = np.floor(ppos / 1.0).astype(np.int64)
         _, groups = np.unique(pcell, axis=0, return_inverse=True)
-        base_groups: list[np.ndarray] = []
         for gid in range(int(groups.max()) + 1 if len(groups) else 0):
-            ids = [phits[i] for i in np.nonzero(groups == gid)[0] if len(phits[i])]
+            members = np.nonzero(groups == gid)[0]
+            ids = [phits[i] for i in members if len(phits[i])]
             if ids:
-                union = np.unique(np.concatenate(ids))
-                base_groups.append(union)
-                station_count[union] += 1
-    else:
-        base_groups = []
+                post(ppos[members].mean(axis=0), ids, np.unique(np.concatenate(ids)))
 
-    def weights() -> np.ndarray:
-        idx = np.clip(station_count, 0, len(_ORB_DEFICIT_WEIGHTS) - 1)
-        w = _ORB_DEFICIT_WEIGHTS[idx].copy()
-        w[station_count >= params.orb_target_stations] = 0
-        w[~reachable_surface] = 0
-        return w
+    # `w` is the ledger's residual, one scalar per patch: what a further
+    # observation is still worth there. It is maintained INCREMENTALLY — only
+    # the patches a newly accepted station touched are recomputed — because a
+    # full pass costs O(bricks) and a large scene selects thousands of stations.
+    w = np.zeros(n_bricks, dtype=np.float32)
+
+    def refresh(idx: np.ndarray) -> None:
+        if not len(idx):
+            return
+        v = station_w[np.clip(stations[idx], 0, n_st)]
+        v = v + _ORB_FRAME_W * (np.clip(n_fr - frames[idx], 0, n_fr) / n_fr)
+        v = v + _ORB_SECTOR_W * (
+            np.clip(n_sec - _ORB_POPCOUNT[sectors[idx]], 0, n_sec) / n_sec
+        )
+        v[~servable[idx]] = 0.0
+        w[idx] = v
 
     cube_up = _up_for(_ORB_CUBE_DIRS)
     # A patch is an ORB target only when at least one ENCLOSED candidate can see
@@ -1180,6 +1340,9 @@ def _plan_orbs(
     # Precompute each candidate's six face-hit sets once. This is the planning
     # cost; greedy selection below is then sparse integer arithmetic.
     face_hits: list[list[np.ndarray]] = []
+    cand_union: list[np.ndarray] = []
+    hit_bytes = 0
+    hit_budget_hit = False
     batch = 256
     if progress is not None:
         progress(0, len(xyz), "orb-candidates")
@@ -1188,98 +1351,158 @@ def _plan_orbs(
         pos = np.repeat(q, 6, axis=0)
         fwd = np.tile(_ORB_CUBE_DIRS, (len(q), 1))
         up = np.tile(cube_up, (len(q), 1))
-        got = _camera_hits(fs, bd, opaque, pos, fwd, up, np.full(len(pos), 90.0), k)
+        # Evaluated at the angle these faces will actually be RENDERED at. This
+        # was hardcoded to 90° while the emitted cameras were later re-derived to
+        # 50-110°, so the ledger credited coverage the render never captured.
+        got = _camera_hits(
+            fs, bd, opaque, pos, fwd, up,
+            np.full(len(pos), float(params.orb_face_fov_deg)), k,
+        )
         for h in got:
             interior_surface[h] = True
-        face_hits.extend([got[i : i + 6] for i in range(0, len(got), 6)])
+        for i in range(0, len(got), 6):
+            faces = [h.astype(np.int32) for h in got[i : i + 6]]
+            face_hits.append(faces)
+            nz = [h for h in faces if len(h)]
+            cand_union.append(
+                np.unique(np.concatenate(nz)) if nz else np.zeros(0, dtype=np.int32)
+            )
+            hit_bytes += 4 * (sum(len(h) for h in faces) + len(cand_union[-1]))
         if progress is not None:
             progress(min(c0 + batch, len(xyz)), len(xyz), "orb-candidates")
+        # A candidate's visibility list is as long as its sightlines, so an open
+        # scene stores far more per candidate than an enclosed one — the pool has
+        # to be bounded by MEMORY, which is a property of the machine, not of the
+        # scene. Truncating here costs a little placement quality; running out of
+        # memory costs the whole plan.
+        if hit_bytes > _ORB_HIT_BUDGET_BYTES:
+            xyz = xyz[: len(face_hits)]
+            enclosed = enclosed[: len(face_hits)]
+            hit_budget_hit = True
+            break
 
-    reachable_surface &= interior_surface
-    n_surface = int(reachable_surface.sum())
-    station_count[:] = 0
-    for union in base_groups:
-        station_count[union] += 1
-    before = station_count.copy()
+    # THE WRITE-OFF COLUMN. Demand that no admissible station can ever satisfy
+    # is retired explicitly instead of being chased forever. Measured on real
+    # cells, ~97% of never-seen surface lines gaps narrower than a camera fits
+    # in — interpenetration seams and cracks behind fixtures. Without this a
+    # capless planner cannot terminate on completion, because a residual it is
+    # powerless to reduce never reaches zero. It is reported, not hidden.
+    servable = reachable_surface & interior_surface
+    written_off = reachable_surface & ~interior_surface
+    n_surface = int(servable.sum())
+    n_written_off = int(written_off.sum())
+    refresh(np.nonzero(reachable_surface)[0])
+    before = stations.copy()
 
     selected = np.zeros(len(xyz), dtype=bool)
     cams: list[dict[str, Any]] = []
     n_stations = 0
 
-    # Bucketed residual selector. Re-evaluate all candidates once per batch, then
-    # commit a spatially diverse top set before refreshing deficits. This preserves
-    # marginal-value behavior without the O(candidates × stations) full rescore
-    # that made large scenes impractical.
-    select_batch = 32
-    while len(cams) < params.orb_max_views:
-        w = weights()
-        if not w.any():
-            break
-        scored: list[tuple[float, int, list[int]]] = []
-        for i, faces in enumerate(face_hits):
-            if selected[i]:
-                continue
-            gains = [float(w[h].sum()) if len(h) else 0.0 for h in faces]
-            useful = [fi for fi, gain in enumerate(gains) if gain >= params.orb_min_face_gain]
-            if useful:
-                union = np.unique(np.concatenate([faces[fi] for fi in useful]))
-                gain = float(w[union].sum()) * float(enclosed[i])
-                if gain >= params.orb_min_face_gain:
-                    scored.append((gain, i, useful))
-        if not scored:
-            break
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        accepted = 0
-        batch_cells: list[np.ndarray] = []
-        for _gain, best_i, best_faces in scored:
-            # Don't take several near-identical winners from the same pocket in
-            # one stale-deficit batch; refresh first after a station-sized spread.
-            if batch_cells:
-                d2 = [float(np.sum((xyz[best_i] - p) ** 2)) for p in batch_cells]
-                if min(d2) < params.orb_candidate_spacing**2:
-                    continue
-            room = params.orb_max_views - len(cams)
-            best_faces = best_faces[:room]
-            if not best_faces:
-                break
-            selected[best_i] = True
-            station_union = np.unique(
-                np.concatenate([face_hits[best_i][fi] for fi in best_faces])
-            )
-            station_count[station_union] += 1
-            for fi in best_faces:
-                cams.append({
-                    "pos": xyz[best_i], "forward": _ORB_CUBE_DIRS[fi],
-                    "kind": "orb", "zone": None, "fov": 90.0,
-                    "station": n_stations, "face": fi,
-                })
-            batch_cells.append(xyz[best_i])
-            n_stations += 1
-            accepted += 1
-            if accepted >= select_batch or len(cams) >= params.orb_max_views:
-                break
-        if not accepted:
-            break
-        if progress is not None:
-            progress(len(cams), params.orb_max_views, "orb-select")
+    # LAZY GREEDY over a submodular objective. Adding a station can only lower
+    # every other candidate's gain, so a stale score is always an upper bound:
+    # pop the best bound, recompute it exactly, and accept only if it still beats
+    # the next bound — otherwise push it back with the fresh value. That gives
+    # the exact greedy sequence at a small fraction of the rescoring cost, which
+    # is what makes an uncapped candidate pool and thousands of stations
+    # affordable at all. It also removes the old spatial-diversity fudge: once a
+    # station is taken, its neighbours' gains collapse on their own.
+    heap: list[tuple[float, int]] = []
+    for i, union in enumerate(cand_union):
+        if len(union):
+            ub = float(w[union].sum()) * float(enclosed[i])
+            if ub > 0.0:
+                heap.append((-ub, i))
+    heapq.heapify(heap)
 
-    target = reachable_surface
-    before_ok = (
-        float((before[target] >= params.orb_target_stations).mean()) if n_surface else 1.0
-    )
-    after_ok = (
-        float((station_count[target] >= params.orb_target_stations).mean())
-        if n_surface else 1.0
+    first_gain = 0.0
+    stop_reason = "complete"
+    rescored = 0
+    while heap:
+        if len(cams) >= params.orb_max_views:
+            stop_reason = "safety_valve"
+            break
+        neg_ub, i = heapq.heappop(heap)
+        union = cand_union[i]
+        gain = float(w[union].sum()) * float(enclosed[i])
+        if gain <= 0.0:
+            continue
+        # Stale bound: not actually the best any more — reinsert and move on.
+        if heap and gain < -heap[0][0] - 1e-9:
+            heapq.heappush(heap, (-gain, i))
+            rescored += 1
+            continue
+        # Accepted gains are non-increasing, so one comparison is a valid knee.
+        if first_gain <= 0.0:
+            first_gain = gain
+        elif gain < params.orb_knee_frac * first_gain:
+            stop_reason = "knee"
+            break
+        faces = face_hits[i]
+        useful = [
+            fi for fi in range(6)
+            if len(faces[fi]) and float(w[faces[fi]].sum()) >= params.orb_min_face_gain
+        ]
+        if not useful:
+            continue
+        useful = useful[: max(0, params.orb_max_views - len(cams))]
+        if not useful:
+            stop_reason = "safety_valve"
+            break
+        selected[i] = True
+        kept = [faces[fi] for fi in useful]
+        taken = np.unique(np.concatenate(kept))
+        post(xyz[i], kept, taken)
+        refresh(taken)
+        for fi in useful:
+            cams.append({
+                "pos": xyz[i], "forward": _ORB_CUBE_DIRS[fi],
+                "kind": "orb", "zone": None,
+                # Authoritative: the cube rig's angle survives the per-camera FOV
+                # derivation, which would otherwise narrow it and break tiling.
+                "fov": float(params.orb_face_fov_deg),
+                "station": n_stations, "face": fi,
+            })
+        n_stations += 1
+        if progress is not None and n_stations % 32 == 0:
+            progress(len(cams), len(cams) + len(heap), "orb-select")
+
+    tgt = servable
+    before_ok = float((before[tgt] >= n_st).mean()) if n_surface else 1.0
+    after_ok = float((stations[tgt] >= n_st).mean()) if n_surface else 1.0
+    done = (
+        (stations[tgt] >= n_st)
+        & (frames[tgt] >= n_fr)
+        & (_ORB_POPCOUNT[sectors[tgt]] >= n_sec)
     )
     return cams, {
         "stations": n_stations,
         "views": len(cams),
         "candidates": int(len(xyz)),
-        "target_bricks": n_surface,
-        "target_stations": params.orb_target_stations,
-        "reached_before": round(before_ok, 4),
-        "reached_after": round(after_ok, 4),
-        "median_stations": int(np.median(station_count[target])) if n_surface else 0,
+        "candidate_budget_hit": hit_budget_hit,
+        "rescored": rescored,
+        # The ledger, as the summary sees it. `servable` is demand this layer
+        # could act on; `written_off` is demand no station can reach, retired up
+        # front with a reason so a capless run can still terminate on completion.
+        "servable_bricks": n_surface,
+        "written_off_bricks": n_written_off,
+        # Of the surface no ORB station can reach — overwhelmingly exterior — how
+        # much the other layers do cover. This is the exterior health indicator:
+        # near zero means the outside of the scene is being left to the void.
+        "written_off_covered": round(
+            float((stations[written_off] >= 1).mean()) if n_written_off else 1.0, 4
+        ),
+        "target_stations": n_st,
+        "target_frames": n_fr,
+        "target_sectors": n_sec,
+        "stations_before": round(before_ok, 4),
+        "stations_after": round(after_ok, 4),
+        "ledger_complete": round(float(done.mean()) if n_surface else 1.0, 4),
+        "median_stations": int(np.median(stations[tgt])) if n_surface else 0,
+        "median_frames": int(np.median(frames[tgt])) if n_surface else 0,
+        # Which of the three conditions ended the run. "safety_valve" is a bug
+        # report, not a size report.
+        "stop_reason": stop_reason,
+        "first_gain": round(first_gain, 3),
         "enclosure_min": params.orb_enclosure_min,
         "measure_rays": k,
     }
@@ -1423,27 +1646,38 @@ def plan_cameras(
     sweep_cams = _surface_sweep_cameras(fs, targets, lo, hi, params, scene_diag, culls)
     cams.extend(sweep_cams)
 
-    # 5) ORBS v2 — enclosed-space cubemap stations selected against the residual
-    # left by every layer above. Runs last because only marginal value matters.
+    # 5) PER-CAMERA FOV for every layer above, derived from each camera's own
+    # subject distance (`_derive_fovs`) — one march against the geometry rather
+    # than five different notions of "how far is what I point at".
+    #
+    # This runs BEFORE the orbs for two reasons. The orb ledger measures what the
+    # existing plan already covers, and it can only do that correctly if those
+    # cameras' real angles are known by then. And a camera that has already
+    # declared its own `fov` — the cube rig, whose six faces must stay at ~90° to
+    # tile the sphere — must be left alone, not re-derived into gaps.
     fields = _brick_fields(fs)
+    if progress is not None:
+        progress(0, 0, "fov")
+    if cams:
+        pre_fwd = np.asarray([c["forward"] for c in cams], dtype=np.float64)
+        pre_pos = np.asarray([c["pos"] for c in cams], dtype=np.float64)
+        pre_fov = _derive_fovs(
+            _subject_distance(fs, fields[3], fields[1], pre_pos, pre_fwd),
+            _BRICK * fs.pitch, params,
+        )
+        for c, f in zip(cams, pre_fov):
+            c.setdefault("fov", float(f))
+
+    # 6) ORBS v2 — enclosed-space cubemap stations selected against the residual
+    # left by every layer above. Runs last because only marginal value matters.
     orb_cams, orb_stats = _plan_orbs(fs, lo, hi, cams, params, progress, fields)
     cams.extend(orb_cams)
 
     fwd_all = np.asarray([c["forward"] for c in cams], dtype=np.float64)
     up_all = _up_for(fwd_all) if len(cams) else np.zeros((0, 3))
-
-    # 6) PER-CAMERA FOV, derived from each camera's own subject distance
-    # (`_derive_fovs`). Done here rather than inside each layer so every camera
-    # is measured the same way — one march, against the geometry, instead of
-    # five different notions of "how far away is what I am pointing at".
-    if progress is not None:
-        progress(0, 0, "fov")
-    pos_all = np.asarray([c["pos"] for c in cams], dtype=np.float64)
-    subj = (
-        _subject_distance(fs, fields[3], fields[1], pos_all, fwd_all)
-        if len(cams) else np.zeros(0)
+    fov_all = np.asarray(
+        [float(c.get("fov") or params.fov_deg) for c in cams], dtype=np.float64
     )
-    fov_all = _derive_fovs(subj, _BRICK * fs.pitch, params)
     fov_shared = float(np.median(fov_all)) if len(cams) else float(params.fov_deg)
 
     near = min(0.05, fs.pitch * 0.5)
@@ -1496,6 +1730,13 @@ def plan_cameras(
             "orb": len(orb_cams),
         },
         "orb": orb_stats,
+        # A plan this size only pays off if the trainer runs long enough to see
+        # each view several times; at one step per view a 30k-view plan gets a
+        # single epoch. Reported so the two cannot drift apart unnoticed.
+        "recommended_steps": max(
+            30000, int(round(len(cams) * max(params.steps_per_view, 1.0)))
+        ),
+        "stop_reason": orb_stats.get("stop_reason", "n/a"),
         "targets": {
             "total": len(targets),
             "framed": len(framed),

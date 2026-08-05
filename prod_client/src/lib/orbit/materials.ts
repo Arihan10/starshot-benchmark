@@ -1,10 +1,12 @@
 import {
 	BackSide,
+	Color,
 	DataTexture,
 	DoubleSide,
 	MeshStandardMaterial,
 	RGBAFormat,
 	ShaderMaterial,
+	Vector2,
 	Vector3,
 } from "three";
 
@@ -113,6 +115,134 @@ export function makeProjectionMaterial(): ShaderMaterial {
 				gl_FragColor = vec4(col / max(wsum, 1e-4), 1.0);
 			}
 		`,
+	});
+}
+
+// The object silhouette, drawn from the ID mask (see idMasks.ts). For each screen
+// pixel: turn the view ray into an equirect texel and ask how much of it belongs
+// to the hovered object.
+//
+// "How much" rather than "whether" is what keeps the edge off the texel grid. A
+// binary answer quantizes the boundary however fine the mask is, and a walkthrough
+// magnifies enough to show it, so the mask carries the sub-texel coverage its
+// supersampled raster measured. Each of the four neighbouring texels contributes
+// its share of the object — its own coverage where the texel is ours, the winner's
+// leftover where it is a texel we bleed into — and those are bilerped into a
+// continuous field.
+//
+// THICKNESS comes from a ring rather than from that field, because coverage only
+// carries signal within about a texel of the boundary: a stroke derived from its
+// gradient saturates around a pixel wide and then drifts with zoom. So the ring
+// asks the mask directly — step `uWidth` screen pixels out in twelve directions
+// and count how many land outside. For a straight edge that count is
+// (1/pi)·acos(t/R), smooth in the distance to the boundary, which gives a stroke of
+// any requested width, feathered inward, at a fixed weight on screen. The steps are
+// taken in DIRECTION space (rotate the ray, then re-project); doing it in uv would
+// blow up where u wraps and where the equirect stretches at the poles.
+//
+// The stroke is drawn from the boundary INWARD. Centred on it, half its width would
+// spill onto whatever lies beyond — painting over the neighbour, or over the
+// occluder, that the mask says owns those pixels.
+export function makeMaskHighlightMaterial(): ShaderMaterial {
+	return new ShaderMaterial({
+		uniforms: {
+			uMask: { value: null },
+			uTexel: { value: new Vector2(1, 1) },
+			uLocal: { value: 0 },
+			uWide: { value: false },
+			uEdge: { value: new Color(0xbfe8ff) },
+			uWidth: { value: 3.0 }, // stroke width in SCREEN pixels
+		},
+		vertexShader: /* glsl */ `
+			varying vec3 vDir;
+			void main() {
+				vDir = position;
+				gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+			}
+		`,
+		fragmentShader: /* glsl */ `
+			uniform sampler2D uMask;
+			uniform vec2 uTexel;
+			uniform float uLocal;
+			uniform bool uWide;
+			uniform vec3 uEdge;
+			uniform float uWidth;
+			varying vec3 vDir;
+
+			// (local id, coverage) in one tap — the mask is interleaved so four
+			// neighbours cost four samples, not eight.
+			vec2 tap(vec2 uv) {
+				vec4 t = texture2D(uMask, uv);
+				return uWide ? vec2(t.r * 255.0 + t.g * 65280.0, t.b) : vec2(t.r * 255.0, t.g);
+			}
+			float ours(vec2 s) {
+				return abs(s.x - uLocal) < 0.5 ? 1.0 : 0.0;
+			}
+			float share(vec2 s, float near) {
+				return mix(near * (1.0 - s.y), s.y, ours(s));
+			}
+			// The plane is stored top-down and the texture is flipY = false, so
+			// t = 1 - v puts row 0 straight up.
+			vec2 dirToUv(vec3 d) {
+				return vec2(
+					atan(d.z, d.x) / 6.28318530718 + 0.5,
+					1.0 - (asin(clamp(d.y, -1.0, 1.0)) / 3.14159265359 + 0.5)
+				);
+			}
+			float coverageAt(vec2 uv) {
+				vec2 t = uv / uTexel - 0.5;
+				vec2 f = fract(t);
+				vec2 b = (floor(t) + 0.5) * uTexel;
+				vec2 s00 = tap(b);
+				vec2 s10 = tap(b + vec2(uTexel.x, 0.0));
+				vec2 s01 = tap(b + vec2(0.0, uTexel.y));
+				vec2 s11 = tap(b + uTexel);
+				// Claiming a neighbour's leftover is only meaningful next to us.
+				float near = max(max(ours(s00), ours(s10)), max(ours(s01), ours(s11)));
+				return mix(
+					mix(share(s00, near), share(s10, near), f.x),
+					mix(share(s01, near), share(s11, near), f.x),
+					f.y
+				);
+			}
+			void main() {
+				if (uLocal < 0.5) discard;
+				vec3 d = normalize(vDir);
+				// Computed with no branching above it: derivatives are undefined in
+				// non-uniform control flow, so discarding outside-fragments first
+				// would corrupt fwidth for the very fragments the stroke lands on.
+				float c = coverageAt(dirToUv(d));
+
+				// Radians per screen pixel, measured on the direction itself so it
+				// stays finite at the seam and at the poles.
+				float angPerPx = length(fwidth(d));
+				vec3 axis = abs(d.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+				vec3 tx = normalize(cross(axis, d));
+				vec3 ty = cross(d, tx);
+				float r = uWidth * angPerPx;
+
+				float outside = 0.0;
+				for (int i = 0; i < 12; i++) {
+					float a = float(i) * 0.5235987756; // 30°
+					vec3 s = normalize(d + (tx * cos(a) + ty * sin(a)) * r);
+					outside += 1.0 - ours(tap(dirToUv(s)));
+				}
+				// Half the ring is outside when we sit on the boundary and none of
+				// it once we are a full width inside, so doubling gives a stroke
+				// solid at the edge and faded to nothing uWidth pixels in.
+				float band = clamp((outside / 12.0) * 2.0, 0.0, 1.0);
+				// The sub-pixel-accurate outer edge; band is the body.
+				float inside = clamp((c - 0.5) / max(fwidth(c), 1e-5) + 0.5, 0.0, 1.0);
+
+				float a = inside * band;
+				if (a <= 0.004) discard;
+				gl_FragColor = vec4(uEdge, a);
+			}
+		`,
+		side: BackSide,
+		transparent: true,
+		depthWrite: false,
+		depthTest: false,
 	});
 }
 

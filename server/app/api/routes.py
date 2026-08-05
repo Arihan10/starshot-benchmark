@@ -48,6 +48,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from app.api import sog as sog_delivery
 from app.core import prompt_store, scene_context, schemas
 from app.utils import cache
 from app.oneshot import routes as oneshot
@@ -209,8 +210,11 @@ _ARTIFACT_MEDIA_TYPES = {
     ".ply": "application/octet-stream",
     ".bin": "application/octet-stream",
     # SOG-encoded trained splat (client/tools/ply-to-sog.mjs) — a zip bundle the
-    # PlayCanvas gsplat loader fetches as raw bytes.
+    # PlayCanvas gsplat loader fetches as raw bytes. `.webp` covers the quantized
+    # textures a streamed-SOG bundle (ply-to-lod-sog.mjs) unpacks them into.
+    # Prefer `/sog` for either — it adds ranges, validators and cache policy.
     ".sog": "application/octet-stream",
+    ".webp": "image/webp",
     # Stage-6 training log — served inline so `log_url` opens live in a browser.
     ".log": "text/plain; charset=utf-8",
 }
@@ -247,7 +251,21 @@ _generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
 _regen_tasks: dict[GenKey, asyncio.Task[None]] = {}
 _regen_queues: dict[GenKey, asyncio.Queue["RegenJob"]] = {}
 _hydrated_runs: set[str] = set()
-_hydration_errors: dict[str, str] = {}
+# Why one CELL wouldn't load, keyed per cell. Hydration holds every parsed event
+# of every cell in RAM for the process's lifetime, so a single cell with a huge
+# events.jsonl can exhaust memory — and it used to take its whole run down with
+# it. Cells are now loaded independently: one that fails is recorded here and
+# skipped, its siblings load normally, and the cell's own endpoints report this
+# reason instead of a bare 404. Cleared per cell by a successful (re)load; a
+# POST /runs/{name}/hydrate drops them so the skipped cells are retried.
+_cell_hydration_errors: dict[RunKey, str] = {}
+# The same, for a simulation BRANCH (keyed by branch id). A branch log carries a
+# copy of its source cell's prefix, so a branch forked from an oversized cell is
+# oversized too — and it must not take the run down either. Note that unlike a
+# malformed branch dir (swept), a branch that merely wouldn't LOAD is left
+# untouched on disk: the failure may be this process running out of memory, which
+# is no reason to delete the sim.
+_branch_hydration_errors: dict[str, str] = {}
 
 # --- Stage 1 splat conversion jobs (background, one per CELL) ----------------
 # Keyed by (run, slot, model): selecting a run lists cells; clicking a cell
@@ -316,10 +334,11 @@ _splat_sog_procs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 # --- Modal remote splat jobs (stages 4-7 on the GPU box) ------------------------
 # One asyncio SUPERVISOR task per cell mirrors the stage-job pattern: it pushes
 # the cell's local inputs to the Modal Volume (content-deduped), spawns
-# `run_cell` over the stage window for the chosen mode ('train' → 4-7 replanning
-# cameras; 'continue' → 5-7 from the pushed local plan), streams that container's
-# heartbeat, and pulls `cameras.json` + `trained.ply` back — so the EXISTING
-# Stage-6 status and the viewer's "trained" toggle light up with no extra wiring.
+# `run_cell` over the stage window the cell's REUSE selection implies (4-7 from
+# scratch, 5-7 from an existing camera plan, or 6-7 straight onto captures that
+# are already rendered), streams that container's heartbeat, and pulls
+# `cameras.json` + `trained.ply` back — so the EXISTING Stage-6 status and the
+# viewer's "trained" toggle light up with no extra wiring.
 # Value: {status, running, phase, heartbeat, call_id, error, started_at, ...}.
 _splat_modal_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_modal_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
@@ -327,6 +346,12 @@ _splat_modal_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 # probe and claiming the job), so the startup scan and a concurrent status poll
 # can't double-attach one cell (which would race two supervisors on its pull).
 _splat_modal_reattaching: set[tuple[str, str, str]] = set()
+# Memoized `remote_cell_state` per cell — what the Volume already holds, which is
+# what the reuse toggles are gated on. It costs a handful of Volume round trips,
+# so it is fetched ON DEMAND (cell open / after a run / explicit refresh) and
+# never from the per-second cells poll. Value: (monotonic stamp, state).
+_splat_modal_state: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_MODAL_STATE_TTL_S = 30.0
 # The remote stage window the button drives: 4-6 (plan/refs/RAW train) + 7
 # (delete + heal + final-prune -> the delivered healed.ply, viewable against the
 # raw trained.ply). NOTE: stage 7 requires a deployed image with `heal_splat`
@@ -334,6 +359,12 @@ _splat_modal_reattaching: set[tuple[str, str, str]] = set()
 # client-triggered, on-demand encode of the chosen model (see the /splat/sog route).
 _MODAL_STAGES = [4, 5, 6, 7]
 _MODAL_POLL_S = 4.0
+# While the poller can't REACH Modal (`job_status` -> "unreachable"): how often to
+# retry, and how long to keep trying before calling it a failure. Deliberately
+# generous — the container is unaffected by a dropped poll, so a minute of flaky
+# network must not end a multi-hour train that is still billing either way.
+_MODAL_LOST_POLL_S = 15.0
+_MODAL_LOST_GIVEUP_S = 600.0
 
 _current_run: str = ""
 
@@ -1180,22 +1211,22 @@ def _generated_image_prompts(events_path: Path) -> dict[str, str]:
 def _ensure_run_hydrated(run: str) -> None:
     """Hydrate an existing run on first data access, never during startup.
 
-    A failed hydration is converted into a per-run 503 rather than an unhandled
-    exception. This keeps the process and every other run usable even when one
-    legacy run is too large or has a damaged event log."""
+    A failure is converted into a 503 rather than an unhandled exception, so the
+    process and every other run stay usable. The failure is NOT remembered: an
+    earlier attempt that died of memory pressure would otherwise keep answering
+    for a run that could load fine now, so every call re-attempts. That is cheap
+    because `_hydrate_run` fills in only the cells it is still missing."""
     if not run or not _run_dir(run).is_dir():
         return
-    if run not in _hydrated_runs:
-        try:
-            _hydrate_run(run)
-        except (MemoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
-            _hydration_errors[run] = f"{type(exc).__name__}: {exc}"
-    error = _hydration_errors.get(run)
-    if error is not None:
+    if run in _hydrated_runs and not _missing_cells(run):
+        return
+    try:
+        _hydrate_run(run)
+    except (MemoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise HTTPException(
             status_code=503,
-            detail=f"run {run!r} could not be loaded: {error}",
-        )
+            detail=f"run {run!r} could not be loaded: {_hydration_detail(exc, 0)}",
+        ) from exc
 
 
 def _slug(text: str) -> str:
@@ -1218,6 +1249,12 @@ def _new_branch_id(slot_id: str, model_alias: str) -> str:
 def _require_branch(branch_id: str) -> Branch:
     br = _branches.get(branch_id)
     if br is None:
+        error = _branch_hydration_errors.get(branch_id)
+        if error is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"branch {branch_id} could not be loaded: {error}",
+            )
         raise HTTPException(status_code=404, detail=f"no such branch: {branch_id}")
     return br
 
@@ -1682,32 +1719,82 @@ def _build_run_prompts(run: str, compare: str | None) -> dict[str, object]:
     return {"run": run, "compare": compare, "steps": steps_out}
 
 
-def _hydrate_run(run: str) -> None:
-    """Build SlotLogs for every (slot, model) cell under RUNS_DIR/<run>/.
+def _hydration_detail(exc: BaseException, log_bytes: int) -> str:
+    """Why a cell (or run) wouldn't load. MemoryError carries no message of its
+    own, so the event log's SIZE is the diagnosis worth printing: hydration parses
+    every line into a dict and holds it for the process's lifetime, which on a
+    multi-GB log needs several times the file size in RAM."""
+    reason = f"{type(exc).__name__}: {exc}".rstrip(": ")
+    if log_bytes <= 0:
+        return reason
+    size = (
+        f"{log_bytes / 1_073_741_824:.2f} GB"
+        if log_bytes >= 1_073_741_824
+        else f"{log_bytes / 1_048_576:.0f} MB"
+    )
+    return f"{reason} — events.jsonl is {size}"
 
-    Idempotent and transactional at the registry level: a failed cell/branch
-    parse leaves no half-hydrated run behind, so other runs remain independent
-    and a later retry starts cleanly."""
-    if run in _hydrated_runs:
-        return
+
+def _pending_cells(run: str) -> list[tuple[int, Slot, str, Path, RunKey]]:
+    """The run's cells still waiting to be loaded — neither in memory nor already
+    recorded as failed — each tagged with its event log's size, SMALLEST FIRST.
+
+    Order matters when a run's total log volume exceeds RAM: going cheapest-first
+    means every cell that CAN be held is loaded before the oversized one runs the
+    process out of memory, instead of one 4 GB cell starving all its siblings."""
+    pending: list[tuple[int, Slot, str, Path, RunKey]] = []
+    for slot in SLOTS:
+        for alias in MODEL_ALIASES:
+            key: RunKey = (run, slot.id, alias)
+            if key in _slot_logs or key in _cell_hydration_errors:
+                continue
+            slot_dir = _slot_dir(run, slot.id, alias)
+            events_path = slot_dir / "events.jsonl"
+            try:
+                size = events_path.stat().st_size
+            except OSError:
+                size = 0
+            pending.append((size, slot, alias, slot_dir, key))
+    pending.sort(key=lambda item: item[0])
+    return pending
+
+
+def _missing_cells(run: str) -> bool:
+    return bool(_pending_cells(run))
+
+
+def _hydrate_run(run: str) -> None:
+    """Build SlotLogs for the (slot, model) cells under RUNS_DIR/<run>/ that
+    aren't loaded yet.
+
+    Idempotent per cell, so a re-entry only fills the gaps. Cells are loaded
+    INDEPENDENTLY: one that can't be parsed (a multi-GB log that won't fit in RAM,
+    a damaged line) is recorded in `_cell_hydration_errors` and skipped rather than
+    aborting the run, because a single oversized cell used to make every other cell
+    in its run unreachable. A branch-registry failure still rolls back the cells
+    this call added, so a retry starts cleanly."""
     run_dir = _run_dir(run)
     run_dir.mkdir(parents=True, exist_ok=True)
     added_keys: list[RunKey] = []
     try:
-        for slot in SLOTS:
-            for alias in MODEL_ALIASES:
-                slot_dir = _slot_dir(run, slot.id, alias)
-                slot_dir.mkdir(parents=True, exist_ok=True)
-                slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
+        for size, slot, alias, slot_dir, key in _pending_cells(run):
+            slot_dir.mkdir(parents=True, exist_ok=True)
+            slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
+            try:
                 slot_log.hydrate_from_disk()
-                key: RunKey = (run, slot.id, alias)
-                _slot_logs[key] = slot_log
-                added_keys.append(key)
-                # Restore stepped mode from its on-disk marker so a stepped run
-                # comes back steppable after a restart instead of a dead paused cell.
-                if (slot_dir / ".stepped").exists():
-                    _stepped_cells.add(key)
-                _maybe_launch(slot, alias, slot_log)
+            except (MemoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+                # Drop the partial parse so its memory is reclaimed for the cells
+                # still to come, and leave this one addressable-but-explained.
+                slot_log.close()
+                _cell_hydration_errors[key] = _hydration_detail(exc, size)
+                continue
+            _slot_logs[key] = slot_log
+            added_keys.append(key)
+            # Restore stepped mode from its on-disk marker so a stepped run
+            # comes back steppable after a restart instead of a dead paused cell.
+            if (slot_dir / ".stepped").exists():
+                _stepped_cells.add(key)
+            _maybe_launch(slot, alias, slot_log)
         _hydrate_branches(run)
     except BaseException:
         for key in added_keys:
@@ -1720,7 +1807,6 @@ def _hydrate_run(run: str) -> None:
                 branch.log.close()
                 _branches.pop(branch_id, None)
         raise
-    _hydration_errors.pop(run, None)
     _hydrated_runs.add(run)
 
 
@@ -1749,7 +1835,17 @@ def _hydrate_branches(run: str) -> None:
             shutil.rmtree(bdir, ignore_errors=True)
             continue
         blog = SlotLog(_branch_run_id(run, bdir.name), events_path)
-        blog.hydrate_from_disk()
+        try:
+            blog.hydrate_from_disk()
+        except (MemoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+            blog.close()
+            try:
+                size = events_path.stat().st_size
+            except OSError:
+                size = 0
+            _branch_hydration_errors[bdir.name] = _hydration_detail(exc, size)
+            continue
+        _branch_hydration_errors.pop(bdir.name, None)
         # No status fix-up: with no live task/gate, derive_status reports a
         # non-terminal branch log as paused (resumable) automatically.
         _branches[bdir.name] = Branch(
@@ -2531,6 +2627,176 @@ def _spawn_sog(run: str, slot: str, model: str, which: str) -> dict[str, Any]:
     return _splat_sog_status(run, slot, model)
 
 
+# --- on-demand streamed-SOG (LOD) bundle -----------------------------------------
+# A single .sog is one request for the whole model; a STREAMED bundle is an octree
+# manifest plus per-LOD chunks the PlayCanvas engine pages in by camera distance
+# under a splat budget. Same on-demand, client-triggered lifecycle as the single
+# encode above (never on the Modal box) — the difference is only the tool and that
+# the output is a DIRECTORY, delivered over `/sog` (see app/api/sog.py).
+
+_LODSOG_TOOL = _REPO_ROOT / "client" / "tools" / "ply-to-lod-sog.mjs"
+
+_splat_lodsog_procs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+
+class LodSogRequest(BaseModel):
+    """Streamed-SOG bundling knobs (all optional; omitted → the tool's defaults).
+
+    `levels`/`ratio` only bite on the DECIMATE path — when a trainer-built ladder
+    (`<stem>.lodK.ply`, stage 7's `_export_lod`) sits beside the source PLY the
+    tool prefers it and derives the level count from that. `chunk_count` is the
+    Gaussians per octree chunk and `chunk_extent` its world size: smaller chunks
+    stream more granularly (finer refinement, more requests), larger ones amortize
+    round trips. `harmonics` strips SH bands above n (0 = flat colour), which is
+    free size on a degree-0 trained splat. `node_heap` raises the encoder child's
+    V8 heap in MB for many-million-Gaussian scenes."""
+
+    levels: int | None = None
+    ratio: float | None = None
+    chunk_count: int | None = None
+    chunk_extent: float | None = None
+    harmonics: int | None = None
+    node_heap: int | None = None
+
+
+def _lodsog_dir(run: str, slot: str, model: str, which: str) -> Path:
+    """Where one model's streamed bundle lives (`splat/trained.lodsog/`), holding
+    `lod-meta.json` beside its per-LOD chunk directories."""
+    return _sog_source_path(run, slot, model, which).with_suffix(".lodsog")
+
+
+def _lodsog_log_path(run: str, slot: str, model: str, which: str) -> Path:
+    return _slot_dir(run, slot, model) / "splat" / f"lodsog-{which}.log"
+
+
+def _lodsog_summary(manifest: Path) -> dict[str, Any] | None:
+    """What the bundle costs to stream, read off its manifest: LOD levels,
+    per-level Gaussian counts, and how many separate files a full refine fetches."""
+    try:
+        meta = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    counts = meta.get("counts") if isinstance(meta.get("counts"), list) else None
+    filenames = meta.get("filenames") if isinstance(meta.get("filenames"), list) else None
+    return {
+        "lod_levels": meta.get("lodLevels"),
+        "counts": counts,
+        "splats": counts[0] if counts else meta.get("count"),
+        "chunk_files": len(filenames) if filenames is not None else None,
+    }
+
+
+def _lodsog_builder_state(run: str, slot: str, model: str, which: str) -> dict[str, Any]:
+    """One model's bundle state: the manifest `url` to hand the viewer (once
+    built), whether its source .ply exists, the bundle summary, and the live child
+    status — mirrors `_sog_encoder_state`."""
+    src = _sog_source_path(run, slot, model, which)
+    manifest = _lodsog_dir(run, slot, model, which) / sog_delivery.MANIFEST_NAME
+    url = sog_delivery.url_for_path(manifest) or _artifact_url(manifest)
+    log_path = _lodsog_log_path(run, slot, model, which)
+    state: dict[str, Any] = {
+        "which": which, "url": url, "source_ready": src.is_file(),
+        "log_url": _artifact_url(log_path),
+        "summary": _lodsog_summary(manifest) if manifest.is_file() else None,
+        # A trainer-built ladder beside the source beats decimation, and the tool
+        # picks it up automatically — surfaced so the client can say which it used.
+        "ladder_levels": len(list(src.parent.glob(f"{src.stem}.lod*.ply"))),
+    }
+    rec = _splat_lodsog_procs.get((run, slot, model, which))
+    if rec is None:
+        state.update(status="done" if url else "idle", running=False, error=None)
+        return state
+    rc = rec["popen"].poll()
+    tail = _tail_text(log_path)
+    if rc is None:
+        state.update(status="running", running=True, pid=rec["popen"].pid,
+                     started_at=rec.get("started_at"), error=None, log_tail=tail)
+        return state
+    if rec.get("logf") is not None:
+        with contextlib.suppress(Exception):
+            rec["logf"].close()
+        rec["logf"] = None
+    rec["returncode"] = rc
+    if rc == 0 and url is not None:
+        state.update(status="done", running=False, error=None, log_tail=tail)
+    else:
+        # A non-zero exit is never reported as success, but say whether a manifest
+        # landed anyway: the bundler can be killed after writing a complete one (a
+        # stray console signal to the detached child does exactly that), and
+        # "exited with code N" alone leaves you guessing whether anything survived.
+        detail = (
+            " — a complete manifest is on disk, so the bundle may still be usable"
+            if url is not None else ""
+        )
+        state.update(status="error", running=False,
+                     error=f"lod-sog bundle exited with code {rc}{detail}", log_tail=tail)
+    return state
+
+
+def _splat_lodsog_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Both models' streamed-bundle state, keyed `builders.trained` /
+    `builders.healed`."""
+    return {
+        "run": run, "slot": slot, "model": model,
+        "builders": {
+            w: _lodsog_builder_state(run, slot, model, w) for w in ("trained", "healed")
+        },
+    }
+
+
+def _spawn_lodsog(
+    run: str, slot: str, model: str, which: str, req: LodSogRequest | None
+) -> dict[str, Any]:
+    """Bundle one model's .ply → a streamed-SOG directory on THIS host via
+    client/tools/ply-to-lod-sog.mjs, as a detached, polled child (same lifecycle
+    as `_spawn_sog`). The output dir is wiped first: a rebuild at a different
+    chunk size would otherwise leave the previous run's orphaned chunks behind,
+    which no manifest references but every byte count includes."""
+    src = _sog_source_path(run, slot, model, which)
+    if not src.is_file():
+        raise HTTPException(status_code=409, detail=f"{which}.ply not on disk — produce it first")
+    out_dir = _lodsog_dir(run, slot, model, which)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["node", str(_LODSOG_TOOL), str(src), str(out_dir)]
+    if req is not None:
+        if req.levels is not None:
+            cmd += ["--levels", str(max(2, min(int(req.levels), 8)))]
+        if req.ratio is not None:
+            cmd += ["--ratio", str(min(max(float(req.ratio), 0.05), 0.9))]
+        if req.chunk_count is not None:
+            cmd += ["--chunk-count", str(max(32, min(int(req.chunk_count), 65536)))]
+        if req.chunk_extent is not None:
+            cmd += ["--chunk-extent", str(min(max(float(req.chunk_extent), 0.5), 1000.0))]
+        if req.harmonics is not None:
+            cmd += ["--filter-harmonics", str(max(0, min(int(req.harmonics), 3)))]
+        if req.node_heap is not None:
+            cmd += ["--node-heap", str(max(512, min(int(req.node_heap), 65536)))]
+    log_path = _lodsog_log_path(run, slot, model, which)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logf = open(log_path, "wb")  # noqa: SIM115 - inherited by the child; closed on finish
+    logf.write(f"$ {' '.join(cmd)}\n\n".encode())
+    logf.flush()
+    kwargs: dict[str, Any] = {
+        # cwd under client/ so node resolves @playcanvas/splat-transform from
+        # client/node_modules.
+        "cwd": str(_REPO_ROOT / "client"),
+        "stdout": logf, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        kwargs["start_new_session"] = True
+    popen = subprocess.Popen(cmd, **kwargs)
+    _splat_lodsog_procs[(run, slot, model, which)] = {
+        "popen": popen, "logf": logf,
+        "started_at": datetime.now().isoformat(timespec="seconds"), "returncode": None,
+    }
+    return _splat_lodsog_status(run, slot, model)
+
+
 class ModalTrainRequest(BaseModel):
     """Remote-train knobs — ALL optional and ALL owned by the CLIENT. The server
     forwards whatever is set straight through to the Stage-6 trainer and injects
@@ -2565,12 +2831,38 @@ class ModalTrainRequest(BaseModel):
     # orientation, radius, full-precision colour and authored glass opacity).
     init: str | None = None
     restart: bool = False
-    # "train"    → Modal (re)plans cameras (stage 4) and OVERWRITES the local
-    #              plan, then renders + fine-tunes (stages 4-7).
-    # "continue" → use the LOCAL Stage-4 plan (splat/cameras.json) as-is; Modal
-    #              runs stages 5-7 only (render references → COLMAP → fine-tune →
-    #              heal). Requires a local camera plan.
-    mode: str = "train"
+    # --- REUSE: start the remote run from what the Volume already holds ---------
+    # Every stage's output persists on the Volume, so a re-run can start from any
+    # of them instead of redoing the expensive ones (stage 5 is hours; retraining
+    # is the thing we do over and over). These are independent switches, not a
+    # ladder — "push new meshes but keep the plan" is a real A/B — with one rule:
+    # reusing captures requires reusing the plan they were rendered from.
+    #   reuse_assets   — skip the input/GLB push; nothing local is read at all, so
+    #                    a cell whose local artifacts are gone still retrains.
+    #   reuse_cameras  — skip stage 4; stage 5 renders an already-planned camera set.
+    #   reuse_captures — skip stage 5 as well; train on the frames already rendered.
+    reuse_assets: bool = False
+    reuse_cameras: bool = False
+    reuse_captures: bool = False
+    # Whose stage-4 plan stage 5 renders once stage 4 is skipped: "volume" (the one
+    # already there) or "local" (upload `splat/cameras.json` — the old 'continue on
+    # modal'). Only meaningful while `reuse_cameras` is set and captures are being
+    # re-rendered; ignored otherwise.
+    plan_source: str = "volume"
+
+    def reuse_opts(self) -> dict[str, Any]:
+        """The normalized reuse selection the supervisor acts on. Captures can only
+        be reused together with the plan they were rendered from, and a plan source
+        means nothing when stage 5 isn't going to run."""
+        cameras = self.reuse_cameras or self.reuse_captures
+        return {
+            "reuse_assets": self.reuse_assets,
+            "reuse_cameras": cameras,
+            "reuse_captures": self.reuse_captures,
+            "local_plan": (
+                cameras and not self.reuse_captures and self.plan_source == "local"
+            ),
+        }
 
     def train_overrides(self) -> dict[str, Any]:
         """The set TrainParams overrides (drops unset fields so the server injects
@@ -2614,9 +2906,13 @@ def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
         return {
             **base, "status": "done" if url else "idle", "phase": None,
             "stage": None, "done": 0, "total": 0, "msg": None, "error": None,
-            "plan_pulled": cams_local, "refs_ready": False,
+            "lost_for": None, "plan_pulled": cams_local, "refs_ready": False,
         }
     hb = job.get("heartbeat") or {}
+    # While contact is lost the heartbeat is STALE, not gone — its stage/step stay
+    # so the panel still shows where the run got to, but the supervisor's message
+    # wins, or the frozen `loss=… it/s` line would read as live progress.
+    lost_for = job.get("lost_for")
     return {
         **base,
         "status": job.get("status", "running"),
@@ -2624,7 +2920,8 @@ def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
         "stage": hb.get("stage"),
         "done": int(hb.get("done", 0) or 0),
         "total": int(hb.get("total", 0) or 0),
-        "msg": hb.get("msg") or job.get("msg"),
+        "msg": job.get("msg") if lost_for else (hb.get("msg") or job.get("msg")),
+        "lost_for": lost_for,
         "call_id": job.get("call_id"),
         "error": job.get("error"),
         "started_at": job.get("started_at"),
@@ -2635,15 +2932,85 @@ def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
     }
 
 
+async def _modal_remote_state(
+    run: str, slot: str, model: str, refresh: bool = False
+) -> dict[str, Any]:
+    """What this cell's Modal Volume already holds, per reusable stage (see
+    `modal_sync.remote_cell_state`), memoized for `_MODAL_STATE_TTL_S`."""
+    key = (run, slot, model)
+    hit = _splat_modal_state.get(key)
+    if not refresh and hit is not None and time.monotonic() - hit[0] < _MODAL_STATE_TTL_S:
+        return hit[1]
+    state = await asyncio.to_thread(
+        splat_modal.remote_cell_state, _slot_dir(run, slot, model)
+    )
+    _splat_modal_state[key] = (time.monotonic(), state)
+    return state
+
+
+def _modal_reuse_local(run: str, slot: str, model: str, state: dict[str, Any]) -> dict[str, Any]:
+    """The LOCAL half of a reuse decision: whether there is a local camera plan to
+    render instead of the Volume's, and whether anything here has MOVED ON since
+    the push the Volume holds.
+
+    Reuse deliberately bypasses the container's signature checks, so the client has
+    to be able to say what changed — but not at the price of re-hashing a gigabyte
+    of mesh tier. Both signals are therefore stat-only: mtimes against the
+    manifest's `pushed_at`, and the recorded tier dir against the cell's current
+    asset selection (switching generated↔library is the silent one — the Volume's
+    captures are of the OTHER mesh set entirely)."""
+    d = _slot_dir(run, slot, model) / "splat"
+    inputs = state.get("inputs") or {}
+    cut: float | None = None
+    if inputs.get("pushed_at"):
+        with contextlib.suppress(ValueError, TypeError):
+            cut = datetime.fromisoformat(inputs["pushed_at"]).timestamp()
+    stale: list[str] = []
+    source = _splat_source(run, slot, model)
+    if cut is not None:
+        for label, p in (
+            ("free-space grid", _freespace_path(run, slot, model)),
+            ("skin sidecar", d / "freespace.npz.skin.npy"),
+            ("surfel cloud", _cloud_path(run, slot, model)),
+            ("scene manifest", d / splat_stage1.MANIFEST_NAME),
+        ):
+            if p.is_file() and p.stat().st_mtime > cut:
+                stale.append(label)
+        if source is not None:
+            newest = max(
+                (
+                    q.stat().st_mtime
+                    for q in source[0].glob("*.glb")
+                    if not q.name.endswith(".raw.glb")
+                ),
+                default=0.0,
+            )
+            if newest > cut:
+                stale.append("meshes")
+    tier_dir = inputs.get("tier_dir")
+    return {
+        "plan": _cameras_path(run, slot, model).is_file(),
+        "stale": stale,
+        "tier_dir": source[0].name if source is not None else None,
+        "tier_mismatch": bool(
+            tier_dir and source is not None and source[0].name != tier_dir
+        ),
+    }
+
+
 async def _run_splat_modal_cell(
     run: str, slot: str, model: str, opts: dict[str, Any],
     *, attach_call_id: str | None = None,
 ) -> None:
-    """Supervise ONE cell's remote train: push stage-1-3 inputs → spawn
-    `run_cell(4,5,6)` → stream heartbeat → pull `trained.ply`. Every Modal SDK
-    call (blocking network I/O) runs in a worker thread so the event loop stays
-    free; the artifacts land in the cell's local `splat/` dir exactly where the
-    Stage-6 status + viewer read them.
+    """Supervise ONE cell's remote train: push stage-1-3 inputs → spawn `run_cell`
+    over the reuse-derived stage window → stream heartbeat → pull `trained.ply`.
+    Every Modal SDK call (blocking network I/O) runs in a worker thread so the
+    event loop stays free; the artifacts land in the cell's local `splat/` dir
+    exactly where the Stage-6 status + viewer read them.
+
+    `opts` carries the normalized reuse selection (`ModalTrainRequest.reuse_opts`),
+    which decides two things: whether the push happens at all, and which stage the
+    remote window starts at.
 
     `attach_call_id` RE-ATTACHES to a container a previous process already
     spawned (the sticky hook after a server restart — see `_reattach_modal_job`):
@@ -2652,7 +3019,10 @@ async def _run_splat_modal_cell(
     supervisor picks the run back up without launching a duplicate."""
     key = (run, slot, model)
     job = _splat_modal_jobs[key]
-    continue_mode = (opts.get("mode") or "train") == "continue"
+    reuse_assets = bool(opts.get("reuse_assets"))
+    reuse_cameras = bool(opts.get("reuse_cameras"))
+    reuse_captures = bool(opts.get("reuse_captures"))
+    local_plan = bool(opts.get("local_plan"))
     try:
         if splat_modal is None:
             raise RuntimeError(
@@ -2661,39 +3031,50 @@ async def _run_splat_modal_cell(
             )
         cell_dir = _slot_dir(run, slot, model)
         if attach_call_id is None:
-            # Gate: the remote pipeline consumes the local stage-2/3 outputs (and,
-            # for 'continue', the local stage-4 camera plan it renders from).
-            needed = {
-                "free-space grid (Stage 2)": _freespace_path(run, slot, model),
-                "skin sidecar (Stage 2)": cell_dir / "splat" / "freespace.npz.skin.npy",
-                "surfel cloud (Stage 3)": _cloud_path(run, slot, model),
-                "scene manifest (Stage 1)": cell_dir / "splat" / splat_stage1.MANIFEST_NAME,
-            }
-            if continue_mode:
-                needed["camera plan (Stage 4)"] = _cameras_path(run, slot, model)
-            missing = [name for name, p in needed.items() if not p.is_file()]
-            if missing:
-                lo = 4 if continue_mode else 3
-                raise RuntimeError(
-                    f"run stages 1-{lo} locally first — missing: {', '.join(missing)}"
-                )
-            tier_dir = await _ensure_splat_tier(run, slot, model, job)
+            if reuse_assets:
+                # No push: the identity block `run_cell` needs comes off the
+                # Volume's own inputs manifest, so this path reads NOTHING local —
+                # it skips hashing the tier, listing the CAS and the upload
+                # transaction, and works even if the cell's local splat/ dir is gone.
+                job["phase"] = "push"
+                job["msg"] = "reusing the volume's inputs…"
+                pushed = await asyncio.to_thread(splat_modal.remote_pushed, cell_dir)
+                if local_plan:
+                    await asyncio.to_thread(splat_modal.push_cameras, cell_dir)
+            else:
+                # Gate: the remote pipeline consumes the local stage-2/3 outputs
+                # (and, when rendering the LOCAL plan, the stage-4 plan as well).
+                needed = {
+                    "free-space grid (Stage 2)": _freespace_path(run, slot, model),
+                    "skin sidecar (Stage 2)": cell_dir / "splat" / "freespace.npz.skin.npy",
+                    "surfel cloud (Stage 3)": _cloud_path(run, slot, model),
+                    "scene manifest (Stage 1)": cell_dir / "splat" / splat_stage1.MANIFEST_NAME,
+                }
+                if local_plan:
+                    needed["camera plan (Stage 4)"] = _cameras_path(run, slot, model)
+                missing = [name for name, p in needed.items() if not p.is_file()]
+                if missing:
+                    lo = 4 if local_plan else 3
+                    raise RuntimeError(
+                        f"run stages 1-{lo} locally first — missing: {', '.join(missing)}"
+                    )
+                tier_dir = await _ensure_splat_tier(run, slot, model, job)
 
-            job["phase"] = "push"
-            job["msg"] = "uploading inputs (deduped)…"
-            pushed = await asyncio.to_thread(
-                splat_modal.push_cell, cell_dir, tier_dir, True, continue_mode
-            )
+                job["phase"] = "push"
+                job["msg"] = "uploading inputs (deduped)…"
+                pushed = await asyncio.to_thread(
+                    splat_modal.push_cell, cell_dir, tier_dir, True, local_plan
+                )
 
             job["phase"] = "spawn"
             job["msg"] = "spawning the GPU job…"
             trainer = (opts.get("trainer") or "brush")
-            # 'continue' feeds the LOCAL plan and skips stage 4; 'train' (re)plans
-            # on the GPU box. Stage 7 (heal/compact) is the GSPLAT path's delivery
-            # step — it re-optimizes through that rasterizer — so the Brush window
-            # stops at 6, which quantizes its own `.sqz` in place of it.
+            # The window starts at the first stage NOT being reused. Stage 7
+            # (heal/compact) is the GSPLAT path's delivery step — it re-optimizes
+            # through that rasterizer — so the Brush window stops at 6, which
+            # quantizes its own `.sqz` in place of it.
             last = 6 if trainer == "brush" else 7
-            first = 5 if continue_mode else _MODAL_STAGES[0]
+            first = 6 if reuse_captures else 5 if reuse_cameras else _MODAL_STAGES[0]
             stages = list(range(first, last + 1))
             # Forward the client's overrides VERBATIM — the server adds nothing.
             call_id = await asyncio.to_thread(
@@ -2701,6 +3082,13 @@ async def _run_splat_modal_cell(
                 None, dict(opts.get("train") or {}), None,
                 bool(opts.get("restart")), trainer, dict(opts.get("brush") or {}),
             )
+            # Reusing the Volume's plan: land it locally NOW rather than waiting for
+            # the mid-run pull, so the camera overlay shows the plan this render is
+            # actually consuming (the local copy was just cleared as a stale artifact).
+            if reuse_cameras and not local_plan:
+                with contextlib.suppress(Exception):
+                    if await asyncio.to_thread(splat_modal.pull_plan, cell_dir):
+                        job["plan_pulled"] = True
         else:
             # Re-attach: adopt the call the prior process spawned; the job record
             # on disk (splat/modal-job.json) already holds it, so nothing to push.
@@ -2709,7 +3097,8 @@ async def _run_splat_modal_cell(
         job["phase"] = "run"
         job["msg"] = (
             "re-attached — streaming remote progress…" if attach_call_id
-            else "rendering references…" if continue_mode
+            else "training on the reused captures…" if reuse_captures
+            else "rendering references…" if reuse_cameras
             else "planning cameras…"
         )
 
@@ -2721,21 +3110,47 @@ async def _run_splat_modal_cell(
         # boundary, and the heartbeat `stage` marks which stage is now live
         # (plan → refs → train → done), so `stage` past "plan" means the camera
         # plan is on the Volume.
+        lost_since: float | None = None
         while True:
             if key not in _splat_modal_jobs:
                 return  # cell closed / job cleared — stop supervising
             st = await asyncio.to_thread(splat_modal.job_status, cell_dir)
+            # A poll that couldn't REACH Modal says nothing about the run: the
+            # container never learns our RPC dropped, so it keeps training and
+            # keeps billing. Hold the job open and retry rather than ending it
+            # over a lost packet; only a sustained blackout counts as a failure.
+            # Nothing below runs on this path — the heartbeat is stale rather
+            # than absent (kept, so the panel still shows where the run got to)
+            # and every progressive pull would fail the same way.
+            if st.get("state") == "unreachable":
+                now = time.monotonic()
+                if lost_since is None:
+                    lost_since = now
+                lost_for = now - lost_since
+                if lost_for > _MODAL_LOST_GIVEUP_S:
+                    raise RuntimeError(
+                        f"no contact with Modal for {lost_for / 60:.0f} min "
+                        f"({st.get('error')}) — the container may still be running; "
+                        "reopen the cell to re-attach to it"
+                    )
+                job["lost_for"] = int(lost_for)
+                job["msg"] = (
+                    f"lost contact with Modal {int(lost_for)}s ago "
+                    f"({st.get('error')}) — the run continues; retrying"
+                )
+                await asyncio.sleep(_MODAL_LOST_POLL_S)
+                continue
+            lost_since = None
+            job["lost_for"] = None
             job["heartbeat"] = st.get("heartbeat")
             hb_stage = (st.get("heartbeat") or {}).get("stage")
-            # Stage 4 done → pull JUST the small camera-plan artifact
-            # (cameras.json — `include_ply=False`, so no plys and never the
+            # Stage 4 done → pull JUST the camera plan (never the plys, never the
             # multi-GB refs). Guarded so it fires once; the final pull is the
-            # backstop if the heartbeat was missed. (In 'continue' mode the plan
-            # is already local; this pulls back the byte-identical copy.)
+            # backstop if the heartbeat was missed. (When the render consumed a
+            # LOCAL plan this pulls back the byte-identical copy.)
             if not job.get("plan_pulled") and hb_stage in ("refs", "train", "done"):
                 with contextlib.suppress(Exception):
-                    await asyncio.to_thread(splat_modal.pull_cell, cell_dir, False, True)
-                    if _cameras_path(run, slot, model).is_file():
+                    if await asyncio.to_thread(splat_modal.pull_plan, cell_dir):
                         job["plan_pulled"] = True
                         job["msg"] = "cameras ready — training; camera positions viewable"
             # Stage 5 done → the references exist on the Volume (kept there — too
@@ -2788,6 +3203,9 @@ async def _run_splat_modal_cell(
         job["running"] = False
         job["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _splat_modal_tasks.pop(key, None)
+        # The run moved what the Volume holds (new plan / captures / model), so the
+        # next reuse panel read must go back to the Volume rather than the TTL copy.
+        _splat_modal_state.pop(key, None)
 
 
 # Downstream (Stage 4-7) artifacts a Modal train produces + pulls back — the set
@@ -2833,6 +3251,11 @@ def _clear_modal_artifacts(
         for p in d.glob(pat):
             with contextlib.suppress(OSError):
                 p.unlink()
+    # Streamed-SOG bundles are DIRECTORIES, so they need a tree removal rather
+    # than the unlink above — and a stale one from the previous train would keep
+    # serving that model's chunks under the new run's URL.
+    for p in d.glob("*.lodsog"):
+        shutil.rmtree(p, ignore_errors=True)
     shutil.rmtree(d / splat_stage5.REFS_DIRNAME / "samples", ignore_errors=True)
     if drop_job_record:
         (d / "modal-job.json").unlink(missing_ok=True)  # forced spawn writes a fresh one
@@ -3673,12 +4096,16 @@ def _plan_payload(
 
 
 def _clear_tour_renders(run: str, slot: str, model: str) -> None:
-    """Drop a previous capture's RENDER outputs (panos / minimaps / proxy /
-    tour.json) while KEEPING the anchor plan — re-rendering must never throw away
-    the plan it renders from."""
+    """Drop a previous capture's RENDER outputs (panos / object-ID masks /
+    minimaps / proxy / tour.json) while KEEPING the anchor plan — re-rendering must
+    never throw away the plan it renders from."""
     tour_dir = _cell_tour_dir(run, slot, model)
     tour_dir.mkdir(parents=True, exist_ok=True)
-    for p in (*tour_dir.glob("*.jpg"), *tour_dir.glob("minimap-*.png")):
+    for p in (
+        *tour_dir.glob("*.jpg"),
+        *tour_dir.glob("*.sid"),
+        *tour_dir.glob("minimap-*.png"),
+    ):
         p.unlink(missing_ok=True)
     for name in ("proxy.glb", "tour.json"):
         (tour_dir / name).unlink(missing_ok=True)
@@ -3958,6 +4385,9 @@ def create_app() -> FastAPI:
     # The experimental one-shot track (single-call scene design, own slots/
     # models/prompt) — fully isolated under /oneshot; see app/oneshot/.
     app.include_router(oneshot.router)
+    # SOG splat delivery (catalog + range/validator/cache-aware bytes + network
+    # shaping) — everything under /sog; see app/api/sog.py.
+    app.include_router(sog_delivery.router)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
     @app.get("/artifacts/{artifact_path:path}")
@@ -4062,14 +4492,33 @@ def create_app() -> FastAPI:
         return {"current": name}
 
     @app.post("/runs/{name}/hydrate")
-    async def hydrate_run(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    async def hydrate_run(name: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Load a run's SlotLogs into memory WITHOUT activating it, so its
         cells' /scene + /meshes become readable alongside the active run — the
-        run-compare view reads a SECOND run next to run A."""
+        run-compare view reads a SECOND run next to run A.
+
+        Also the RETRY for any cell an earlier pass skipped: its recorded failure
+        is cleared first, so a cell that lost a race for memory gets another go.
+        Returns how many cells are loaded and which remain unavailable, with why —
+        on a run whose logs outweigh RAM that list is the useful answer, not an
+        error."""
         if not _run_dir(name).is_dir():
             raise HTTPException(status_code=404, detail=f"unknown run: {name}")
+        for key in [k for k in _cell_hydration_errors if k[0] == name]:
+            _cell_hydration_errors.pop(key, None)
+        _branch_hydration_errors.clear()
         _ensure_run_hydrated(name)
-        return {"run": name}
+        unavailable = {
+            f"{k[1]}/{k[2]}": v for k, v in _cell_hydration_errors.items() if k[0] == name
+        }
+        unavailable.update(
+            {f"branch {bid}": why for bid, why in _branch_hydration_errors.items()}
+        )
+        return {
+            "run": name,
+            "loaded": sum(1 for k in _slot_logs if k[0] == name),
+            "unavailable": unavailable,
+        }
 
     @app.get("/prompt-runs")
     async def prompt_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -4788,8 +5237,8 @@ def create_app() -> FastAPI:
         the renderer."""
         state = _stage5_state_for(run, slot, model, token)
         body = await request.body()
-        # The page compresses the ~6 MB/view payload client-side so it doesn't pace the
-        # single-threaded ingest; inflate off the loop back to the byte-identical SRF1.
+        # Two framings: SZC1 = gzip-wrapped raw planes, inflated off the loop;
+        # SRF1 = raw planes as-is.
         if body[:4] == refcapture.FRAME_BATCH_GZIP_MAGIC:
             body = await asyncio.to_thread(refcapture.decompress_frame_batch, body)
         try:
@@ -4799,16 +5248,18 @@ def create_app() -> FastAPI:
         state["last_frame_at"] = time.monotonic()
         state["got_frames"] = True
         job = _splat_stage5_jobs.get((run, slot, model))
-        batch: list[tuple[str, int, int, int]] = []
-        for vid, resolution, rgba_off, depth_off in frames:
-            if resolution != state["resolution"]:
+        batch: list[tuple] = []
+        for entry in frames:
+            vid = entry[0]
+            # The framing carries the resolution — cross-check it against the plan.
+            if entry[1] != state["resolution"]:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"{vid}: resolution {resolution} != plan {state['resolution']}",
+                    detail=f"{vid}: resolution {entry[1]} != plan {state['resolution']}",
                 )
             if vid not in state["pending"]:
                 continue  # duplicate of an already-encoded view (page retry) — skip
-            batch.append((vid, resolution, rgba_off, depth_off))
+            batch.append(entry)
         if batch:
             # The whole POST batch goes to the pool as ONE task, body untouched:
             # descriptors only on the event loop, pixel slicing in the worker —
@@ -4966,6 +5417,9 @@ def create_app() -> FastAPI:
             "planned": planned,
             "captured": tour_json.is_file(),
             "panos": len(sorted(tour_dir.glob("*.jpg"))),
+            # One object-ID mask per pano; a count below `panos` means the cell was
+            # captured before masks existed (or with them disabled).
+            "masks": len(sorted(tour_dir.glob("*.sid"))),
             "minimaps": len(sorted(tour_dir.glob("minimap-*.png"))),
             "proxy": (tour_dir / "proxy.glb").is_file(),
             "published": preview.is_file(),
@@ -5127,6 +5581,23 @@ def create_app() -> FastAPI:
         _tour_beat(run, slot_id, model_alias)
         return {"ok": True}
 
+    @app.put("/slots/{slot_id}/{model_alias}/tour/mask/{mask_id}")
+    async def tour_mask(slot_id: str, model_alias: str, mask_id: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        # One per-pixel object-ID mask per anchor — a SID1 container (byte layout
+        # documented in client/public/js/idmask.js) written beside its pano as
+        # `{anchor}.sid`, so it resolves like a pano filename for the viewer.
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty mask body")
+        tour_dir = _cell_tour_dir(run, slot_id, model_alias)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(mask_id).name  # defend against path traversal
+        (tour_dir / f"{stem}.sid").write_bytes(body)
+        _tour_beat(run, slot_id, model_alias)
+        return {"ok": True}
+
     @app.put("/slots/{slot_id}/{model_alias}/tour/minimap/{minimap_id}")
     async def tour_minimap(slot_id: str, model_alias: str, minimap_id: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
         # One top-down bird's-eye slice per Y level, stored beside the panos as a
@@ -5243,7 +5714,27 @@ def create_app() -> FastAPI:
             "namer_model": state["namer_model"],
             "planner_reasoning": state["planner_reasoning"],
             # High-res 360 capture: 6 cube faces at `face_size`² → equirect `width`.
+            # `face_size`/`width` apply only when masks are OFF; with masks on the
+            # capture derives both from the mask geometry below so the photo and the
+            # mask are rasterized identically (see `mask`).
             "pano": {"face_size": 1024, "width": 4096, "quality": 0.92},
+            # Per-pixel object-ID mask per anchor: the same six faces flat-shaded
+            # by object id, resolved to `width`×`width`/2 and stored as one SID1
+            # container beside the pano (client/public/js/idmask.js). This is what
+            # the walkthrough hovers and highlights against, instead of raycasting
+            # the decimated projection proxy.
+            #
+            # `supersample` is the edge-quality knob, NOT `width`: ids can't be
+            # antialiased, so the faces are rendered at width/4 × supersample and
+            # each mask texel keeps the fraction of samples its winning id took.
+            # Widening the equirect past width/4 only upsamples the same hard raster.
+            #
+            # This geometry drives the PANO too. Sharing a camera doesn't make a mask
+            # line up with a photo — an edge sits where the raster puts it — so the
+            # colour pass renders the same face size and box-averages the same
+            # sample footprint the ID pass votes on. Raising `supersample` therefore
+            # costs 4x the pixels on the expensive (lit + OIT) pass as well.
+            "mask": {"enabled": True, "width": 4096, "supersample": 2},
             "minimap": {"res": 1024, "level_eps": 1.5, "pad_frac": 0.04, "slice_below": 2.0},
         }
 
@@ -5377,40 +5868,117 @@ def create_app() -> FastAPI:
         status + the `.sog` url once encoded). See `_splat_sog_status`."""
         return _splat_sog_status(run, slot, model)
 
+    @app.post("/runs/{run}/splat/lodsog/{slot}/{model}")
+    async def splat_lodsog_build(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, which: str = "trained",
+        body: LodSogRequest | None = None,
+    ) -> dict[str, object]:
+        """Bundle the chosen model (`?which=trained|healed`, default trained) into a
+        STREAMED-SOG bundle via client/tools/ply-to-lod-sog.mjs — an octree
+        manifest plus per-LOD chunks the viewer pages in by camera distance,
+        instead of the single whole-model `.sog` the /splat/sog route encodes.
+        Detached child on THIS host, never on the Modal pipeline. Optional body:
+        `levels`/`ratio`/`chunk_count`/`chunk_extent`/`harmonics`/`node_heap`
+        (see `LodSogRequest`). Idempotent while building (returns the live job);
+        poll GET for progress and the manifest url to hand the viewer."""
+        if which not in ("trained", "healed"):
+            raise HTTPException(status_code=400, detail="which must be 'trained' or 'healed'")
+        key = (run, slot, model, which)
+        rec = _splat_lodsog_procs.get(key)
+        if rec is not None and rec["popen"].poll() is None:
+            return _splat_lodsog_status(run, slot, model)  # already bundling this model
+        if rec is not None and rec.get("logf") is not None:
+            with contextlib.suppress(Exception):
+                rec["logf"].close()
+        return _spawn_lodsog(run, slot, model, which, body)
+
+    @app.get("/runs/{run}/splat/lodsog/{slot}/{model}")
+    async def splat_lodsog_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Both models' streamed-SOG bundle state (`builders.trained` /
+        `builders.healed`: status, the manifest url, and the LOD summary once
+        built). See `_splat_lodsog_status`."""
+        return _splat_lodsog_status(run, slot, model)
+
     @app.post("/runs/{run}/splat/modal/{slot}/{model}")
     async def splat_modal_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: ModalTrainRequest | None = None
     ) -> dict[str, object]:
-        """Splat ONE cell on the Modal GPU box, in one of two modes (body `mode`):
+        """Splat ONE cell on the Modal GPU box, over the stage window the body's
+        REUSE selection implies (see `ModalTrainRequest`):
 
-          * "train" (default) — Modal (re)plans cameras (stage 4) and OVERWRITES
-            the local plan, then renders references, builds the COLMAP model, and
-            fine-tunes (stages 4-7). Needs the local Stage 1-3 outputs.
-          * "continue" — use the LOCAL Stage-4 plan (`splat/cameras.json`) as-is;
-            Modal runs stages 5-7 only (references → COLMAP → 2DGS fine-tune →
-            heal). Needs a local camera plan (run Stage 4 here first).
+          * nothing reused (default) — push the inputs, then plan cameras, render
+            references, build the COLMAP model and fine-tune (stages 4-7). Needs
+            the local Stage 1-3 outputs.
+          * `reuse_assets` — same window, but the Volume's existing inputs are used
+            as-is: no tier hashing, no CAS listing, no upload.
+          * `reuse_cameras` — stages 5-7, rendering an already-planned camera set:
+            the Volume's, or (`plan_source: "local"`) the local `splat/cameras.json`
+            uploaded on its own.
+          * `reuse_captures` — stages 6-7, training straight onto the reference
+            frames already rendered. This is the retrain loop, and the only path
+            that needs nothing local at all.
 
         `trained.ply` is pulled back so the viewer's 'trained' toggle lights up.
-        This button is an explicit FRESH, FORCED restart: it cancels any train
-        already running for the cell, deletes the previous run's downstream local
-        artifacts (`_clear_modal_artifacts` — 'continue' KEEPS the local plan),
-        and spawns a from-scratch remote run (force). CONTINUING a still-running
-        train is the job of the AUTOMATIC paths (startup scan + status-poll
-        reattach hook), never this button. Async — poll the GET (or the cells
-        list's per-cell `modal` field) for the live phase + training step."""
+        This button is an explicit FRESH, FORCED restart of the stages IN the
+        window: it cancels any train already running for the cell, deletes that
+        cell's downstream local artifacts (`_clear_modal_artifacts`), and forces
+        the window to re-run rather than serve a cached signature match. Stages
+        BELOW the window are never touched — that is what makes reuse safe.
+        CONTINUING a still-running train is the job of the AUTOMATIC paths
+        (startup scan + status-poll reattach hook), never this button. Async —
+        poll the GET (or the cells list's per-cell `modal` field) for the live
+        phase + training step."""
         if splat_modal is None:
             raise HTTPException(
                 status_code=503,
                 detail="the Modal SDK isn't available on this server host",
             )
-        mode = (body.mode if body is not None else "train") or "train"
-        if mode not in ("train", "continue"):
-            raise HTTPException(status_code=400, detail=f"unknown mode {mode!r}")
-        if mode == "continue" and not _cameras_path(run, slot, model).is_file():
+        body = body or ModalTrainRequest()
+        if body.plan_source not in ("volume", "local"):
+            raise HTTPException(
+                status_code=400, detail=f"unknown plan_source {body.plan_source!r}"
+            )
+        reuse = body.reuse_opts()
+        # Validate every reuse against what is ACTUALLY there before tearing the
+        # cell down, so a stale panel can't strand it: a fresh read (not the TTL
+        # copy) is a handful of small requests against one launch.
+        if reuse["local_plan"] and not _cameras_path(run, slot, model).is_file():
             raise HTTPException(
                 status_code=409,
-                detail="no local camera plan — run Stage 4 first, or use train mode",
+                detail="no local camera plan — run Stage 4 first, or set "
+                       "plan_source to 'volume'",
             )
+        if any(reuse[k] for k in ("reuse_assets", "reuse_cameras", "reuse_captures")):
+            try:
+                state = await _modal_remote_state(run, slot, model, refresh=True)
+            except Exception as exc:  # noqa: BLE001 - volume/credential failure
+                raise HTTPException(
+                    status_code=502, detail=f"could not read the volume: {exc}"
+                ) from exc
+            missing = ", ".join((state.get("inputs") or {}).get("missing") or [])
+            if reuse["reuse_assets"] and not state["inputs"]["available"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="this cell's inputs are not on the volume"
+                           + (f" (missing {missing})" if missing else "")
+                           + " — run once without reusing assets first",
+                )
+            # Only a requirement when stage 5 is going to READ the plan: reusing the
+            # captures skips that stage, so a retrain must not be blocked on it.
+            if (
+                reuse["reuse_cameras"] and not reuse["reuse_captures"]
+                and not reuse["local_plan"] and not state["cameras"]["available"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="no camera plan on the volume — run Stage 4 on Modal "
+                           "first, or render the local plan instead",
+                )
+            if reuse["reuse_captures"] and not state["captures"]["available"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="no captures on the volume — run Stage 5 on Modal first",
+                )
         key = (run, slot, model)
         # The MANUAL button is an explicit FRESH, FORCED restart — distinct from
         # the AUTOMATIC paths (startup scan + the status-poll `_reattach_modal_job`
@@ -5435,17 +6003,21 @@ def create_app() -> FastAPI:
         # Explicit restart = clean slate: drop every previous-run artifact locally
         # (incl. modal-job.json — the forced spawn writes a new one) so nothing old
         # lingers to confuse old-vs-new. Runs AFTER cancel_cell, which needs the
-        # old modal-job.json to terminate the prior container. 'continue' KEEPS the
-        # local camera plan — it's the input the remote render consumes.
+        # old modal-job.json to terminate the prior container. Rendering the LOCAL
+        # plan KEEPS it — it's the input that render consumes; every other path
+        # takes its plan from the Volume and re-pulls it.
         _clear_modal_artifacts(
-            run, slot, model, drop_job_record=True, keep_plan=(mode == "continue")
+            run, slot, model, drop_job_record=True, keep_plan=reuse["local_plan"]
         )
+        # The run is about to change what the Volume holds, so the memoized view of
+        # it is stale from here on.
+        _splat_modal_state.pop(key, None)
         opts = {
-            "trainer": (body.trainer if body is not None else None) or "brush",
-            "train": body.train_overrides() if body is not None else {},
-            "brush": body.brush_overrides() if body is not None else {},
-            "restart": True,  # explicit button press = force fresh
-            "mode": mode,
+            "trainer": body.trainer or "brush",
+            "train": body.train_overrides(),
+            "brush": body.brush_overrides(),
+            "restart": True,  # explicit button press = force the window fresh
+            **reuse,
         }
         _splat_modal_jobs[key] = {
             "status": "running", "running": True, "phase": "start",
@@ -5467,6 +6039,34 @@ def create_app() -> FastAPI:
         # after startup), re-hook it on poll. Idempotent + cheap once tracked.
         await _reattach_modal_job(run, slot, model)
         return _splat_modal_status(run, slot, model)
+
+    @app.get("/runs/{run}/splat/modal-state/{slot}/{model}")
+    async def splat_modal_state(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, refresh: bool = False
+    ) -> dict[str, object]:
+        """What this cell already has ON the Modal Volume, per reusable stage —
+        `inputs` (pushed at / tier dir / mesh count), `cameras`, `captures`,
+        `trained`, `healed`, each with `available` plus the stage summary and
+        completion time the container recorded. `local` carries the other half of
+        the decision: whether a local camera plan exists to render instead, and
+        which local inputs have changed since that push (`stale`, `tier_mismatch`)
+        — reuse skips the container's signature checks, so those are the warnings.
+
+        Costs a few Volume round trips, so it is memoized for 30s and meant to be
+        fetched on demand (cell open, after a run, `?refresh=1`) rather than on the
+        cells poll."""
+        if splat_modal is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the Modal SDK isn't available on this server host",
+            )
+        try:
+            state = await _modal_remote_state(run, slot, model, refresh)
+        except Exception as exc:  # noqa: BLE001 - volume/credential errors → 502
+            raise HTTPException(
+                status_code=502, detail=f"{type(exc).__name__}: {exc}"
+            ) from exc
+        return {**state, "local": _modal_reuse_local(run, slot, model, state)}
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -7904,8 +8504,22 @@ def _require_model(model_alias: str) -> None:
 def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
     _require_slot(slot_id)
     _require_model(model_alias)
-    log = _slot_logs.get((run, slot_id, model_alias))
+    key: RunKey = (run, slot_id, model_alias)
+    log = _slot_logs.get(key)
     if log is None:
+        # A cell hydration SKIPPED is a different thing from a cell that was never
+        # run — say which, because "no run for …" sends you looking for a missing
+        # run rather than at a log that won't fit in memory.
+        error = _cell_hydration_errors.get(key)
+        if error is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"cell {run}/{slot_id}/{model_alias} could not be loaded: {error}. "
+                    f"Other cells in this run are unaffected; POST /runs/{run}/hydrate "
+                    "to retry it."
+                ),
+            )
         raise HTTPException(
             status_code=404,
             detail=f"no run for run={run} slot={slot_id} model={model_alias}",

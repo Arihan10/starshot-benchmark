@@ -36,8 +36,10 @@ IDEMPOTENT / RESUMABLE: `run_cell` skips any stage whose recorded input
 signature (content hashes + params) matches and whose artifacts exist —
 re-running with new train params re-uses the refs; a preempted container
 resumes stage 5 from the frames on the Volume and stage 6 from its checkpoint
-(written straight to the Volume). Live progress streams through a
-`modal.Dict` heartbeat ("starshot-splat-status", keyed `{run}/{slot}/{model}`).
+(written straight to the Volume). `force` is INVALIDATE-ONCE (see `run_cell`),
+so a preemption RETRY of a forced run resumes rather than starting over. Live
+progress streams through a `modal.Dict` heartbeat ("starshot-splat-status",
+keyed `{run}/{slot}/{model}`).
 
 PYTHON PIN: the image runs Python 3.10 because the pinned `gsplat 1.5.3`
 prebuilt wheel (pt24cu124) is cp310-only — no CUDA toolchain in the image, no
@@ -53,6 +55,8 @@ import hashlib
 import json
 import shutil
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -239,6 +243,11 @@ image = (
     .add_local_file(
         _REPO / "client/public/js/reflective.js", f"{_ASSETS}/js/reflective.js"
     )
+    # transmissive.js is oit.js's transparency discriminator — a MISSING file here
+    # 404s the module graph and renders zero frames, so it must ship with oit.js.
+    .add_local_file(
+        _REPO / "client/public/js/transmissive.js", f"{_ASSETS}/js/transmissive.js"
+    )
     .add_local_file(
         _REPO / "client/public/js/oit.js", f"{_ASSETS}/js/oit.js"
     )
@@ -247,6 +256,14 @@ image = (
     )
     .add_local_file(
         _REPO / "client/public/js/emissive.js", f"{_ASSETS}/js/emissive.js"
+    )
+    # idmask.js is pulled in by capturecore.js (the tour's per-pixel object-ID
+    # materials). Stage 5 never renders an ID mask, but it imports the module graph
+    # that references it, and a `type="module"` script whose graph 404s fails
+    # SILENTLY — the page loads, evaluates nothing, and the host sees only a boot
+    # timeout with no error. That cost a full watchdog cycle to diagnose once.
+    .add_local_file(
+        _REPO / "client/public/js/idmask.js", f"{_ASSETS}/js/idmask.js"
     )
     .add_local_file(
         _REPO / "client/public/js/splatlight.js", f"{_ASSETS}/js/splatlight.js"
@@ -315,22 +332,48 @@ def _ensure_input(inputs: Path, name: str, sha: str, scratch: Path) -> Path:
     return out
 
 
-def _sync_dir(src: Path, dst: Path) -> int:
+def _sync_dir(
+    src: Path,
+    dst: Path,
+    progress: Callable[[int, int, str], None] | None = None,
+    jobs: int = 16,
+) -> int:
     """Copy files missing (or size-changed) from `src` into `dst`, recursively.
-    Returns the number of files copied. Both sides keep their extras."""
-    copied = 0
+    Returns the number of files copied. Both sides keep their extras.
+
+    THREADED AND REPORTED, because in one direction this moves a cell's entire
+    reference set between the Volume and local scratch — 32k SZF frames / 23 GB is
+    an ordinary big plan. A serial `shutil.copyfile` loop over the network-backed
+    mount is bound by per-file latency rather than bandwidth (measured at ~3.7
+    files/s, i.e. 2.7 MB/s), so it spent over TWO HOURS on one such set with
+    nothing on the heartbeat to say what it was doing — the container read as
+    wedged. Copies are I/O-bound and release the GIL, so threads scale here, and
+    progress is reported from this thread (ordered `map` results) so the callback
+    needs no locking."""
     if not src.is_dir():
-        return copied
+        return 0
+    todo: list[tuple[Path, Path]] = []
     for p in src.rglob("*"):
         if not p.is_file():
             continue
         q = dst / p.relative_to(src)
         if q.is_file() and q.stat().st_size == p.stat().st_size:
             continue
-        q.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(p, q)
-        copied += 1
-    return copied
+        todo.append((p, q))
+    if not todo:
+        return 0
+    for parent in {q.parent for _, q in todo}:
+        parent.mkdir(parents=True, exist_ok=True)
+    total = len(todo)
+    if progress is not None:
+        progress(0, total, f"syncing {total} file(s) {src.name} -> {dst}")
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for done, _ in enumerate(
+            pool.map(lambda pair: shutil.copyfile(pair[0], pair[1]), todo), 1
+        ):
+            if progress is not None and (done % 500 == 0 or done == total):
+                progress(done, total, f"syncing {done}/{total} file(s)")
+    return total
 
 
 class _Heartbeat:
@@ -414,14 +457,20 @@ def _record(
     image=image,
     gpu=GPU,
     # COST NOTE: Modal bills CPU + memory on max(reservation, actual use) for the
-    # WHOLE container lifetime, ON TOP of the GPU. This run is GPU-bound — stage 6
-    # training dominates the wall time and uses only ~1-2 cores — so we RESERVE
-    # little and let the CPU-heavy stage-5 SZF encode BURST (the soft CPU limit is
-    # reservation + 16 cores; memory can grow past the reservation when the worker
-    # has room, still billed for actual use). Reserving 16 cores + 50 GiB instead
-    # would pay for them idle through the whole train, adding over a dollar an
-    # hour on top of the L40S floor this sits just above.
-    cpu=4.0,
+    # WHOLE container lifetime, ON TOP of the GPU. Bursting above the reservation is
+    # allowed (soft limit = reservation + 16 cores) but only when the worker happens
+    # to have room, so a reservation is really a guarantee against a busy host.
+    #
+    # 8 rather than 4. Stage 5 is not GPU-bound: measured on two cells of the same
+    # scene, one hit 58 views/s while the other sat at 25 with the GPU idle in both
+    # (render 5-6 ms/view of a 17-40 ms budget). The difference is the host-side
+    # frame pipeline — POST ingest on the event loop plus the SZF encode threads —
+    # which wants ~5-6 cores at full rate and was being throttled back to the
+    # reserved 4. Since we are billed for what we use either way, reserving the
+    # cores the pipeline already consumes costs ~nothing and removes the
+    # host-contention lottery. Stage 6 still only needs 1-2 cores and simply leaves
+    # the rest idle.
+    cpu=8.0,
     memory=8192,            # 8 GiB guaranteed floor; bursts higher on demand, billed for use
     timeout=12 * 3600,
     volumes={VOL: volume},
@@ -441,7 +490,19 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
       trainer: "brush" | "gsplat",     # which stage-6 back-end (default brush)
       plan / train / brush / quant: {} param overrides (dataclass field names),
       force: bool,
+      force_token: str,                # the spawn this `force` belongs to
     }
+
+    FORCE IS INVALIDATE-ONCE. Modal retries a preempted container with the SAME
+    input, so a `force` re-read on every attempt would drop stage 5's frames and
+    stage 6's checkpoint again on each retry — a train preempted at 25k of 30k
+    steps would restart at 0, forever. Instead the spawn's `force_token` is
+    recorded on the Volume the first time it is honoured: attempt 1 invalidates
+    (pops the window's stage records, drops the checkpoint / stale frames /
+    healed artifacts), every later attempt of the SAME spawn sees a matching
+    token and resumes. Which stages then run is decided by `_fresh` alone, so a
+    retry also keeps whatever stages already finished. A `force` with no token
+    (an older client) keeps the old re-invalidate-every-attempt behaviour.
 
     TRAINER. Stage 6 has two interchangeable back-ends behind one seam (both
     consume the COLMAP model and emit `trained.ply`): "brush" runs the upstream
@@ -464,6 +525,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     run, slot, model = spec["run"], spec["slot"], spec["model"]
     stages = set(spec.get("stages") or [4, 5, 6, 7])
     force = bool(spec.get("force"))
+    force_token = spec.get("force_token")
     trainer = spec.get("trainer") or "brush"
     if trainer not in ("brush", "gsplat"):
         raise ValueError(f"unknown trainer {trainer!r} (expected 'brush' or 'gsplat')")
@@ -476,7 +538,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # differ only by plan/train config are told apart too.
     print(
         f"=== run_cell START {key} | stages={sorted(stages)} force={force} "
-        f"trainer={trainer} | plan={spec.get('plan') or {}} "
+        f"token={force_token} trainer={trainer} | plan={spec.get('plan') or {}} "
         f"train={spec.get('train') or {}} brush={spec.get('brush') or {}} "
         f"quant={spec.get('quant') or {}} ===",
         flush=True,
@@ -497,6 +559,36 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     status["spec"] = {"run": run, "slot": slot, "model": model,
                       "stages": sorted(stages)}
     summary: dict[str, Any] = {"cell": key, "stages_run": [], "stages_skipped": []}
+
+    # INVALIDATE-ONCE (see the docstring): honour this spawn's `force` on the
+    # first attempt only, recording its token so a preemption retry resumes.
+    # EVERYTHING destructive happens here, in one step with the token record, and
+    # ONLY for stages in the window — so a retry can never find a half-invalidated
+    # cell (e.g. records dropped but the previous run's checkpoint still in place,
+    # which would warm-restart the very model the user asked to discard). From
+    # here on `_fresh` is the only gate, which is also why a retry keeps whatever
+    # stages already finished.
+    apply_force = force and (
+        force_token is None or status.get("forced_token") != force_token
+    )
+    if apply_force:
+        heart.stage("start")(0, 0, f"forced — invalidating stages {sorted(stages)}")
+        for s in sorted(stages):
+            status["stages"].pop(str(s), None)
+        if 5 in stages:                       # both copies: Volume + local scratch
+            shutil.rmtree(out / "refs", ignore_errors=True)
+            shutil.rmtree(scratch / "refs", ignore_errors=True)
+        if 6 in stages:                       # trainer checkpoints -> cold start
+            shutil.rmtree(out / "ckpt", ignore_errors=True)
+            (out / splat_brush.PROGRESS_NAME).unlink(missing_ok=True)
+        if 7 in stages:
+            for old in out.glob("healed*"):
+                old.unlink()
+        status["forced_token"] = force_token
+        _save_status(status_path, status)
+        volume.commit()
+    elif force:
+        print(f"[{key}] force already applied for this spawn — resuming", flush=True)
 
     # Heavy inputs land in local scratch (fast mmap/reads); artifacts publish to
     # the Volume at stage boundaries with a commit each.
@@ -522,11 +614,17 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
         # capturecore.js (the shared render pipeline), splatlight.js (bake rig),
         # oit.js (weighted-blended OIT + the all-layers shadow bake), reflections.js
         # (per-object scene reflections), reflective.js (which surfaces stay
-        # reflective vs. forced matte), and emissive.js (emissive glow + point
-        # lights) all determine every captured pixel — fold them in so a change
-        # there re-renders stage 5 instead of silently reusing frames.
+        # reflective vs. forced matte), transmissive.js (which surfaces are actually
+        # see-through, so which take the OIT path and which write their own depth),
+        # and emissive.js (emissive glow + point lights) all determine every captured
+        # pixel — fold them in so a change there re-renders stage 5 instead of
+        # silently reusing frames.
+        # idmask.js only supplies the tour's ID materials, but capturecore.js imports
+        # it, so it is part of the graph stage 5 evaluates — and therefore part of
+        # what has to be present and versioned.
         _js / "capturecore.js", _js / "splatlight.js", _js / "oit.js",
-        _js / "reflections.js", _js / "reflective.js", _js / "emissive.js",
+        _js / "reflections.js", _js / "reflective.js", _js / "transmissive.js",
+        _js / "emissive.js", _js / "idmask.js",
     )
     # Stage 6 now trains from the COLMAP export, so its code sig folds in colmap.py
     # too — editing the exporter re-runs stage 6 rather than reusing a stale model.
@@ -546,7 +644,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     cameras = out / "cameras.json"
     art4 = [cameras]
     if 4 in stages:
-        if not force and _fresh(status, "4", sig4, art4):
+        if _fresh(status, "4", sig4, art4):
             summary["stages_skipped"].append(4)
         else:
             s4 = plan_cameras(
@@ -569,7 +667,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             raise FileNotFoundError("cameras.json missing — run stage 4 first")
         cam_sha = _sha256(cameras)
         sig5 = _sig({"cameras": cam_sha, "tier": in_sha["tier"], "code": code5})
-        if not force and _fresh(status, "5", sig5, [transforms]):
+        if _fresh(status, "5", sig5, [transforms]):
             summary["stages_skipped"].append(5)
         else:
             refs_scratch = scratch / "refs"
@@ -589,12 +687,8 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             same_plan = False
             with contextlib.suppress(Exception):
                 same_plan = marker.read_text() == cam_sha
-            if force or not same_plan:
-                heart.stage("refs")(
-                    0, 0,
-                    "fresh render — dropping any stale frames" if not same_plan and not force
-                    else "forced re-render — dropping frames",
-                )
+            if not same_plan:
+                heart.stage("refs")(0, 0, "fresh render — dropping any stale frames")
                 shutil.rmtree(refs_scratch, ignore_errors=True)
                 shutil.rmtree(out / "refs", ignore_errors=True)
             else:
@@ -602,10 +696,17 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                 # from the Volume can take minutes — emit a heartbeat so this step
                 # is VISIBLE (not mistaken for a hung earlier stage).
                 heart.stage("refs")(0, 0, "resuming — syncing prior frames from volume")
-                _sync_dir(out / "refs", refs_scratch)
-            # Stamp the plan marker on both copies before rendering; the capture's
-            # periodic sample commits carry the Volume copy, so a preemption of
-            # THIS plan resumes instead of re-rendering from scratch.
+                _sync_dir(out / "refs", refs_scratch, progress=heart.stage("refs"))
+            # Stamp the plan marker on both copies before rendering, so the branch
+            # above can tell a resume of THIS plan from a replan.
+            #
+            # CAVEAT, because the invalidate-once work above makes it easy to assume
+            # otherwise: the frames render into local SCRATCH and only reach the
+            # Volume in the `_sync_dir` after `capture_refs` returns (mid-render the
+            # Volume gets just the sample PNGs). So a container preempted DURING the
+            # render loses the frames with /tmp, and the resume branch finds only the
+            # marker — stage 5 is all-or-nothing per attempt. Stage 6 is not: its
+            # checkpoints are written straight to the Volume, so its retry warm-starts.
             for d in (out / "refs", refs_scratch):
                 d.mkdir(parents=True, exist_ok=True)
                 (d / "plan.sha").write_text(cam_sha)
@@ -623,7 +724,9 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                 commit=volume.commit,
                 progress=heart.stage("refs"),
             )
-            _sync_dir(refs_scratch, out / "refs")
+            # Publishing the render is the same 23 GB in the other direction, and it
+            # is what makes the frames reusable at all — heartbeat it too.
+            _sync_dir(refs_scratch, out / "refs", progress=heart.stage("refs"))
             _record(status, status_path, "5", sig5, s5)
             summary["stages_run"].append(5)
             summary["refs"] = s5
@@ -655,11 +758,23 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             "quant": quant.as_summary() if trainer == "brush" else None,
         })
         art6 = [trained, trained_sqz] if trainer == "brush" else [trained]
-        if not force and _fresh(status, "6", sig6, art6):
+        if _fresh(status, "6", sig6, art6):
             summary["stages_skipped"].append(6)
         else:
-            refs_scratch = scratch / "refs"
-            _sync_dir(out / "refs", refs_scratch)  # export reads refs from local disk
+            # WHERE THE REFS ARE READ FROM. Brush trains from the PNGs the export
+            # writes and never touches an SZF frame; the gsplat loop re-reads them
+            # every step through the supervision sidecar (alpha + metric depth), so
+            # only IT needs them on local disk. The export's own decode pass reads
+            # each frame exactly once and is already threaded, so on the Brush path
+            # it reads straight off the Volume — copying 23 GB of frames into /tmp
+            # first was over two hours of pure overhead (and 23 GB of scratch) for a
+            # run that then ignored them. A cell whose stage 5 ran in THIS container
+            # already has them in scratch, so that case copies nothing either way.
+            if trainer == "brush":
+                refs_src = out / "refs"
+            else:
+                refs_src = scratch / "refs"
+                _sync_dir(out / "refs", refs_src, progress=heart.stage("train"))
             # Stage 6 now trains from a COLMAP model (the Postshot-style point cloud
             # + poses + images) — build it once from this cell's Stage-3 cloud +
             # Stage-5 refs into local scratch, rebuilt on force or when absent.
@@ -667,19 +782,18 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             # Rebuild on force, when absent, or when a warm container's export
             # predates the SZF supervision sidecar the refs could provide.
             colmap_stale = not (colmap_scratch / splat_colmap.CAMERAS_TXT).is_file() or (
-                (refs_scratch / _stage5.FRAMES_DIRNAME).is_dir()
+                (refs_src / _stage5.FRAMES_DIRNAME).is_dir()
                 and not (colmap_scratch / splat_colmap.SIDECAR_NAME).is_file()
             )
-            if force or colmap_stale:
+            if apply_force or colmap_stale:
                 heart.stage("train")(0, 0, "building COLMAP model (points3D + cameras + images)")
-                splat_colmap.export_colmap(refs_scratch, cloud, colmap_scratch)
+                splat_colmap.export_colmap(refs_src, cloud, colmap_scratch)
             # out_path lives ON the Volume: trained.ply + LODs land durably and
             # stage-6 checkpoints (splat/ckpt beside it) survive preemption, so
-            # Modal's retry resumes mid-training. A fresh (non-resume) run must
-            # drop stale checkpoints or train_splat would resume a dead run.
-            if force:
-                shutil.rmtree(out / "ckpt", ignore_errors=True)
-                (out / splat_brush.PROGRESS_NAME).unlink(missing_ok=True)
+            # Modal's retry resumes mid-training. Both trainers therefore always
+            # RESUME — a fresh start is expressed by dropping the checkpoint, which
+            # invalidate-once did above on the forced attempt only, so the retry of
+            # a forced run warm-restarts instead of training from zero again.
             if trainer == "brush":
                 s6 = splat_brush.train_brush(
                     run=run, slot=slot, model=model,
@@ -695,7 +809,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                     init_ply=cloud,
                     params=brush_params,
                     brush_bin=BRUSH_BIN,
-                    resume=not force,
+                    resume=True,
                     progress=heart.stage("train", commit=True),
                 )
                 # No stage 7 on this path, so the shippable .sqz is produced here.
@@ -718,7 +832,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                     # entirely — it seeds from the COLMAP points3D.
                     init_ply=cloud,
                     params=train_params,
-                    resume=not force,
+                    resume=True,
                     progress=heart.stage("train", commit=True),
                 )
             _record(status, status_path, "6", sig6, s6)
@@ -755,14 +869,13 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             "code": _src_sig(Path(_stage6.__file__), Path(quantize.__file__)),
         })
         sqz = out / "healed.sqz"
-        if not force and _fresh(status, "7", sig7, [healed, sqz]):
+        if _fresh(status, "7", sig7, [healed, sqz]):
             summary["stages_skipped"].append(7)
         else:
-            if force:
-                for old in out.glob("healed*"):     # drop stale healed artifacts
-                    old.unlink()
+            # Heal re-renders every reference view through the rasterizer, so unlike
+            # the Brush export it does want them on local disk.
             refs_scratch = scratch / "refs"
-            _sync_dir(out / "refs", refs_scratch)   # heal reads refs from local disk
+            _sync_dir(out / "refs", refs_scratch, progress=heart.stage("heal"))
             s7: dict[str, Any] = {"heal": heal_splat(
                 run=run, slot=slot, model=model,
                 trained_path=trained, cloud_path=cloud, refs_dir=refs_scratch,
@@ -920,18 +1033,28 @@ def probe_webgl() -> dict[str, Any]:
     import subprocess
     import tempfile
 
-    from splat.modal_capture import _COMMON_FLAGS, _GPU_FLAGS, _SW_FLAGS, _chromium_binary
+    from splat.modal_capture import (
+        _COMMON_FLAGS,
+        _MODE_FLAGS,
+        _RENDER_MODES,
+        _chromium_binary,
+        chromium_version,
+    )
 
     html = Path(tempfile.mkstemp(suffix=".html")[1])
     html.write_text(_PROBE_HTML, encoding="utf-8")
     url = f"file://{html}"
-    out: dict[str, Any] = {}
+    # The GL backend depends entirely on which Chromium the unpinned apt_install
+    # fetched, so name it — a silent version bump has broken both backends at once.
+    out: dict[str, Any] = {"browser": chromium_version()}
 
     def attr(text: str, name: str) -> str:
         m = re.search(rf'{name}="([^"]*)"', text)
         return m.group(1) if m else ""
 
-    for mode, flags in (("gpu", _GPU_FLAGS), ("swiftshader", _SW_FLAGS)):
+    # Exactly the modes, in the order, that `capture_refs` will try — so a green
+    # probe means the capture has a working backend, not merely that one exists.
+    for mode, flags in ((m, _MODE_FLAGS[m]) for m in _RENDER_MODES):
         res = subprocess.run(
             [_chromium_binary(), *_COMMON_FLAGS, *flags,
              f"--user-data-dir=/tmp/probe-{mode}",

@@ -58,7 +58,10 @@ export function tourSource(s: Scene): TourSource {
 		manifestUrl: s.tourKey ? assetUrl(s.tourKey) : null,
 		resolvePano: (file) => ({ url: panoUrl(s, file), placeholderUrl: panoPlaceholderUrl(s, file) }),
 		resolveProxy: () => assetUrl(s.proxyKey ?? ""),
-		// Minimap slices are published under the same prefix as the panos.
+		// Minimap slices and object-ID masks are published under the same prefix as
+		// the panos. Masks deliberately resolve through `panoUrl`, never the image
+		// transformation edge — a resized or re-encoded mask is a corrupt one.
 		resolveMinimap: (file) => panoUrl(s, file),
+		resolveMask: (file) => panoUrl(s, file),
 	};
 }

@@ -29,10 +29,12 @@ import { CopyShader } from "three/examples/jsm/shaders/CopyShader.js";
 import { loadGLB } from "./loaders";
 import {
 	DUMMY_TEX,
+	makeMaskHighlightMaterial,
 	makePanoMaterial,
 	makePolyMaterial,
 	SPHERE_RADIUS,
 } from "./materials";
+import { ID_BACKGROUND, MaskStreamer, sampleIdMask } from "./idMasks";
 import {
 	HOTSPOT_FLOOR_DROP,
 	LOCATE_SLICE_ABOVE_EYE,
@@ -233,6 +235,15 @@ export class OrbitEngine {
 	private readonly polyMaterial = makePolyMaterial();
 
 	private readonly streamer: PanoStreamer;
+	// Object addressing INSIDE comes from the per-anchor ID masks, not from the
+	// proxy: the proxy is the whole scene at 40k triangles, so raycasting it picks
+	// the wrong object and outlines a shape that isn't there. ObjectAddressing
+	// still owns the overview, where the dollhouse carries 3M triangles.
+	private readonly masks: MaskStreamer;
+	private readonly maskHighlight: Mesh;
+	private readonly maskHighlightMat: ShaderMaterial;
+	private objects: Array<{ id: string; name?: string }> = [];
+	private hoveredObject = ID_BACKGROUND;
 	private readonly projection = new Projection();
 	private readonly markers: MarkerLayer;
 	private readonly addressing: ObjectAddressing;
@@ -405,11 +416,26 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.scene.add(this.sphereA, this.sphereB);
 
+		// The silhouette rides the camera like the backdrop does, but with depth
+		// testing off and a high render order, so it composites over whatever the
+		// interior is showing — the mask already says which pixels are the object's.
+		this.maskHighlightMat = makeMaskHighlightMaterial();
+		this.maskHighlight = new Mesh(this.sphereA.geometry, this.maskHighlightMat);
+		this.maskHighlight.renderOrder = 25;
+		this.maskHighlight.visible = false;
+		this.maskHighlight.frustumCulled = false;
+		this.scene.add(this.maskHighlight);
+
 		this.markers = new MarkerLayer(this.scene);
 		this.cursor = new SurfaceCursor(this.scene);
 		this.streamer = new PanoStreamer(
 			() => this.loadToken,
 			(i) => this.onPanoReady(i),
+		);
+		this.masks = new MaskStreamer(
+			() => this.loadToken,
+			(i) => this.panos[i]?.maskUrl,
+			(i) => this.onMaskReady(i),
 		);
 		this.addressing = new ObjectAddressing(
 			this.scene,
@@ -478,6 +504,7 @@ export class OrbitEngine {
 		window.removeEventListener("keyup", this.onKeyUp);
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
+		this.maskHighlightMat.dispose();
 		this.cursor.dispose();
 		this.markers.dispose();
 		this.rig.dispose();
@@ -544,13 +571,19 @@ export class OrbitEngine {
 			currentName: cur ? (cur.name ?? null) : null,
 			currentIndex: this.currentIndex,
 			hover,
-			objectHover: this.addressing.hoverLabel,
+			// Inside, the label comes from the ID mask; outside, from the dollhouse
+			// geometry the overview raycasts.
+			objectHover:
+				this.mode === "interior"
+					? this.objectLabel()
+					: this.addressing.hoverLabel,
 			proxyView: this.proxyView,
 			canProxyView: this.canToggleProxyView(),
 			highlightEnabled: this.highlightEnabled,
 			canHighlight:
-				(this.mode === "overview" || this.mode === "interior") &&
-				!!this.activeObjectRoot(),
+				this.mode === "interior"
+					? this.masks.has(this.currentIndex)
+					: this.mode === "overview" && !!this.activeObjectRoot(),
 			contextMenu: this.addressing.menu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
@@ -794,7 +827,8 @@ export class OrbitEngine {
 				Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY),
 			);
 			// Drop any stale hover preview once the look starts moving.
-			if (this.hoveredNavIndex !== -1 || this.hoveredLevel) {
+			const dropped = this.clearObjectHover();
+			if (this.hoveredNavIndex !== -1 || this.hoveredLevel || dropped) {
 				this.hoveredNavIndex = -1;
 				this.hoveredLevel = null;
 				this.markers.setNavHover(null);
@@ -861,7 +895,8 @@ export class OrbitEngine {
 	private onPointerLeave = () => {
 		this.pointerInside = false;
 		this.cursor.hide();
-		if (this.hoveredLevel) {
+		const dropped = this.clearObjectHover();
+		if (this.hoveredLevel || dropped) {
 			this.hoveredLevel = null;
 			this.markers.setLevelHover(null);
 			this.emit();
@@ -969,7 +1004,7 @@ export class OrbitEngine {
 			this.canvas.style.cursor = "pointer";
 			changed = changed || this.hoveredNavIndex !== -1;
 			this.hoveredNavIndex = -1;
-			if (this.addressing.setHover(null) || changed) this.emit();
+			if (this.clearObjectHover() || changed) this.emit();
 			return;
 		}
 		const spot = this.markers.pickNav(
@@ -980,13 +1015,10 @@ export class OrbitEngine {
 		);
 		this.markers.setNavHover(spot);
 		const idx = spot ? (spot.userData.to as number) : -1;
-		const obj = this.highlightEnabled
-			? this.addressing.pickAt(
-					ev.clientX,
-					ev.clientY,
-					this.activeObjectRoot(),
-				)
-			: null;
+		// Objects are named and outlined on hover but they are not click targets —
+		// a click still navigates — so the cursor keeps answering "where would this
+		// take me", not "is something under me".
+		const objChanged = this.refreshObjectHover();
 		if (idx >= 0) {
 			const rendered = this.navNode(this.currentIndex)?.rendered;
 			const isVertical = rendered?.some(
@@ -995,8 +1027,6 @@ export class OrbitEngine {
 			const clear =
 				isVertical || this.isTargetClear(v3(this.panos[idx].position));
 			this.canvas.style.cursor = clear ? "pointer" : "crosshair";
-		} else if (obj) {
-			this.canvas.style.cursor = "pointer";
 		} else {
 			// Nothing to aim at here. If the ray leaves the scene entirely, this click
 			// pulls back out to the orbit (see clickAnywhere) — advertise that instead
@@ -1007,7 +1037,7 @@ export class OrbitEngine {
 		}
 		changed = changed || idx !== this.hoveredNavIndex;
 		this.hoveredNavIndex = idx;
-		if (this.addressing.setHover(obj) || changed) this.emit();
+		if (objChanged || changed) this.emit();
 	}
 
 	// Every visible interior surface under a screen point, nearest first. The
@@ -1283,6 +1313,7 @@ export class OrbitEngine {
 		if (!this.canToggleProxyView()) return;
 		this.proxyView = !this.proxyView;
 		this.addressing.setHover(null);
+		this.clearObjectHover(); // the bare proxy isn't what the mask describes
 		this.addressing.closeMenu();
 		this.canvas.style.cursor = "";
 		if (this.mode === "overview") this.setOverviewView();
@@ -1292,19 +1323,94 @@ export class OrbitEngine {
 
 	toggleHighlight() {
 		this.highlightEnabled = !this.highlightEnabled;
-		if (!this.highlightEnabled) this.addressing.setHover(null);
+		if (this.highlightEnabled) {
+			this.refreshObjectHover();
+		} else {
+			this.addressing.setHover(null);
+			this.clearObjectHover();
+		}
 		this.canvas.style.cursor = "";
 		this.emit();
 	}
 
-	// --- per-object addressing ------------------------------------------------
+	// --- per-object addressing (interior: the ID mask) ------------------------
 
+	// The whole pick: screen pixel → world ray → equirect texel. No raycast, no
+	// depth test, no proxy. It is exact because the mask was rasterized from THIS
+	// point against the full-resolution meshes, and the walkthrough can't leave the
+	// point — so visibility here is a fixed function of direction. Returns whether
+	// the hovered object changed, so the caller can decide to re-emit.
+	private refreshObjectHover(): boolean {
+		const mask =
+			this.mode === "interior" &&
+			this.highlightEnabled &&
+			!this.proxyView &&
+			!this.interiorBusy &&
+			this.pointerInside &&
+			this.currentIndex >= 0
+				? this.masks.get(this.currentIndex)
+				: null;
+		if (!mask) return this.clearObjectHover();
+		const dir = cursorRayDir(
+			this.camera,
+			this.canvas,
+			this.cursorRay,
+			this.pointerClientX,
+			this.pointerClientY,
+		);
+		// A one-texel majority: a sliver under the cursor shouldn't flicker the
+		// label between two objects.
+		const global = sampleIdMask(mask, dir.x, dir.y, dir.z, 1);
+		const local =
+			global === ID_BACKGROUND ? 0 : (mask.localOf.get(global) ?? 0);
+		if (local > 0) {
+			const u = this.maskHighlightMat.uniforms;
+			u.uMask.value = mask.texture;
+			(u.uTexel.value as Vector2).set(1 / mask.width, 1 / mask.height);
+			u.uWide.value = mask.indexBytes === 2;
+		}
+		this.maskHighlightMat.uniforms.uLocal.value = local;
+		this.maskHighlight.visible = local > 0;
+		const changed = this.hoveredObject !== global;
+		this.hoveredObject = global;
+		return changed;
+	}
+
+	private clearObjectHover(): boolean {
+		this.maskHighlightMat.uniforms.uLocal.value = 0;
+		this.maskHighlight.visible = false;
+		const changed = this.hoveredObject !== ID_BACKGROUND;
+		this.hoveredObject = ID_BACKGROUND;
+		return changed;
+	}
+
+	// The mask names an object by its GLB stem; the tour's directory is the only
+	// place that maps an index back to it.
+	private objectLabel(): string | null {
+		if (this.hoveredObject === ID_BACKGROUND) return null;
+		const obj = this.objects[this.hoveredObject - 1];
+		if (!obj) return null;
+		return obj.name ?? obj.id.replace(/_/g, " ");
+	}
+
+	private onMaskReady(index: number) {
+		if (index !== this.currentIndex) return;
+		// Masks land a beat after arrival, by which time the cursor is already
+		// resting on something — so re-run the hover rather than waiting for the
+		// next mouse move to discover it.
+		this.refreshObjectHover();
+		this.emit();
+	}
+
+	// Which root the OVERVIEW addresses by raycast. Interior has no entry here on
+	// purpose: inside, objects are picked from the ID mask, and the proxy is left to
+	// the jobs a 40k-triangle stand-in is actually good at — line of sight, click
+	// routing, and carrying the projected panos.
 	private activeObjectRoot(): Object3D | null {
 		if (this.mode === "overview" || this.mode === "peek") {
 			if (this.proxyView && this.proxyGroup) return this.proxyGroup;
 			return this.liteRoot ?? this.proxyGroup;
 		}
-		if (this.mode === "interior") return this.proxyGroup;
 		return null;
 	}
 
@@ -1422,6 +1528,7 @@ export class OrbitEngine {
 		this.markers.hideSonar();
 		this.addressing.setHover(null);
 		this.addressing.closeMenu();
+		this.clearObjectHover();
 		this.canvas.style.cursor = "";
 		this.emit();
 	}
@@ -1456,7 +1563,9 @@ export class OrbitEngine {
 		this.markers.navGroup.visible = false;
 		this.markers.levelGroup.visible = false;
 		this.markers.hideSonar();
+		this.clearObjectHover(); // nothing under the cursor survives the hop
 		this.requestPano(index);
+		this.masks.request(index);
 		const fromPos = this.camera.position.clone();
 		const toPos = v3(this.panos[index].position);
 		const ctrl = this.reducedMotion
@@ -1577,6 +1686,7 @@ export class OrbitEngine {
 		this.flyTarget = -1;
 		this.visited.add(index);
 		this.requestPano(index);
+		this.masks.request(index);
 		if (!this.projectionMode) {
 			this.sphereAMat.uniforms.map.value =
 				this.panos[index].texture ?? DUMMY_TEX;
@@ -1588,6 +1698,7 @@ export class OrbitEngine {
 		this.refreshLevelWaypoints();
 		if (node?.trapped) this.markers.pulseExits(performance.now(), 2200);
 		this.noteInput();
+		this.refreshObjectHover();
 		this.emit();
 	}
 
@@ -1954,6 +2065,9 @@ export class OrbitEngine {
 		this.proxyColorMats = [];
 		this.projection.clearBase(this.scene);
 		this.streamer.reset();
+		this.masks.reset();
+		this.clearObjectHover();
+		this.objects = [];
 		this.connectors = [];
 		this.navGraph = null;
 		this.nodeDir = [];
@@ -2038,12 +2152,17 @@ export class OrbitEngine {
 					forward: p.forward,
 					url,
 					placeholderUrl,
+					maskUrl: p.mask ? source.resolveMask(p.mask) : undefined,
 					texture: null,
 					placeholderTexture: null,
 					hasFull: false,
 					requested: false,
 				};
 			});
+			// The directory the masks index into. Empty on a tour captured before
+			// object masks, which simply leaves the interior without addressing.
+			const objects =
+				manifest && Array.isArray(manifest.objects) ? manifest.objects : [];
 
 			const connectors =
 				manifest && Array.isArray(manifest.connectors)
@@ -2069,7 +2188,7 @@ export class OrbitEngine {
 				}
 			}
 			if (token !== this.loadToken || this.disposed) return;
-			this.applyScene(entries, proxyRoot, lite, connectors);
+			this.applyScene(entries, proxyRoot, lite, connectors, objects);
 		} catch (e) {
 			if (token !== this.loadToken || this.disposed) return;
 			this.mode = "empty";
@@ -2085,8 +2204,10 @@ export class OrbitEngine {
 		proxyRoot: Group | null,
 		lite: Group | null,
 		connectors: Connector[],
+		objects: Array<{ id: string; name?: string }> = [],
 	) {
 		this.connectors = connectors;
+		this.objects = objects;
 		this.streamer.reset(entries);
 		this.panoLevel = entries.map((p) =>
 			levelForY(this.minimaps, p.position[1]),
@@ -2412,6 +2533,10 @@ export class OrbitEngine {
 			this.director.tick(now);
 			this.lat = applyLook(this.camera, this.lon, this.lat);
 			if (!this.interiorBusy) {
+				// Per frame, not per mouse move: Q/E, WASD and the auto tour all
+				// swing the view under a stationary cursor, and the outline has to
+				// follow what is actually beneath it. A sample is one array read.
+				if (this.refreshObjectHover()) this.emit();
 				this.markers.updateNav(
 					this.camera,
 					this.lon,
@@ -2452,6 +2577,10 @@ export class OrbitEngine {
 			this.camera.lookAt(this.sceneCenter);
 		}
 
+		// The silhouette is a camera-locked backdrop like the pano is, so it has to
+		// ride along; it is only ever visible while parked, where that is exact.
+		if (this.maskHighlight.visible)
+			this.maskHighlight.position.copy(this.camera.position);
 		this.updateCursorRing();
 		this.addressing.updateOutlines();
 		this.composer.render();

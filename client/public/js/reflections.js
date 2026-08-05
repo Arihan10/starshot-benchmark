@@ -104,13 +104,18 @@ export function bakeReflectionProbes(renderer, scene, opts = {}) {
 	renderer.autoClear = true;
 	renderer.setClearColor(bg, 1);
 
-	// Trellis marks nearly every surface alphaMode=BLEND, so prepareOITScene moves
-	// them onto the OIT layer with additive OIT blending. Render them into the cubes
-	// as OPAQUE geometry (they are almost always solid, α≈1): flip each to normal
-	// blending + depth write and switch the shared `oitPass` to the opaque
-	// passthrough, and let the cube cameras see the OIT layer too. Without this the
-	// layer-0-only probe captures an empty (black) scene, so every reflective
-	// surface — mirrors, metal — reflects pure black. Restored after the bake.
+	// The meshes prepareOITScene put on the OIT layer carry additive OIT blending,
+	// which a plain cube render cannot reproduce. Render them into the cubes as
+	// OPAQUE geometry instead: flip each to normal blending + depth write, switch the
+	// shared `oitPass` to the opaque passthrough, and let the cube cameras see the
+	// OIT layer too. Restored after the bake.
+	//
+	// This used to be the difference between a working probe and a black one, because
+	// Trellis's blanket alphaMode=BLEND put ENTIRE scenes on the OIT layer and a
+	// layer-0-only probe therefore captured nothing. The transmissivity gate
+	// (transmissive.js) now keeps ordinary surfaces on layer 0, so the stakes are
+	// lower — but real glass still lives here and a probe that ignored it would
+	// reflect windows as holes.
 	const oitMats = [];
 	scene.traverse((obj) => {
 		const list = obj.material

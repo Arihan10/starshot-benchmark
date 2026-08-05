@@ -14,12 +14,12 @@
                 --text: #e6e6e6;
                 --text-dim: #b8bcc4;
                 --text-faint: #7a808c;
+                --text-desc: #6f757f;
                 --accent: #9ad4ff;
                 --accent-line: #4a8fd8;
                 --green: #8bd17c;
                 --amber: #e0c271;
                 --red: #ff8080;
-                --purple: #c9a6ff;
             }
             * { box-sizing: border-box; }
             html, body { height: 100%; margin: 0; }
@@ -29,7 +29,7 @@
                 font: 12px/1.45 "SF Mono", ui-monospace, Menlo, monospace;
                 overflow: hidden;
             }
-            #app { display: grid; grid-template-columns: 300px 1fr; height: 100%; }
+            #app { display: grid; grid-template-columns: 340px 1fr; height: 100%; }
 
             /* ---- control panel ---- */
             #panel {
@@ -39,7 +39,7 @@
                 padding: 12px;
                 display: flex;
                 flex-direction: column;
-                gap: 14px;
+                gap: 12px;
             }
             .brand { display: flex; flex-direction: column; gap: 2px; }
             .brand h1 { margin: 0; font-size: 13px; letter-spacing: 0.04em; color: var(--text); }
@@ -47,21 +47,63 @@
             .brand a { color: var(--accent); text-decoration: none; font-size: 10px; }
             .brand a:hover { text-decoration: underline; }
 
-            section.group { display: flex; flex-direction: column; gap: 9px; }
-            .group > h2 {
+            #toolbar {
+                display: flex; align-items: center; justify-content: space-between;
+                gap: 8px; padding-bottom: 10px; border-bottom: 1px solid var(--line);
+            }
+            #toolbar button { padding: 4px 8px; font-size: 11px; }
+
+            section.fixed { display: flex; flex-direction: column; gap: 9px; }
+            section.fixed > h2, details.group > summary {
                 margin: 0; font-size: 10px; text-transform: uppercase;
                 letter-spacing: 0.08em; color: var(--text-faint);
                 border-bottom: 1px solid var(--line); padding-bottom: 5px;
             }
+            details.group { display: block; }
+            details.group > summary {
+                cursor: pointer; display: flex; align-items: baseline;
+                justify-content: space-between; gap: 8px; list-style: none;
+            }
+            details.group > summary::-webkit-details-marker { display: none; }
+            details.group > summary::before {
+                content: "\25B8"; color: var(--text-faint); font-size: 9px; margin-right: 6px;
+            }
+            details.group[open] > summary::before { content: "\25BE"; }
+            details.group > summary:hover { color: var(--text-dim); }
+            details.group > summary em {
+                flex: 1; text-align: right; font-style: normal;
+                text-transform: none; letter-spacing: 0; color: #5d636e; font-size: 9px;
+            }
+            details.group > .body {
+                display: flex; flex-direction: column; gap: 12px; padding: 10px 0 2px;
+            }
+            details.group.inert > summary, details.group.inert > .body { opacity: 0.42; }
+
+            /* ---- controls ---- */
             .ctl { display: flex; flex-direction: column; gap: 3px; }
-            .ctl .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-            .ctl label { color: var(--text-dim); }
-            .ctl .val { color: var(--accent); font-variant-numeric: tabular-nums; }
+            .ctl.disabled { opacity: 0.45; }
+            .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+            .row label { color: var(--text-dim); }
+            .row .val { color: var(--accent); font-variant-numeric: tabular-nums; }
+            .ctl.changed .row .val { color: var(--amber); }
+            .ctl.changed .row label::after,
+            .ctl.changed > label.check::after {
+                content: " \25CF"; color: var(--amber); font-size: 8px; vertical-align: 1px;
+            }
+            .desc {
+                margin: 2px 0 0; font-size: 10px; line-height: 1.55; color: var(--text-desc);
+            }
+            body.lean .desc { display: none; }
+            body.lean details.group > .body { gap: 9px; }
+
             input[type="range"] { width: 100%; accent-color: var(--accent-line); margin: 0; }
+            input[type="range"]:disabled { opacity: 0.4; }
             select, input[type="text"] {
                 width: 100%; background: var(--bg); color: var(--text);
-                border: 1px solid var(--line); border-radius: 4px; padding: 5px 6px; font: inherit;
+                border: 1px solid var(--line); border-radius: 4px; padding: 5px 6px;
+                font: inherit; min-width: 0;
             }
+            select:disabled { opacity: 0.45; }
             .field { display: flex; gap: 6px; }
             .field input { flex: 1; min-width: 0; }
             button {
@@ -69,10 +111,21 @@
                 border: 1px solid var(--line); border-radius: 4px; padding: 6px 9px; cursor: pointer;
             }
             button:hover:not(:disabled) { border-color: var(--accent-line); color: #cfe3fb; }
-            button.primary { background: #21344e; border-color: var(--accent-line); color: #cfe3fb; }
+            button.primary, button.active { background: #21344e; border-color: var(--accent-line); color: #cfe3fb; }
             button:disabled { opacity: 0.45; cursor: default; }
             label.check { display: flex; align-items: center; gap: 7px; color: var(--text-dim); cursor: pointer; }
             label.check input { accent-color: var(--accent-line); }
+
+            .presets { display: flex; flex-wrap: wrap; gap: 5px; }
+            .presets button { padding: 4px 7px; font-size: 11px; }
+            p.note { margin: 0; font-size: 10px; color: var(--text-faint); line-height: 1.5; }
+            p.note.bad { color: var(--red); }
+            pre.log {
+                margin: 0; padding: 7px 8px; max-height: 150px; overflow: auto;
+                background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+                font-size: 10px; line-height: 1.45; color: var(--text-faint);
+                white-space: pre-wrap; word-break: break-all;
+            }
 
             /* ---- stage ---- */
             #stage { position: relative; min-width: 0; min-height: 0; }
@@ -83,17 +136,19 @@
                 position: absolute; border-radius: 6px; border: 1px solid var(--line);
                 background: rgba(16, 18, 22, 0.82); backdrop-filter: blur(4px);
             }
-            #hud { top: 12px; right: 12px; padding: 10px 12px; min-width: 210px; }
+            #hud { top: 12px; right: 12px; padding: 10px 12px; min-width: 238px; }
             #hud h3 {
                 margin: 0 0 7px; font-size: 10px; text-transform: uppercase;
                 letter-spacing: 0.08em; color: var(--text-faint);
             }
+            #hud h3.sub { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
             .stat { display: flex; justify-content: space-between; gap: 12px; padding: 1px 0; }
             .stat .k { color: var(--text-faint); }
             .stat .v { color: var(--text); font-variant-numeric: tabular-nums; }
             .stat .v.good { color: var(--green); }
             .stat .v.warn { color: var(--amber); }
             .stat .v.bad { color: var(--red); }
+            .why { margin: 3px 0 0; font-size: 10px; color: var(--text-desc); line-height: 1.4; }
             .bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 5px; }
             .bar > i { display: block; height: 100%; background: var(--accent-line); width: 0; transition: width 0.2s; }
 
@@ -110,7 +165,7 @@
             #loader .box {
                 display: flex; flex-direction: column; gap: 8px; align-items: center;
                 padding: 18px 26px; border: 1px solid var(--line); border-radius: 8px;
-                background: var(--panel); color: var(--text-dim);
+                background: var(--panel); color: var(--text-dim); max-width: 60%; text-align: center;
             }
             #loader.err .box { border-color: var(--red); color: var(--red); }
             #loader[hidden] { display: none; }
@@ -137,59 +192,74 @@
                     <a href="/">← pipeline dashboard</a>
                 </div>
 
-                <section class="group">
+                <div id="toolbar">
+                    <label class="check" title="Hide every knob's written description for a compact panel.">
+                        <input type="checkbox" id="toggle-desc" checked />
+                        descriptions
+                    </label>
+                </div>
+                <section class="fixed">
+                    <h2>stance</h2>
+                    <div class="presets" id="lever-presets"></div>
+                    <p class="note">
+                        Sets every lever at once. Hover for what each one trades away;
+                        touching any lever afterwards drops the highlight.
+                    </p>
+                </section>
+
+                <section class="fixed">
                     <h2>source</h2>
-                    <select id="src-picker" title="Splat assets discovered under client/public/assets/"></select>
+                    <select id="src-picker" title="Pipeline splats from the API server's /sog/catalog, plus anything under client/public/assets/"></select>
                     <div class="field">
                         <input id="src-url" type="text" placeholder="…or a lod-meta.json / .sog URL" />
                         <button id="src-load">load</button>
                     </div>
-                    <button id="reframe">reframe birdseye</button>
-                </section>
-
-                <section class="group" id="grp-lod">
-                    <h2>LOD selection</h2>
-                </section>
-
-                <section class="group" id="grp-stream">
-                    <h2>streaming &amp; budget</h2>
-                </section>
-
-                <section class="group">
-                    <h2>dynamic loading</h2>
-                    <label class="check">
-                        <input type="checkbox" id="auto-quality" />
-                        auto-quality (adapt budget + resolution to hold 55 fps)
-                    </label>
-                    <div class="ctl">
-                        <div class="row"><label for="debug">debug view</label></div>
-                        <select id="debug">
-                            <option value="none">none</option>
-                            <option value="lod">colorize by LOD</option>
-                            <option value="nodes">octree node AABBs</option>
-                            <option value="aabbs">splat AABBs</option>
-                            <option value="heatmap">overdraw heatmap</option>
-                        </select>
+                    <div class="field">
+                        <button id="reframe" style="flex:1">reframe birdseye</button>
+                        <button id="src-refresh" title="Rescan both catalogues">rescan</button>
                     </div>
                 </section>
+
+                <!-- groups are built from js/playground/levers.js -->
+                <div id="groups" style="display:flex; flex-direction:column; gap:12px"></div>
             </aside>
 
             <div id="stage">
                 <div id="canvas-host"><canvas id="view" tabindex="0"></canvas></div>
 
                 <div id="hud" class="overlay">
-                    <h3>live</h3>
+                    <h3>asset</h3>
                     <div class="stat"><span class="k">source</span><span class="v" id="s-type">—</span></div>
                     <div class="stat"><span class="k">LOD levels</span><span class="v" id="s-lods">—</span></div>
                     <div class="stat"><span class="k">full detail</span><span class="v" id="s-splats">—</span></div>
+                    <div class="stat"><span class="k">rendering</span><span class="v" id="s-rendered">—</span></div>
+                    <div class="stat"><span class="k">budget</span><span class="v" id="s-budget">—</span></div>
+
+                    <h3 class="sub">streaming</h3>
                     <div class="stat"><span class="k">chunks resident</span><span class="v" id="s-files">—</span></div>
                     <div class="bar"><i id="s-files-bar"></i></div>
-                    <div class="stat" style="margin-top:7px"><span class="k">downloaded</span><span class="v" id="s-bytes">—</span></div>
-                    <div class="stat"><span class="k">budget</span><span class="v" id="s-budget">—</span></div>
-                    <div class="stat"><span class="k">resolution</span><span class="v" id="s-dpr">—</span></div>
+                    <div class="stat" style="margin-top:5px"><span class="k">on cooldown</span><span class="v" id="s-cooling">—</span></div>
+                    <div class="stat"><span class="k">viewpoint</span><span class="v" id="s-inflight">—</span></div>
+                    <div class="stat"><span class="k">downloaded</span><span class="v" id="s-bytes">—</span></div>
+                    <div class="stat"><span class="k">requests</span><span class="v" id="s-requests">—</span></div>
+                    <div class="stat"><span class="k">avg request</span><span class="v" id="s-latency">—</span></div>
+
+                    <h3 class="sub">frame</h3>
+                    <div class="stat"><span class="k">graphics api</span><span class="v" id="s-api">—</span></div>
+                    <div class="stat" title="Per-octree-node frustum culling: splats that survived the cull, out of the resident total the compute pass tested.">
+                        <span class="k">frustum cull</span><span class="v" id="s-cull">—</span>
+                    </div>
+                    <p class="why" id="s-cull-why"></p>
+                    <div class="stat"><span class="k">buffer churn</span><span class="v" id="s-churn">—</span></div>
+                    <div class="stat"><span class="k">render scale</span><span class="v" id="s-dpr">—</span></div>
                     <div class="stat"><span class="k">cam distance</span><span class="v" id="s-dist">—</span></div>
                     <div class="stat"><span class="k">frame</span><span class="v" id="s-frame">—</span></div>
                     <div class="stat"><span class="k">fps</span><span class="v" id="s-fps">—</span></div>
+
+                    <h3 class="sub">adaptive quality</h3>
+                    <div class="stat"><span class="k">tier</span><span class="v" id="s-tier">off</span></div>
+                    <div class="bar"><i id="s-tier-bar"></i></div>
+                    <p class="why" id="s-tier-why"></p>
                 </div>
 
                 <div id="help" class="overlay">

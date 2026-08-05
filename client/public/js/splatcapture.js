@@ -33,8 +33,13 @@
 // Per view, three passes:
 //   * scene pass   → rtScene (RGBA16F + float depth): the lit scene shaded in
 //     LINEAR light (HDR, no encode). alpha channel = accumulated coverage;
-//     opaque + alphaMode=MASK write depth, alphaMode=BLEND glass does not (its
-//     depth is the surface behind).
+//     opaque + alphaMode=MASK write depth, genuinely see-through glass does not
+//     (its depth is the surface behind). WHICH surfaces count as see-through is
+//     decided by the transmissivity gate (oit.js prepareOITScene +
+//     transmissive.js), NOT by the raw alphaMode=BLEND flag — Trellis stamps that
+//     on nearly everything, which used to put whole scenes on the OIT layer (three
+//     geometry passes per view instead of one) and leak the depth of the room
+//     behind every mis-tagged wall. `&oitall=1` restores the old behaviour.
 //   * present pass → rtColor (RGBA8): fullscreen triangle applying a fixed
 //     ACES-filmic tone map + sRGB encode (no auto-exposure) — the display colour
 //     the refs store and gsplat trains against. Done in our own shader (stored
@@ -67,17 +72,27 @@ import {
     createCaptureRenderer,
     DEPTH_CODE_MAX,
     prepareCaptureObject,
+    renderProfile,
     setupCaptureLighting,
 } from "./capturecore.js";
+// The transmissivity gate's escape hatch (&oitall=1) — see oit.js prepareOITScene.
+import { oitPolicy } from "./oit.js";
 // The bake rig + lit PBR materials live in splatlight.js (shared with the debug
 // viewers). The server sends splat/stage5.py's LIGHTING in the manifest, and
 // `normalizeLighting` falls back to the shared defaults when it's absent.
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
-const POST_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2); // gzip+POST pool
+// POST pool: these swizzle, pack, and POST — no pixel codec runs here (see the wire
+// note in splatcapture-worker.js). Capped low on purpose: they share the container's
+// cores with the render thread and the GPU process, so more threads here is not free.
+const POST_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
 const MAX_PARSE_INFLIGHT = 4; // concurrent GLB parses while streaming the bundle
 const READ_SEGMENTS = 3; // readback segments in flight (ring depth)
 const SEGMENT_VIEWS = 8; // views per segment → ONE getBufferSubData per 8 views
-const POST_BATCH_BYTES = 24 * 1024 * 1024; // ~4 views/batch at 1024² (worker-side)
+// RAW bytes per POST batch → the worker's flush THRESHOLD, not a cap: a readback
+// segment hands it SEGMENT_VIEWS at once and `flush` drains the whole queue, so the
+// actual body is normally SEGMENT_VIEWS wide regardless. Lowering this only makes the
+// worker post sooner on a partial queue.
+const POST_BATCH_BYTES = 24 * 1024 * 1024;
 const MESH_BUNDLE_MAGIC = "SMB1";
 // Frame batches go over the wire as gzip-wrapped SRF1 (SZC1) — built, compressed,
 // and POSTed by a POOL of post workers (splatcapture-worker.js) that own everything
@@ -136,6 +151,39 @@ function bucketLine(buckets, n) {
     );
 }
 
+// The per-pass breakdown, as `pass cpu/gpu ms xN draws`. `gpu` is averaged over the
+// SAMPLED views only (renderProfile.gpuEvery), which is why it has its own divisor;
+// `-` means the timer-query extension was unavailable, in which case cpu is all we
+// get and a high draw count is the thing to read.
+function profileLine(p) {
+    const n = Math.max(1, p.views);
+    const g = Math.max(1, p.gpuViews);
+    const passes = Object.keys(p.cpu);
+    if (passes.length === 0) return "no passes profiled";
+    return (
+        passes
+            .map((k) => {
+                const gpu = p.gpu[k] === undefined ? "-" : (p.gpu[k] / g).toFixed(2);
+                return `${k} ${(p.cpu[k] / n).toFixed(2)}/${gpu} x${(p.calls[k] / n).toFixed(0)}`;
+            })
+            .join(" · ") + ` (cpu/gpu ms · draws, ${p.gpuStatus})`
+    );
+}
+
+function profileStats(p) {
+    const n = Math.max(1, p.views);
+    const g = Math.max(1, p.gpuViews);
+    const out = { gpu_timing: p.gpuStatus, gpu_sampled_views: p.gpuViews };
+    for (const k of Object.keys(p.cpu)) {
+        out[`${k}_cpu_ms`] = Number((p.cpu[k] / n).toFixed(3));
+        out[`${k}_draws`] = Number((p.calls[k] / n).toFixed(1));
+        if (p.gpu[k] !== undefined) {
+            out[`${k}_gpu_ms`] = Number((p.gpu[k] / g).toFixed(3));
+        }
+    }
+    return out;
+}
+
 function stagePath(tail) {
     return (
         `${API}/runs/${encodeURIComponent(RUN)}/splat/stage5/` +
@@ -173,11 +221,20 @@ function createReadbackRing(renderer, resolution) {
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     let open = 0; // segment currently accumulating views
 
+    // How long sealed segments waited on their fence, and how many views they held.
+    // This is the GPU-vs-CPU discriminator: a fence that is already signaled the
+    // first time we look means the device finished while the JS thread was still
+    // working, so the device is not the wall. (Detection lag is bounded by the poll
+    // interval, which is a MessageChannel yield — sub-millisecond.)
+    const fence = { waitMs: 0, sealed: 0 };
+
     function seal() {
         const seg = segments[open];
         if (seg.views.length === 0 || seg.sync) return;
         seg.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        seg.sealedAt = performance.now();
         gl.flush();
+        fence.sealed += 1;
         open = (open + 1) % segments.length;
     }
 
@@ -205,7 +262,10 @@ function createReadbackRing(renderer, resolution) {
             const seg = segments[(open + i) % segments.length];
             if (!seg.sync) continue;
             const s = gl.clientWaitSync(seg.sync, 0, 0);
-            if (s === gl.ALREADY_SIGNALED || s === gl.CONDITION_SATISFIED) return seg;
+            if (s === gl.ALREADY_SIGNALED || s === gl.CONDITION_SATISFIED) {
+                fence.waitMs += performance.now() - seg.sealedAt;
+                return seg;
+            }
             return null; // oldest not ready — later ones can't be either
         }
         return null;
@@ -234,6 +294,10 @@ function createReadbackRing(renderer, resolution) {
         readySealed,
         collect,
         inFlight: () => segments.some((s) => s.sync !== null) || segments[open].views.length > 0,
+        fenceStats: () => ({
+            perSegmentMs: fence.waitMs / Math.max(1, fence.sealed),
+            viewsPerSegment: SEGMENT_VIEWS,
+        }),
     };
 }
 
@@ -295,6 +359,10 @@ async function loadScene(renderer, bundleUrl) {
     }
     let loaded = 0;
     let failed = 0;
+    // What the transmissivity gate decided, summed over the scene — reported once
+    // loading finishes so a mis-gated scene is visible immediately instead of being
+    // silently baked into the supervision.
+    const oit = { oitMeshes: 0, forcedOpaque: 0 };
     const inflight = new Set();
     while (true) {
         const idLenB = await r.readExact(4);
@@ -309,9 +377,11 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                // id stamp (emissive.js / reflective.js match on it) + the matte
-                // discriminator + the OIT patch — see capturecore.js.
-                prepareCaptureObject(gltf.scene, id);
+                // id stamp (emissive.js / reflective.js / transmissive.js match on
+                // it) + the matte discriminator + the OIT gate — see capturecore.js.
+                const gate = prepareCaptureObject(gltf.scene, id);
+                oit.oitMeshes += gate.oitMeshes;
+                oit.forcedOpaque += gate.forcedOpaque;
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -324,7 +394,7 @@ async function loadScene(renderer, bundleUrl) {
         if (inflight.size >= MAX_PARSE_INFLIGHT) await Promise.race(inflight);
     }
     await Promise.allSettled(inflight);
-    return { scene, loaded, failed };
+    return { scene, loaded, failed, oit };
 }
 
 // --- frame post-processing (the worker owns swizzle + SRF1 pack + POST) ----------
@@ -377,12 +447,28 @@ async function runCapture() {
     );
 
     const plan = await (await fetch(new URL(manifest.cameras_url, API), { cache: "no-store" })).json();
-    const { scene, loaded, failed: badObjects } = await loadScene(
+    // Transmissivity gate policy, before any object is prepared: &oitall=1 restores
+    // the pre-gate behaviour (every alphaMode=BLEND mesh on the OIT layer) so a run
+    // can be A/B'd against it — see oit.js prepareOITScene.
+    oitPolicy.forceAll = params.get("oitall") === "1";
+    // Per-pass accounting is always on: a run is thousands of views long, so the
+    // per-view cost of a timestamp pair and an `info.render.calls` read is noise next
+    // to knowing which pass to attack. See renderProfile in capturecore.js.
+    renderProfile.enabled = true;
+    const { scene, loaded, failed: badObjects, oit } = await loadScene(
         renderer,
         new URL(manifest.bundle_url, API),
     );
     status(`scene: ${loaded} objects loaded${badObjects ? `, ${badObjects} failed` : ""}`);
     if (loaded === 0) throw new Error("no objects loaded from the mesh bundle");
+    // The gate's verdict. `see-through 0` on a scene with real windows, or a large
+    // `forced opaque` on a scene that should be mostly glass, both mean the name
+    // vocabulary in transmissive.js needs a look.
+    status(
+        `transparency: ${oit.oitMeshes} see-through mesh(es) on the OIT layer, ` +
+            `${oit.forcedOpaque} mis-tagged BLEND material(s) forced opaque` +
+            (oitPolicy.forceAll ? " — GATE DISABLED (&oitall=1)" : ""),
+    );
 
     // Fixed light rig (Phase 1): added once, identical for every view. The sun is
     // placed from the scene's bounds; the shadow map is rendered ONCE (static
@@ -434,6 +520,10 @@ async function runCapture() {
         });
     }
 
+    // `nozip=0` re-enables the gzip transport wrapper: a win over a real socket, pure
+    // cost over loopback (see `_WIRE_GZIP` in modal_capture.py).
+    const gzip = params.get("nozip") !== "1";
+
     // The render thread does ONLY GPU work + PBO copies; the depth swizzle, SRF1
     // packing, and POSTs live in a dedicated worker (splatcapture-worker.js) fed
     // by zero-copy buffer transfers — the profiled ~6 ms/view of post-processing
@@ -446,10 +536,8 @@ async function runCapture() {
         2 * batchViews,
         Math.floor((256 * 1024 * 1024) / (R * R * 6)),
     );
-    // POOL of post workers: readback segments round-robin across them, and each gzips
-    // + POSTs its own batches. Gzip is CPU-bound, so one worker would cap the page
-    // below the render rate once the server ingest stops being the wall.
-    const gzip = params.get("nozip") !== "1"; // &nozip=1 posts raw SRF1 (A/B the wire cost)
+    // POOL of post workers: readback segments round-robin across them, and each packs
+    // and POSTs its own frames.
     const workers = Array.from(
         { length: POST_WORKERS },
         () => new Worker("/js/splatcapture-worker.js"),
@@ -464,9 +552,18 @@ async function runCapture() {
             else if (ev.data.drained) drainedWorkers += 1;
         };
         w.postMessage({
-            cfg: { framesUrl: stagePath("/frames"), resolution: R, batchViews, gzip },
+            cfg: {
+                framesUrl: stagePath("/frames"),
+                resolution: R,
+                batchViews,
+                gzip,
+            },
         });
     }
+    status(
+        `wire: ${gzip ? "SZC1 (gzipped raw planes)" : "SRF1 (raw planes)"}` +
+            ` · ${POST_WORKERS} POST worker(s) · ${batchViews} views/batch`,
+    );
     let nextWorker = 0; // round-robin cursor for segment dispatch
 
     let renderedViews = 0;
@@ -475,6 +572,10 @@ async function runCapture() {
     // actually doing"; shown live, logged, and shipped in the finish stats.
     const buckets = { render: 0, collect: 0, spin: 0 };
     const t0 = performance.now();
+    // `progress` only rewrites the DOM, which nobody sees in a headless container, so
+    // the per-pass breakdown is ALSO echoed to the console on a slow cadence — that is
+    // the copy that reaches `modal app logs` while a run is still going.
+    let lastProfileLog = 0;
 
     while (queue.length || ring.inFlight()) {
         if (postError) throw postError;
@@ -509,6 +610,15 @@ async function runCapture() {
                     `(${renderedViews} rendered, ${rate.toFixed(1)} views/s) · ` +
                     bucketLine(buckets, Math.max(renderedViews, 1)),
             );
+            if (now - lastProfileLog > 30000) {
+                lastProfileLog = now;
+                console.log(
+                    `[capture] ${rate.toFixed(1)} views/s · ` +
+                        `${bucketLine(buckets, Math.max(renderedViews, 1))} · ` +
+                        `fence ${ring.fenceStats().perSegmentMs.toFixed(1)} ms/seg`,
+                );
+                console.log(`[capture] passes: ${profileLine(renderProfile)}`);
+            }
         }
         // Fences land ~1-3 ms after issue, but a setTimeout wait is clamped to
         // ~4 ms once nested — timer-pacing the whole loop. So while readbacks
@@ -529,7 +639,13 @@ async function runCapture() {
     const secs = (performance.now() - t0) / 1000;
     const rate = postedViews / Math.max(secs, 0.001);
     const statsLine = bucketLine(buckets, Math.max(postedViews, 1));
+    const fenceStats = ring.fenceStats();
     console.log(`[capture] ${rate.toFixed(1)} views/s · per-view ${statsLine}`);
+    console.log(`[capture] passes: ${profileLine(renderProfile)}`);
+    console.log(
+        `[capture] readback: fence signaled ${fenceStats.perSegmentMs.toFixed(1)} ms ` +
+            `after seal (${fenceStats.viewsPerSegment} views/segment)`,
+    );
     status(
         `rendered ${postedViews} views in ${secs.toFixed(1)}s ` +
             `(${rate.toFixed(1)} views/s · ${statsLine}) — finishing…`,
@@ -540,6 +656,9 @@ async function runCapture() {
             views_per_s: Number(rate.toFixed(2)),
             per_view_ms: perViewMs(buckets, Math.max(postedViews, 1)),
             resolution: R,
+            passes: profileStats(renderProfile),
+            fence_ms_per_segment: Number(fenceStats.perSegmentMs.toFixed(2)),
+            views_per_segment: fenceStats.viewsPerSegment,
         },
     });
     if (fin.missing && fin.missing > 0) {

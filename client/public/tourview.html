@@ -1,0 +1,121 @@
+<!doctype html>
+<!-- Tour mask inspector — a stripped-down stand-in for the prod walkthrough
+     (prod_client/), for looking at what a capture actually produced: every 360
+     pano of a captured tour, and the per-pixel object-ID mask (idmask.js) that
+     drives hover + highlight, sampled exactly the way the real viewer will.
+     Deliberately knows nothing about publishing, R2, or the nav graph. All logic
+     lives in js/tourview.js. -->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="server-url" content="http://127.0.0.1:8765" />
+        <title>starshot · tour masks</title>
+        <style>
+            :root {
+                --bg: #0c0d10;
+                --panel: #16181d;
+                --panel-2: #1c1e24;
+                --line: #2a2d35;
+                --text: #e6e6e6;
+                --text-dim: #b8bcc4;
+                --text-faint: #7a808c;
+                --accent: #9ad4ff;
+                --accent-line: #4a8fd8;
+                --green: #8bd17c;
+                --red: #ff8080;
+            }
+            * { box-sizing: border-box; }
+            html, body { height: 100%; margin: 0; }
+            body {
+                background: var(--bg);
+                color: var(--text);
+                font: 12px/1.45 "SF Mono", ui-monospace, Menlo, monospace;
+                display: flex;
+                flex-direction: column;
+            }
+            header {
+                display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+                padding: 10px 14px; border-bottom: 1px solid var(--line);
+                background: var(--panel);
+            }
+            header h1 { margin: 0 8px 0 0; font-size: 13px; letter-spacing: 0.04em; }
+            header .spacer { flex: 1; }
+            header a { color: var(--accent); text-decoration: none; font-size: 10px; }
+            header a:hover { text-decoration: underline; }
+            select, button {
+                font: inherit; color: var(--text-dim); background: var(--panel-2);
+                border: 1px solid var(--line); border-radius: 4px; padding: 5px 9px;
+                cursor: pointer; max-width: 380px;
+            }
+            button:hover:not(:disabled), select:hover { border-color: var(--accent-line); color: #cfe3fb; }
+            button.on { background: #21344e; border-color: var(--accent-line); color: #cfe3fb; }
+            button:disabled { opacity: 0.45; cursor: default; }
+
+            main { flex: 1; display: flex; min-height: 0; }
+            #list {
+                flex: 0 0 240px; overflow-y: auto; border-right: 1px solid var(--line);
+                background: var(--panel);
+            }
+            #list .row {
+                padding: 6px 10px; border-bottom: 1px solid #1f2128; cursor: pointer;
+                display: flex; align-items: baseline; gap: 6px;
+            }
+            #list .row:hover { background: rgba(255, 255, 255, 0.03); }
+            #list .row.sel { background: #1d2a3a; }
+            #list .row .n { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+            #list .row .id { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #list .row .zone { margin-left: auto; color: var(--text-faint); font-size: 10px; }
+            #list .row.nomask .id { color: var(--text-faint); }
+
+            #stage { flex: 1; position: relative; min-width: 0; background: #07080a; }
+            #view { position: absolute; inset: 0; }
+            #view canvas { display: block; width: 100%; height: 100%; }
+            .overlay {
+                position: absolute; pointer-events: none; border-radius: 5px;
+                border: 1px solid var(--line); background: rgba(8, 10, 14, 0.82);
+                padding: 6px 9px; backdrop-filter: blur(4px);
+            }
+            #hud { left: 12px; bottom: 12px; max-width: 70%; }
+            #hud .obj { color: var(--accent); }
+            #hud .dim { color: var(--text-faint); }
+            #stats { right: 12px; bottom: 12px; color: var(--text-dim); white-space: pre; }
+            #msg { left: 50%; top: 14px; transform: translateX(-50%); color: var(--text-dim); }
+            #msg.err { color: var(--red); border-color: #5a2a2a; }
+            #msg.ok { color: var(--green); }
+            #msg[hidden] { display: none; }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <header>
+            <h1>tour masks</h1>
+            <select id="tour"><option>loading…</option></select>
+            <button id="prev" title="previous anchor (←)">←</button>
+            <button id="next" title="next anchor (→)">→</button>
+            <button id="highlight" class="on" title="highlight the hovered object (h)">highlight</button>
+            <button id="maskview" title="show the raw ID plane in false colour (m)">mask view</button>
+            <span class="spacer"></span>
+            <a href="/tours">tours index →</a>
+        </header>
+
+        <main>
+            <div id="list"></div>
+            <div id="stage">
+                <div id="view"></div>
+                <div id="msg" class="overlay">loading…</div>
+                <div id="hud" class="overlay"></div>
+                <div id="stats" class="overlay"></div>
+            </div>
+        </main>
+
+        <script type="module" src="/js/tourview.js"></script>
+    </body>
+</html>

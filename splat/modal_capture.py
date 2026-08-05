@@ -17,6 +17,15 @@ render conventions locked to the debug-viewer stack never fork. Frames are
 encoded on a thread pool via `stage5.write_reference_frame` into a LOCAL
 scratch dir (the caller syncs them to the Volume afterwards).
 
+WIRE: raw SRF1, NOT gzip-wrapped — the opposite of the local server's choice, for
+a reason specific to this host (see `_WIRE_GZIP`). Set STARSHOT_CAPTURE_GZIP=1 to
+put the transport codec back for an A/B.
+
+THROUGHPUT is reported live in the render heartbeat (`N img/s (avg M) · eta …`,
+see `_phase_msg`) and recorded in the returned summary as `img_per_s`. Stage 5
+runs for minutes per cell, so a capture that has halved in speed is otherwise
+invisible: the watchdog only notices a full stop.
+
 RENDERER: stage 5 is a WebGL/three.js workload (NOT CUDA), so it needs the
 GRAPHICS half of the driver, not just compute. It now gets it: `modal_app`
 registers the NVIDIA Vulkan ICD + EGL vendor itself (the driver ships the libs
@@ -51,6 +60,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -79,7 +89,15 @@ _SZC1_MAGIC = b"SZC1"  # gzip-wrapped SRF1 (client-side wire compression; see re
 # Encode workers / backlog mirror the server's capture ingest (routes.py):
 # zstd + the numpy filter release the GIL, so threads parallelize fine.
 _ENCODE_WORKERS = 8
-_ENCODE_BACKLOG = 8
+# Backlog is the FLOW-CONTROL depth, in POST batches held while their frames are
+# encoded/written. It is what makes a brief encode hiccup visible to the renderer:
+# the frames handler parks in `asyncio.wait` once the backlog is full, which delays
+# its response, which trips the page's `renderedViews - postedViews < maxOutstanding`
+# gate and stalls the render loop. At 8 batches × 4 views that was only ~32 views of
+# slack against a 42-view gate — tight enough that ordinary jitter propagated all
+# the way back to the GPU. 16 decouples them; the cost is bounded memory (each held
+# batch is one POST body, so ~16 × the batch size).
+_ENCODE_BACKLOG = 16
 # WATCHDOG. There is no single "is it stuck?" deadline, because the capture goes
 # through three phases with completely different expected durations, and only the
 # host knows which one it is in. Timing all of them from one clock started at
@@ -99,16 +117,62 @@ _ENCODE_BACKLOG = 8
 #             meaningful, because it measures work of a knowable size.
 # After the first frame, a long silence is a wedged renderer as before.
 _BOOT_GRACE_S = 180.0
+# Once the page's assets have been served, it asks for its work order almost
+# immediately — the manifest fetch is the second thing `runCapture` does. So a page
+# that has loaded and then gone quiet for this long is WEDGED, not slow, and the
+# most likely reason is that `getContext("webgl2")` never returned: that call is
+# synchronous, so when the GPU process cannot produce a context the page neither
+# proceeds nor throws, and no amount of page-side error handling can report it.
+# Failing fast here is what turns a 3-minute silent boot into a named error and lets
+# the next backend be tried while it still might help.
+_PAGE_SILENT_S = 45.0
 _BUNDLE_STALL_S = 120.0
 _FIRST_FRAME_GRACE_S = 420.0
 _STALL_S = 180.0
 _POLL_S = 2.0
-# Render-backend attempts, in order. "vulkan" = ANGLE/Vulkan (the NVIDIA device
-# if a container ever exposes the ICD, else Mesa llvmpipe — the faster CPU
-# rasterizer); "swiftshader" = Google's CPU rasterizer, the fallback. Both run
-# with force=1 (see the module docstring): there's no hardware WebGL on Modal's
-# GPU containers today, and the unlit output is identical on a CPU backend.
-_RENDER_MODES = ("vulkan", "swiftshader")
+# Trailing window for the live images/second readout in the render heartbeat
+# (mirrors the local server's `_stage5_capture_rate`). Short enough that the number
+# reacts to a stall, long enough not to jitter between two-second polls.
+_RATE_WINDOW_S = 5.0
+# WIRE COMPRESSION IS OFF HERE, deliberately, and this is NOT the same trade the
+# local server makes. The page can gzip each SRF1 batch before POSTing it
+# (splatcapture-worker.js), which is a clear win over a real socket: it was added
+# because the local server's single asyncio event loop — on Windows, so no uvloop —
+# was measured saturating a core just ingesting the raw ~6 MB/view bodies.
+#
+# In THIS container the browser and this host are the same machine talking over
+# 127.0.0.1, so the wire is a memory copy and the bytes were never the constraint.
+# What gzip buys is nothing; what it costs is a compress in the page's post workers
+# plus an inflate here, for every view, on top of the sub-left+zstd that actually
+# produces the .szf (~12 ms/view). Measured across three cells the capture floors
+# at ~53 views/s even when the GPU is idle (render 0.23 ms/view), and 4 post workers
+# × ~80 MB/s of deflate ≈ 320 MB/s is exactly 53 views/s × 6 MB — i.e. the transport
+# codec, not the encode it wraps, is what the floor is made of. So skip it and let
+# the loopback carry raw SRF1. Both hosts still ACCEPT either framing (see the
+# `frames` handler's SZC1 check), so this is a per-run choice, not a format change.
+_WIRE_GZIP = bool(os.environ.get("STARSHOT_CAPTURE_GZIP"))
+# Render-backend attempts, in order, each tried until one renders a frame. All run
+# with force=1 (see the module docstring), which is a no-op on a hardware backend.
+#
+#   vulkan            ANGLE/Vulkan against the NVIDIA device — the fast path.
+#   vulkan-nosurface  the same, minus the Vulkan WSI surface extensions.
+#   swiftshader       Google's CPU rasterizer. Correct pixels, ~100x slower.
+#
+# The middle mode exists because of a real failure. `vkCreateInstance() failed: -7`
+# is VK_ERROR_EXTENSION_NOT_PRESENT — NOT a missing driver (that is -9). The driver
+# was healthy throughout: `probe_gpu_stack` enumerated the L40S with
+# DRIVER_ID_NVIDIA_PROPRIETARY and `vulkaninfo` built an instance happily. What
+# Chromium could not get was an INSTANCE EXTENSION, and the ones it asks for depend
+# on its ozone platform — in a container with no DISPLAY and no XDG_RUNTIME_DIR, the
+# platform surface extensions (VK_KHR_xcb_surface / VK_KHR_wayland_surface) are the
+# obvious candidates. `--disable-vulkan-surface` makes Chromium skip the swapchain
+# path and bit-blit instead, which is what the Chrome team's own headless-GPU recipe
+# uses and is harmless under `--headless=new`, where nothing reaches a screen.
+#
+# It is a separate MODE rather than an extra flag on `vulkan` because the plain mode
+# demonstrably worked on an earlier Chromium and this diagnosis is an inference: keep
+# both and let whichever works win. `renderer` in the summary records which one did.
+_RENDER_MODES = ("vulkan", "vulkan-nosurface", "swiftshader")
 # Debug: how many rendered frames to decode to PNG and publish mid-run, so the
 # picture-taking can be eyeballed WHILE stage 5 (and 6) continue.
 _SAMPLE_COUNT = 8
@@ -169,6 +233,47 @@ def _encode_batch(
 # --- loopback host ---------------------------------------------------------------
 
 
+def _print_capture_stats(tag: str, stats: dict[str, Any]) -> None:
+    """Print the page's end-of-capture accounting to the container log.
+
+    Without this the numbers only exist inside the returned summary, which is the
+    wrong place to read them from when the question is "which pass do I fix next".
+    The per-pass line is the important one: `cpu/gpu ms · draws` per pass says
+    whether a capture is submission-bound (high cpu, high draws, low gpu → merge
+    geometry or cut passes) or fill-bound (high gpu → fewer pixels), and those two
+    want opposite changes."""
+    per_view = stats.get("per_view_ms") or {}
+    if per_view:
+        buckets = " / ".join(f"{k} {v}" for k, v in per_view.items())
+        print(
+            f"{tag} capture: {stats.get('views_per_s')} views/s "
+            f"@ {stats.get('resolution')}² · {buckets} ms/view",
+            flush=True,
+        )
+    passes = stats.get("passes") or {}
+    names = [k[: -len("_cpu_ms")] for k in passes if k.endswith("_cpu_ms")]
+    if names:
+        parts = []
+        for n in names:
+            gpu = passes.get(f"{n}_gpu_ms")
+            parts.append(
+                f"{n} {passes[f'{n}_cpu_ms']}/{'-' if gpu is None else gpu}"
+                f" x{passes.get(f'{n}_draws')}"
+            )
+        print(
+            f"{tag} passes: {' · '.join(parts)}  (cpu/gpu ms · draws, "
+            f"{passes.get('gpu_timing')}, {passes.get('gpu_sampled_views')} gpu samples)",
+            flush=True,
+        )
+    if stats.get("fence_ms_per_segment") is not None:
+        print(
+            f"{tag} readback: fence signaled {stats['fence_ms_per_segment']} ms after "
+            f"seal ({stats.get('views_per_segment')} views/segment) — a value near zero "
+            f"means the GPU was already done and the wall is on the CPU side",
+            flush=True,
+        )
+
+
 def _make_app(state: dict[str, Any]):
     from aiohttp import web
 
@@ -178,6 +283,10 @@ def _make_app(state: dict[str, Any]):
 
     async def manifest(request):
         _check_token(request)
+        # The boot phase covers two very different states — "the browser hasn't
+        # loaded the page yet" and "the page is up but hasn't started work" — and
+        # only the second implicates our JS. This is the marker that separates them.
+        state["manifest_at"] = time.monotonic()
         return web.json_response(
             {
                 "run": state["run"],
@@ -214,10 +323,13 @@ def _make_app(state: dict[str, Any]):
         # Authoritative reset: a re-fetch (page reload / retried request) starts
         # the delivery over, so the counters must too or the watchdog would read a
         # half-sent bundle as further along than it is.
+        now = time.monotonic()
         state["bundle_bytes"] = 0
         state["bundle_meshes"] = 0
         state["bundle_done_at"] = None
-        state["bundle_last_write_at"] = time.monotonic()
+        state["bundle_last_write_at"] = now
+        state["bundle_started_at"] = now
+        state["bundle_samples"].clear()
         for node_id, sha in sorted(state["tier"].items()):
             data = await asyncio.to_thread(
                 (cas / sha[:2] / f"{sha}.glb").read_bytes
@@ -229,6 +341,11 @@ def _make_app(state: dict[str, Any]):
             state["bundle_bytes"] += len(data)
             state["bundle_meshes"] += 1
             state["bundle_last_write_at"] = time.monotonic()
+            # One (time, cumulative bytes, cumulative meshes) sample per mesh — the
+            # series `_load_rate` differentiates for the live delivery speed.
+            state["bundle_samples"].append(
+                (state["bundle_last_write_at"], state["bundle_bytes"], state["bundle_meshes"])
+            )
         await resp.write_eof()
         state["bundle_done_at"] = time.monotonic()
         return resp
@@ -257,9 +374,16 @@ def _make_app(state: dict[str, Any]):
                 if exc is not None:
                     state["encode_errors"].append(f"{vids[0]}…{vids[-1]}: {exc}")
                     return
-                state["last_frame_at"] = time.monotonic()
+                # A view is DONE when its frame is on disk, so time the completions
+                # here — that is what the heartbeat's img/s and the summary's
+                # `img_per_s` are both measured from.
+                now = time.monotonic()
+                state["last_frame_at"] = now
+                if state["first_frame_at"] is None:
+                    state["first_frame_at"] = now
                 for vid in vids:
                     state["pending"].discard(vid)
+                    state["frame_times"].append(now)
                 state["done"] += len(vids)
 
             fut.add_done_callback(_encoded)
@@ -277,6 +401,7 @@ def _make_app(state: dict[str, Any]):
             state["renderer"] = payload["renderer"]
         if payload.get("stats"):
             state["stats"] = payload["stats"]
+            _print_capture_stats("[refs]", payload["stats"])
         if payload.get("error"):
             state["client_error"] = str(payload["error"])
         while state["outstanding"]:
@@ -295,7 +420,9 @@ def _make_app(state: dict[str, Any]):
     async def _log_requests(request, handler):
         """Print every loopback request → status to the container log, so the
         request SEQUENCE (page → three modules → manifest → bundle → frames)
-        pinpoints where a stalled capture got stuck."""
+        pinpoints where a stalled capture got stuck. Also stamps the last time the
+        page asked for ANYTHING, which is what `_PAGE_SILENT_S` measures from."""
+        state["last_http_at"] = time.monotonic()
         try:
             resp = await handler(request)
         except web.HTTPException as exc:
@@ -382,16 +509,18 @@ _COMMON_FLAGS = [
     "--disable-renderer-backgrounding",
     "--disable-backgrounding-occluded-windows",
     "--window-size=480,360",
+    # Exposes EXT_disjoint_timer_query_webgl2, which the capture page uses for
+    # per-pass GPU time (see `renderProfile` in capturecore.js). Desktop Chrome
+    # already enables it via a driver-bug workaround, so this is belt-and-braces —
+    # the page reports `gpu_timing: unavailable` and falls back to CPU-only pass
+    # accounting if it is missing.
+    "--enable-webgl-developer-extensions",
 ]
 # GPU attempt: ANGLE over Vulkan against the NVIDIA driver. Translate GL ES →
 # Vulkan, enable the Vulkan backend, bypass Chrome's GPU + GPU-process-sandbox
 # blocklists in the container, and DISABLE THE GPU WATCHDOG (headless server GPU
-# init can trip it → context loss). NOTE: we deliberately do NOT pass
-# `--disable-vulkan-surface` — three.js's WebGLRenderer allocates a canvas
-# default framebuffer, which needs a Vulkan surface; disabling it loses the
-# WebGL context ~immediately on init (that flag is only safe for pure-offscreen
-# WebGPU that never touches a canvas). On a container without the NVIDIA
-# graphics libs this resolves to Mesa llvmpipe (CPU); with them it uses the GPU.
+# init can trip it → context loss). On a container without the NVIDIA graphics libs
+# this resolves to Mesa llvmpipe (CPU); with them it uses the GPU.
 _GPU_FLAGS = [
     "--use-angle=vulkan",
     "--enable-features=Vulkan",
@@ -399,16 +528,58 @@ _GPU_FLAGS = [
     "--disable-gpu-sandbox",
     "--disable-gpu-watchdog",
 ]
+# Drop the Vulkan WSI surface extensions (see `_RENDER_MODES`). Presentation falls
+# back to a bit blit, which is all a headless capture needs — it reads pixels out of
+# its own framebuffers and never presents to a screen.
+_GPU_NOSURFACE_FLAGS = [*_GPU_FLAGS, "--disable-vulkan-surface"]
 # CPU attempt: conformant software WebGL — identical pixels, slower. The page
 # rejects software GL unless the URL carries &force=1 (added by the caller).
-_SW_FLAGS = ["--use-gl=angle", "--use-angle=swiftshader"]
+#
+# `--enable-unsafe-swiftshader` is REQUIRED, not optional. Chromium deprecated the
+# automatic SwiftShader fallback for WebGL: without this flag a modern build will
+# refuse to hand a software context to `getContext("webgl2")` even when
+# `--use-angle=swiftshader` is set, and the request does not fail cleanly — the page
+# blocks in context creation and simply never starts. That is indistinguishable in
+# the logs from a slow scene load, and it is why the SwiftShader retry stopped
+# rescuing runs whose Vulkan init had failed: BOTH backends produced no context, and
+# each burned the full boot grace in silence.
+_SW_FLAGS = [
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+]
+# The flag set each `_RENDER_MODES` entry launches with.
+_MODE_FLAGS = {
+    "vulkan": _GPU_FLAGS,
+    "vulkan-nosurface": _GPU_NOSURFACE_FLAGS,
+    "swiftshader": _SW_FLAGS,
+}
 
 
-def _launch(url: str, gpu: bool, profile_dir: Path) -> subprocess.Popen:
+def chromium_version() -> str:
+    """`chromium --version`, or a reason it could not be read.
+
+    Worth recording: the capture's GL backend is entirely at the mercy of which
+    Chromium the image's unpinned `apt_install` happened to fetch, and a silent
+    version bump has already broken it once — a newer build both asked Vulkan for an
+    instance extension the container could not supply AND began refusing SwiftShader
+    without `--enable-unsafe-swiftshader`, so both backends died at once. With the
+    version in the summary, "it worked yesterday" becomes checkable."""
+    try:
+        r = subprocess.run(
+            [_chromium_binary(), "--version"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return (r.stdout or r.stderr).strip() or "(no output)"
+    except Exception as exc:  # diagnostic only — never fail a capture over it
+        return f"<{type(exc).__name__}: {exc}>"
+
+
+def _launch(url: str, mode: str, profile_dir: Path) -> subprocess.Popen:
     args = [
         _chromium_binary(),
         *_COMMON_FLAGS,
-        *(_GPU_FLAGS if gpu else _SW_FLAGS),
+        *_MODE_FLAGS[mode],
         f"--user-data-dir={profile_dir}",
     ]
     if _CAPTURE_DEBUG:
@@ -450,21 +621,112 @@ def _phase(state: dict[str, Any]) -> str:
     return "boot"
 
 
+def _capture_rate(state: dict[str, Any]) -> tuple[float, float]:
+    """(live images/second over the trailing window, session mean since the first
+    frame). Computed at read time so the window is always current, and the live
+    figure decays to zero within one window after frames stop — which is what makes
+    it useful next to the watchdog rather than merely decorative."""
+    now = time.monotonic()
+    buf: deque[float] = state["frame_times"]
+    while buf and now - buf[0] > _RATE_WINDOW_S:
+        buf.popleft()
+    first = state["first_frame_at"]
+    if first is None:
+        return 0.0, 0.0
+    # During warm-up divide by the elapsed time, not the full window, so the first
+    # couple of polls aren't understated.
+    window = min(_RATE_WINDOW_S, max(now - first, 1e-3))
+    elapsed = now - first
+    avg = state["done"] / elapsed if elapsed > 1e-3 else 0.0
+    return len(buf) / window, avg
+
+
+def _load_rate(state: dict[str, Any]) -> tuple[float, float, float]:
+    """Bundle-delivery speed: (live MB/s, mean MB/s, live meshes/s). Differentiates
+    the per-mesh sample series the `/bundle` handler records, so the live figures
+    reflect what the CLIENT is consuming — aiohttp's write backpressures against the
+    transport, so those writes complete at the rate the browser drains them, not at
+    the rate we can read the CAS.
+
+    The load phase is where a big cell spends minutes before frame 1, and a stalled
+    download and a merely slow one look identical on a `133/807 meshes` counter.
+
+    The live window is measured against NOW, not against the newest sample, which is
+    the whole point: if delivery stopped twenty seconds ago the numerator is zero and
+    the rate reads 0, whereas differencing the last two samples would keep reporting
+    the healthy rate it had before it died."""
+    buf: deque[tuple[float, int, int]] = state["bundle_samples"]
+    now = time.monotonic()
+    # Keep the newest sample that has already fallen out of the window: it is the
+    # baseline the window's delta is measured from.
+    while len(buf) >= 2 and now - buf[1][0] > _RATE_WINDOW_S:
+        buf.popleft()
+    base_t, base_b, base_m = buf[0] if buf else (now, state["bundle_bytes"], state["bundle_meshes"])
+    dt = now - base_t
+    live_mb = (state["bundle_bytes"] - base_b) / dt / 1e6 if dt > 1e-3 else 0.0
+    live_mesh = (state["bundle_meshes"] - base_m) / dt if dt > 1e-3 else 0.0
+    started = state.get("bundle_started_at")
+    elapsed = (now - started) if started else 0.0
+    avg_mb = state["bundle_bytes"] / elapsed / 1e6 if elapsed > 1e-3 else 0.0
+    return live_mb, avg_mb, live_mesh
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Compact ETA: `48s`, `12m30s`, `2h05m`."""
+    s = int(max(seconds, 0))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 def _phase_msg(state: dict[str, Any], mode: str) -> str:
     """Heartbeat text for the current phase. Before the first frame the useful
     number is how much of the SCENE has arrived — `0/N views` is constant through
-    the entire load and reads as a hang."""
+    the entire load and reads as a hang. Once frames flow the useful number is the
+    THROUGHPUT: a capture that has slowed by half is otherwise indistinguishable
+    from one that is merely large, and the watchdog only fires on a full stop."""
     phase = _phase(state)
     if phase == "load":
         got, total = state["bundle_bytes"], state["bundle_total_bytes"]
         span = (
             f"{got / 1e9:.2f}/{total / 1e9:.2f} GB" if total else f"{got / 1e9:.2f} GB"
         )
+        live_mb, avg_mb, live_mesh = _load_rate(state)
+        # ETA off the MEAN rather than the live rate: mesh sizes vary by orders of
+        # magnitude, so a live-rate ETA swings wildly on a series this coarse.
+        eta = ""
+        if total and avg_mb > 1e-6:
+            eta = f" · eta {_fmt_eta(max(total - got, 0) / (avg_mb * 1e6))}"
         return (
             f"load[{mode}] {state['bundle_meshes']}/{len(state['tier'])} meshes · {span}"
+            f" · {live_mb:.0f} MB/s (avg {avg_mb:.0f}) · {live_mesh:.1f} mesh/s{eta}"
         )
     if phase == "build":
         return f"build[{mode}] scene delivered, parsing + baking"
+    if phase == "boot":
+        # Naming which half of boot we are in turns a silent 3-minute timeout into
+        # an immediate diagnosis: still "launching" means the browser or the page
+        # never came up (missing asset, dead GPU process), while "page up" means our
+        # JS is running and stuck somewhere before it asked for the bundle.
+        return (
+            f"boot[{mode}] page up, fetching plan + bundle"
+            if state.get("manifest_at")
+            else f"boot[{mode}] launching browser, page has not requested the manifest yet"
+        )
+    if phase == "render":
+        rate, avg = _capture_rate(state)
+        # `pending` is the authoritative outstanding set — on a resumed render
+        # `total - done` would count views that were already on disk before this
+        # session started.
+        left = len(state["pending"])
+        eta = f" · eta {_fmt_eta(left / avg)}" if avg > 1e-6 else ""
+        # "ref/s" to match the stage's own vocabulary — these are reference frames,
+        # and the heartbeat prefix is already `[refs]`. The summary field stays
+        # `img_per_s`, which is what the local server records and what every
+        # existing status.json already carries, so runs remain comparable.
+        return f"render[{mode}] {rate:.1f} ref/s (avg {avg:.1f}){eta}"
     return f"{phase}[{mode}]"
 
 
@@ -530,6 +792,8 @@ def capture_refs(
     rendered = 0
     renderer = None
     stats = None
+    img_per_s = None
+    browser = None
 
     if pending:
         (refs_dir / stage5.FRAMES_DIRNAME).mkdir(parents=True, exist_ok=True)
@@ -553,6 +817,18 @@ def capture_refs(
                 max_workers=_ENCODE_WORKERS, thread_name_prefix="szf-encode"
             ),
             "last_frame_at": None,
+            # Set when the page asks for its work order — the signal that its module
+            # graph evaluated and its JS is running (see `_phase_msg`).
+            "manifest_at": None,
+            # Last loopback request of any kind, from the logging middleware. Paired
+            # with `manifest_at` it separates "page still fetching its modules" from
+            # "page loaded and then went silent" (see `_PAGE_SILENT_S`).
+            "last_http_at": None,
+            # Throughput tracking (see `_capture_rate`): a trailing-window deque of
+            # frame-completion times for the live rate, plus the first-frame stamp
+            # that `done` is averaged over for the session mean.
+            "frame_times": deque(),
+            "first_frame_at": None,
             "finished": False,
             "renderer": None,
             "client_error": None,
@@ -565,6 +841,10 @@ def capture_refs(
             "bundle_meshes": 0,
             "bundle_last_write_at": None,
             "bundle_done_at": None,
+            # Delivery-speed series for `_load_rate`: one (time, cumulative bytes,
+            # cumulative meshes) sample per mesh, pruned to the rate window.
+            "bundle_samples": deque(),
+            "bundle_started_at": None,
             "timeout": None,
         }
         if progress is not None:
@@ -573,6 +853,8 @@ def capture_refs(
                 f"tier: {len(tier)} meshes · "
                 f"{state['bundle_total_bytes'] / 1e9:.2f} GB",
             )
+        browser = chromium_version()
+        print(f"[host] browser: {browser}", flush=True)
         stop = _serve(state)
         try:
             for mode in _RENDER_MODES:
@@ -586,19 +868,26 @@ def capture_refs(
                 state["bundle_meshes"] = 0
                 state["bundle_last_write_at"] = None
                 state["bundle_done_at"] = None
+                state["bundle_samples"].clear()
+                state["bundle_started_at"] = None
+                state["manifest_at"] = None
+                state["last_http_at"] = None
                 state["timeout"] = None
                 # force=1 always: the page refuses a software backend otherwise,
                 # which would break the SwiftShader fallback. A no-op on the
-                # hardware path (see the docstring).
+                # hardware path (see the docstring). nozip=1 unless
+                # STARSHOT_CAPTURE_GZIP is set: on loopback the transport codec is
+                # pure cost (see `_WIRE_GZIP`).
                 url = (
                     f"http://127.0.0.1:{_PORT}/splatcapture.html"
                     f"?api=http://127.0.0.1:{_PORT}&run={run}&slot={slot}"
                     f"&model={model}&token={_TOKEN}&force=1"
+                    + ("" if _WIRE_GZIP else "&nozip=1")
                 )
                 profile = Path(f"/tmp/splatcap-profile-{mode}")
                 shutil.rmtree(profile, ignore_errors=True)
                 started = time.monotonic()
-                proc = _launch(url, gpu=(mode == "vulkan"), profile_dir=profile)
+                proc = _launch(url, mode, profile)
                 try:
                     while True:
                         time.sleep(_POLL_S)
@@ -629,10 +918,27 @@ def capture_refs(
                             "load": (state["bundle_last_write_at"], _BUNDLE_STALL_S),
                             "boot": (started, _BOOT_GRACE_S),
                         }[phase]
+                        why = f"{phase} phase"
+                        # A page that fetched its assets and then asked for nothing
+                        # else is wedged rather than slow — almost always because
+                        # `getContext("webgl2")` never returned (a synchronous call,
+                        # so the page can neither continue nor report). Cut it short
+                        # and say so, instead of spending the whole boot grace.
+                        if (
+                            phase == "boot"
+                            and state["manifest_at"] is None
+                            and state["last_http_at"] is not None
+                        ):
+                            since, limit = state["last_http_at"], _PAGE_SILENT_S
+                            why = (
+                                "page loaded its modules but never requested the "
+                                "manifest — no WebGL context (check the gpu-process "
+                                "lines above)"
+                            )
                         idle = time.monotonic() - (since if since else started)
                         if idle > limit:
                             state["timeout"] = (
-                                f"{phase} phase made no progress for "
+                                f"{why} made no progress for "
                                 f"{idle:.0f}s (limit {limit:.0f}s)"
                             )
                             print(
@@ -654,6 +960,16 @@ def capture_refs(
         renderer = state["renderer"]
         rendered = state["done"]
         stats = state["stats"]
+        # The HOST's own throughput measurement (frames landed on disk ÷ time since
+        # the first one), recorded beside the page's self-reported `capture_stats`.
+        # Two independent numbers are worth having: the page's excludes whatever it
+        # was blocked on before its first frame, and a shard that dies mid-run still
+        # leaves this one behind.
+        first = state["first_frame_at"]
+        if first is not None and state["done"]:
+            elapsed = time.monotonic() - first
+            if elapsed > 1e-3:
+                img_per_s = round(state["done"] / elapsed, 2)
         if state["pending"]:
             # Name the PHASE that gave up and how much of the scene had landed.
             # "stalled on both backends" alone reads like a capacity wall no
@@ -682,6 +998,9 @@ def capture_refs(
         "rendered": rendered,
         "resumed": len(views) - len(pending),
         "renderer": renderer,
+        "browser": browser,
         "capture_stats": stats,
+        "img_per_s": img_per_s,
+        "wire_gzip": _WIRE_GZIP,
         "seconds": round(time.perf_counter() - t0, 1),
     }

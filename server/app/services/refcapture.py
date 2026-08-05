@@ -210,15 +210,19 @@ def _encode_batch(
     return out
 
 
-def submit_encode_batch(
-    refs_dir: Path, body: bytes, frames: list[tuple[str, int, int, int]]
-) -> Future:
-    """Queue one POST batch of captured views for SZF encoding on the shared
-    thread pool (body shared by reference — no pickling, no pipes). Returns a
-    future resolving to the written view ids."""
+def _ensure_pool() -> ThreadPoolExecutor:
     global _pool
     if _pool is None:
         _pool = ThreadPoolExecutor(
             max_workers=_ENCODE_WORKERS, thread_name_prefix="szf-encode"
         )
-    return _pool.submit(_encode_batch, str(refs_dir), body, frames)
+    return _pool
+
+
+def submit_encode_batch(
+    refs_dir: Path, body: bytes, frames: list[tuple[str, int, int, int]]
+) -> Future:
+    """Queue one POST batch of RAW captured views for SZF encoding on the shared
+    thread pool (body shared by reference — no pickling, no pipes). Returns a
+    future resolving to the written view ids."""
+    return _ensure_pool().submit(_encode_batch, str(refs_dir), body, frames)

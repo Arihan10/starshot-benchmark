@@ -12,8 +12,9 @@ resume signal, transforms writer) — it renders nothing itself:
     renders every (camera, face) of the plan LIT (PBR + baked per-object scene
     reflections), and streams raw frames back.
   * `server/app/services/refcapture.py` — the ORCHESTRATOR: launches a headless
-    Chromium/Edge at the capture page, ingests its frame batches, and encodes
-    frames on a process pool (this module's `write_reference_frame`).
+    Chromium/Edge at the capture page and ingests its frame batches. The page sends
+    RAW planes (SRF1, optionally gzip-wrapped as SZC1) and the host encodes them
+    (`write_reference_frame`) on a thread pool.
   * `server/app/api/routes.py` — the stage-5 endpoints (start/status, the
     capture manifest/frames/finish protocol, and the on-demand PNG preview).
 
@@ -93,18 +94,31 @@ FRAME_SUFFIX = ".szf"
 
 # --- the SZF frame container ---------------------------------------------------
 # frames/{view}.szf, little-endian:
-#   magic  b"SZF1"  | u16 resolution (square) | u8 filter | u8 reserved
+#   magic  b"SZF1"  | u16 resolution (square) | u8 filter | u8 codec
 #   u32 rgba_clen   | u32 depth_clen
-#   zstd(filtered RGBA8  [H,W,4], top-down)   rgba_clen bytes
-#   zstd(filtered u16-LE depth codes [H,W])   depth_clen bytes
+#   codec(filtered RGBA8  [H,W,4], top-down)   rgba_clen bytes
+#   codec(filtered u16-LE depth codes [H,W])   depth_clen bytes
 # `filter` 1 = sub-left (PNG "Sub": per-row, per-channel horizontal delta in the
 # plane's own unsigned dtype — wraps mod 2^8 / 2^16); 0 = raw. Filtered zstd-3
 # measured 28% smaller than raw zstd-3 on real frames for ~1 ms extra decode.
+#
+# `codec` names the stream compressor. It occupies the byte that used to be a
+# hard-coded zero `reserved`, so every frame written before this field existed
+# reads back as _CODEC_ZSTD — the container version does not need to move.
+#   0 = zstd     — what `write_reference_frame` produces, and the only writer.
+#   1 = deflate  — RAW deflate (no zlib/gzip wrapper). READ-ONLY: nothing writes it
+#                  now. It exists because a browser-side encode was tried (browsers
+#                  have `CompressionStream("deflate-raw")` and no zstd encoder) and
+#                  reverted — it was slower to capture AND, because Stage 6 re-reads
+#                  every frame every epoch, permanently worse to train on. Kept so
+#                  frames from that experiment still decode.
 FRAME_MAGIC = b"SZF1"
 FRAME_FORMAT = "szf1"          # transforms.json container tag
 _FRAME_HEADER = struct.Struct("<4sHBBII")
 _FILTER_RAW = 0
 _FILTER_SUBLEFT = 1
+CODEC_ZSTD = 0
+CODEC_DEFLATE = 1
 _FRAME_ZSTD_LEVEL = 3          # ~3 ms/512² view; level 1 is barely faster, 4% bigger
 
 # Depth VALUE semantics (independent of the container): planar-Z metres are
@@ -188,7 +202,17 @@ LIGHTING: dict[str, Any] = {
 # probe; every other surface is forced fully matte (view-INDEPENDENT: metalness 0,
 # roughness 1, metallic-roughness maps nulled), so the sun + emissive lights no longer
 # paint moving highlights on ordinary walls/furniture that Stage-6 SH would have to chase.
-COLOR_PIPELINE = "linear-aces-srgb-v9"
+# v10: TRANSPARENCY is decided the same way — by a NAME discriminator (client
+# transmissive.js) plus material-readable alpha — instead of by the raw
+# alphaMode=BLEND flag. Trellis marks nearly every surface BLEND (measured: 377 of
+# 383 objects on a hotel-room cell, versus 38 of 807 on a house), so honouring it put
+# whole scenes on the weighted-blended OIT layer. Two things change in the stored
+# pixels, and both are corrections: a mis-tagged wall now renders through the single
+# opaque pass, and — the reason this needs a version bump rather than being invisible
+# — it now writes its OWN depth instead of leaving the depth of whatever stands
+# behind it. Real glass (curated names, or a sub-cutoff constant alpha / alphaMap) is
+# unchanged, so the alpha-gated depth loss still sees through actual panes.
+COLOR_PIPELINE = "linear-aces-srgb-v10"
 
 # Sidecar under a cell's refs/ recording the capture settings the on-disk frames
 # were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).
@@ -454,10 +478,27 @@ def write_reference_frame(
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("wb") as f:
-        f.write(_FRAME_HEADER.pack(FRAME_MAGIC, r, _FILTER_SUBLEFT, 0, len(rgba_c), len(depth_c)))
+        f.write(
+            _FRAME_HEADER.pack(
+                FRAME_MAGIC, r, _FILTER_SUBLEFT, CODEC_ZSTD, len(rgba_c), len(depth_c)
+            )
+        )
         f.write(rgba_c)
         f.write(depth_c)
     tmp.replace(path)
+
+
+def _frame_decompressor(codec: int):
+    """The stream decompressor for an SZF `codec` byte (see the container block).
+    Raw deflate is `zlib` with negative wbits — no zlib/gzip wrapper — which is
+    exactly what the browser's `CompressionStream("deflate-raw")` emits."""
+    if codec == CODEC_ZSTD:
+        return _zstd()[1]
+    if codec == CODEC_DEFLATE:
+        import zlib
+
+        return lambda data: zlib.decompress(data, -zlib.MAX_WBITS)
+    raise ValueError(f"unknown SZF codec {codec}")
 
 
 def _read_frame(path: Path, *, want_rgba: bool, want_depth: bool):
@@ -466,12 +507,12 @@ def _read_frame(path: Path, *, want_rgba: bool, want_depth: bool):
     data = Path(path).read_bytes()
     if len(data) < _FRAME_HEADER.size or data[:4] != FRAME_MAGIC:
         raise ValueError(f"{path}: not an SZF reference frame")
-    _, r, filt, _, rgba_clen, depth_clen = _FRAME_HEADER.unpack_from(data)
+    _, r, filt, codec, rgba_clen, depth_clen = _FRAME_HEADER.unpack_from(data)
     if len(data) != _FRAME_HEADER.size + rgba_clen + depth_clen:
         raise ValueError(f"{path}: truncated SZF frame")
     if filt not in (_FILTER_RAW, _FILTER_SUBLEFT):
         raise ValueError(f"{path}: unknown SZF filter {filt}")
-    _, decompress = _zstd()
+    decompress = _frame_decompressor(codec)
     o = _FRAME_HEADER.size
     rgba = codes = None
     if want_rgba:

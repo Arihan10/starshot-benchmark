@@ -3,10 +3,24 @@
 // The capture measurement showed the page's single JS thread was the pipeline
 // wall (~6 ms/view of swizzle + pack + upload vs ~0.3 ms of actual rendering),
 // so everything after the GPU readback lands here instead: raw buffers arrive
-// as zero-copy transfers, the depth pack-pass RGBA is swizzled to uint16 codes,
-// frames are packed into SRF1 batches, gzip-wrapped (SZC1) so the raw ~6 MB/view
-// payload doesn't pace the single-threaded server ingest, and POSTed to the API.
+// as zero-copy transfers, frames are encoded, and the result is POSTed to the API.
 // The WebGL thread only renders, fences, and copies buffers out of the PBOs.
+//
+// WIRE: raw planes (SRF1), host encodes them — optionally gzip-wrapped as SZC1, which
+// is a win over a real socket and pure cost over loopback (`&nozip=1`).
+//
+// This worker deliberately does NOT compress pixels, and that is a measured decision
+// rather than an omission. Having it build each view's finished .szf (deflate, written
+// verbatim by the host) was tried and reverted: it ran at 6.4 img/s against 58 for raw
+// planes. The reasons are worth keeping, because they apply to any variant of the idea:
+//
+//   - It does not remove work, it relocates it. The post workers, the render thread and
+//     the host all share the container's 8 cores, so a codec here competes with the
+//     render loop it was supposed to unblock.
+//   - Over loopback the bytes were never the constraint, so there is nothing to buy.
+//   - Browsers ship no zstd encoder, so client-side encoding forces the STORED frames
+//     to deflate. Stage 6 re-reads every frame every epoch, making that a permanent
+//     tax on training in exchange for a capture-time win that did not materialize.
 //
 // Protocol (messages in):
 //   { cfg: { framesUrl, resolution, batchViews, gzip } } — once, before any frame
@@ -26,6 +40,8 @@ let cfg = null;
 let ready = [];
 let postsInFlight = 0;
 let draining = false;
+
+// --- SRF1 encode --------------------------------------------------------------
 
 function packBatch(frames, resolution) {
     const enc = new TextEncoder();
@@ -47,8 +63,7 @@ function packBatch(frames, resolution) {
 // Wrap the SRF1 batch as "SZC1" + gzip(SRF1). The server detects the marker and
 // inflates back to the byte-identical SRF1 body (refcapture.py / modal_capture.py),
 // so the SZF encode is unchanged — this only lifts the raw payload off the single-
-// threaded ingest. cfg.gzip === false (…&nozip=1) or no CompressionStream posts the
-// raw SRF1 blob instead (both servers accept either).
+// threaded ingest. A win over a real socket, pure cost over loopback.
 const GZIP_MARKER = new Uint8Array([0x53, 0x5a, 0x43, 0x31]); // "SZC1"
 
 async function encodeBody(frames, resolution) {
@@ -111,20 +126,21 @@ onmessage = (ev) => {
         void flush();
         return;
     }
-    // One readback segment: slice each view's planes out of the transferred
-    // buffer (subarray views — no copies). The RG8 depth plane already IS the
-    // little-endian uint16 codes the SRF1 wire + SZF store carry, so there is no
-    // per-pixel swizzle here — just pass the bytes through.
-    const n = cfg.resolution * cfg.resolution;
-    const colorBytes = n * 4;
-    const depthBytes = n * 2;
-    const viewBytes = colorBytes + depthBytes;
+    // One readback segment: per view, [RGBA8][RG8 depth] back to back.
+    const res = cfg.resolution;
+    const n = res * res;
+    const viewBytes = n * 6;
     const seg = new Uint8Array(m.segment);
+
+    // Pass the raw planes through as zero-copy subarray views.
+    const colorBytes = n * 4;
     for (let vi = 0; vi < m.ids.length; vi++) {
         const base = vi * viewBytes;
-        const rgba = seg.subarray(base, base + colorBytes);
-        const depth = seg.subarray(base + colorBytes, base + viewBytes);
-        ready.push({ id: m.ids[vi], rgba, depth });
+        ready.push({
+            id: m.ids[vi],
+            rgba: seg.subarray(base, base + colorBytes),
+            depth: seg.subarray(base + colorBytes, base + viewBytes),
+        });
     }
     void flush();
 };

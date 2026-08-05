@@ -13,6 +13,9 @@ export type PanoEntry = {
 	forward?: [number, number, number];
 	url: string;
 	placeholderUrl: string;
+	// The anchor's object-ID mask, when the capture produced one. Streamed
+	// separately from the image (see lib/orbit/idMasks.ts).
+	maskUrl?: string;
 	texture: Texture | null;
 	placeholderTexture: Texture | null;
 	hasFull: boolean;

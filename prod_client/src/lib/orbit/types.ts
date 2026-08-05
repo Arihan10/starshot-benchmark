@@ -9,6 +9,9 @@ export type TourSource = {
 	resolvePano: (file: string) => { url: string; placeholderUrl: string };
 	resolveProxy: (file: string) => string;
 	resolveMinimap: (file: string) => string;
+	// Object-ID masks sit beside their panos. They must NOT go through an image
+	// transformation edge: every byte is meaningful (see lib/orbit/idMasks.ts).
+	resolveMask: (file: string) => string;
 };
 
 // One bird's-eye slice: the scene rendered top-down, cut at a Y "level" (storey)
@@ -46,7 +49,16 @@ export type TourManifest = {
 		file: string;
 		name?: string; // POI label from the anchor namer; absent for unnamed anchors
 		zone?: string; // the zone this capture point belongs to (assigned server-side)
+		// The SID1 object-ID mask captured with this pano — the per-pixel object
+		// identity behind hover + highlight. Absent on tours captured before masks.
+		mask?: string;
 	}>;
+	// The directory those masks index into: global index i names objects[i - 1].
+	// `id` is the object's GLB stem, the same string the proxy and the dollhouse
+	// name their nodes with.
+	objects?: Array<{ id: string; name?: string }>;
+	mask_format?: string; // "sid1"
+	mask_size?: [number, number];
 	proxy?: string;
 	minimaps?: MinimapLevel[];
 	// Cross-zone connectors from the anchor planner (doors, stairs, ...): each

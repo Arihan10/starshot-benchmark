@@ -7,11 +7,19 @@
 // which keeps its own inline copy.
 
 import * as THREE from "three";
+import { isTransmissiveName } from "./transmissive.js";
 
 export const OIT_LAYER = 1;
 // α at/above which a transparent fragment counts as SOLID (writes depth + occludes):
 // window frames/mullions stay opaque, sub-cutoff glass blends and stays see-through.
 export const OIT_OPAQUE = 0.8;
+
+// Escape hatch for the transmissivity gate in `prepareOITScene`. `forceAll` puts
+// EVERY `alphaMode=BLEND` mesh back on the OIT layer — the pre-gate behaviour —
+// so a run can be A/B'd against it without a redeploy (the capture page wires
+// this to `&oitall=1`). Module-level, mirroring the `oitPass` singleton, because
+// scene prep happens per object from several call sites.
+export const oitPolicy = { forceAll: false };
 
 // oitPass selector values. 0 accumulate · 1 revealage · 2 depth pre-pass are the
 // weighted-blended OIT sub-passes; OPAQUE (3) is a passthrough that emits the
@@ -114,12 +122,43 @@ export function setOITBlend(m, accum) {
     m.blendDstAlpha = m.blendDst;
 }
 
+// Transparency this module can READ off the material, as opposed to the blanket
+// `alphaMode=BLEND` Trellis stamps on nearly everything: a sub-cutoff constant
+// alpha, or a dedicated alphaMap. glass.py's real panes carry neither — they bake
+// alpha into base-colour texels — so they are admitted by the NAME gate instead
+// (transmissive.js). Callers pass only already-`transparent` materials.
+function declaresTransmissive(m) {
+    if (m.alphaMap) return true;
+    return (m.opacity ?? 1) < OIT_OPAQUE;
+}
+
 // In-place lit-scene prep: generate missing normals, cast/receive shadows, force
 // DoubleSide with back-face shadowing (Trellis winding is unreliable), and route
-// transparent meshes onto the OIT layer with the weighted-blend patch. Material
-// reflectivity is decided elsewhere (reflective.js: keep the curated reflective
-// surfaces, force everything else matte) BEFORE this runs.
-export function prepareOITScene(root, oitPass) {
+// GENUINELY see-through meshes onto the OIT layer with the weighted-blend patch.
+// Material reflectivity is decided elsewhere (reflective.js: keep the curated
+// reflective surfaces, force everything else matte) BEFORE this runs.
+//
+// THE GATE. `material.transparent` alone is not evidence of transparency here:
+// Trellis marks nearly every surface `alphaMode=BLEND` (measured: 377 of 383
+// objects on a hotel-room cell), and honouring that put the whole scene on the OIT
+// layer — three full geometry passes per view instead of one. A mesh now reaches
+// OIT only when its object NAME says see-through (transmissive.js, the same
+// vocabulary glass.py gates its alpha bake on) or a material DECLARES transparency
+// in a readable way. Everything else is put back in the opaque queue, which also
+// restores its depth: a mis-tagged wall now writes its OWN depth instead of
+// leaking the depth of the room behind it.
+//
+// The decision is per MESH, because the OIT layer is assigned per mesh — one real
+// pane inside a multi-material window takes the whole mesh with it, and its α≈1
+// frame still writes depth in the pre-pass exactly as before.
+//
+// Returns `{ oitMeshes, forcedOpaque }` so callers can report what the gate did;
+// existing callers may ignore it.
+export function prepareOITScene(root, oitPass, opts = {}) {
+    const forceAll = opts.forceAll ?? oitPolicy.forceAll;
+    const named = isTransmissiveName(root.userData?.objectId || root.name || "");
+    let oitMeshes = 0;
+    let forcedOpaque = 0;
     root.traverse((child) => {
         if (!child.isMesh || !child.material) return;
         if (child.geometry && !child.geometry.getAttribute("normal")) {
@@ -128,18 +167,27 @@ export function prepareOITScene(root, oitPass) {
         child.castShadow = true;
         child.receiveShadow = true;
         const mats = Array.isArray(child.material) ? child.material : [child.material];
-        let oit = false;
         for (const m of mats) {
             m.side = THREE.DoubleSide;
             m.shadowSide = THREE.BackSide;
-            if (m.transparent) oit = true;
         }
-        if (oit) {
+        const claimed = mats.filter((m) => m.transparent);
+        if (claimed.length === 0) return;
+        if (forceAll || named || claimed.some(declaresTransmissive)) {
             for (const m of mats) patchMaterialOIT(m, oitPass);
             child.layers.set(OIT_LAYER);
             child.userData.__oit = true;
+            oitMeshes += 1;
+            return;
+        }
+        for (const m of claimed) {
+            m.transparent = false;
+            m.depthWrite = true;
+            m.needsUpdate = true;
+            forcedOpaque += 1;
         }
     });
+    return { oitMeshes, forcedOpaque };
 }
 
 // The transparent (OIT) materials under `root`, gathered for the per-pass state
@@ -166,14 +214,16 @@ export function decorateOITLights({ hemi, key }) {
 // Bake the (static) shadow map ONCE, seeing ALL casters — the opaque layer AND the
 // OIT layer. three.js' WebGLShadowMap tests each shadow caster against the CURRENT
 // camera's layers (WebGLShadowMap.renderObject: `object.layers.test(camera.layers)`),
-// and prepareOITScene moves every transparent mesh onto OIT_LAYER. Trellis marks
-// nearly every surface alphaMode=BLEND, so in such scenes ALL geometry lives on the
-// OIT layer — and the OIT render bakes the shadow map during its opaque pass (camera
-// on layer 0), which would test out every caster and leave the map EMPTY (no
-// shadows). This renders a 1×1 throwaway from an all-layers camera to trigger the
-// shadow pass with every caster, then freezes the map (autoUpdate off) so the
-// per-pass camera-layer switching never re-bakes it empty. Scene + sun are static,
-// so once is enough; call it after the light rig is fitted, before the render loop.
+// and prepareOITScene moves see-through meshes onto OIT_LAYER — while the OIT render
+// bakes the shadow map during its opaque pass (camera on layer 0), which would test
+// those casters out. Before the transmissivity gate this was catastrophic rather
+// than partial (Trellis's blanket alphaMode=BLEND put entire scenes on the OIT layer,
+// so the map baked EMPTY and nothing had shadows); it is still wrong for the glass
+// that legitimately lives there. This renders a 1×1 throwaway from an all-layers
+// camera to trigger the shadow pass with every caster, then freezes the map
+// (autoUpdate off) so the per-pass camera-layer switching never re-bakes it empty.
+// Scene + sun are static, so once is enough; call it after the light rig is fitted,
+// before the render loop.
 export function bakeShadowMap(renderer, scene) {
     if (!renderer.shadowMap.enabled) return;
     const cam = new THREE.PerspectiveCamera();

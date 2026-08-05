@@ -274,9 +274,7 @@ export const api = {
         ),
     // Modal remote splat on the GPU box: renders references, builds the COLMAP
     // model, and fine-tunes on the GPU box, then pulls trained.ply back so the
-    // "trained" viewer toggle lights up. `body.mode` is "continue" (from the
-    // LOCAL Stage-4 plan, skipping stage 4; needs a local camera plan) or
-    // "train" (Modal replans cameras too).
+    // "trained" viewer toggle lights up.
     // `body.trainer` picks the stage-6 back-end and the stage window with it:
     //   "brush"  — the upstream Rust/wgpu trainer (default). Stages 4-6, tuned
     //              by `iterations` + `max_splats`; delivers trained.ply +
@@ -284,6 +282,14 @@ export const api = {
     //   "gsplat" — the in-house loop. Stages 4-7, tuned by `representation`
     //              ("2dgs" surfels / "3dgs" full 3D Gaussians), `epochs`,
     //              `iterations`, `batch`.
+    // REUSE — where in the pipeline the remote run starts, given everything each
+    // stage produced is still on the Volume (see `splatModalState`):
+    //   `reuse_assets`   skip the input/GLB upload entirely.
+    //   `reuse_cameras`  also skip stage 4 — stage 5 renders an existing plan,
+    //                    the Volume's or (`plan_source: "local"`) the local
+    //                    splat/cameras.json, uploaded on its own.
+    //   `reuse_captures` also skip stage 5 — train straight onto the frames
+    //                    already rendered. The retrain loop; needs nothing local.
     // `body` may also carry `restart`. Status returns the live phase + heartbeat.
     splatModalStart: (run, slot, model, body) =>
         request(
@@ -300,6 +306,18 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
             { method: "DELETE" },
+        ),
+    // What this cell ALREADY has on the Modal Volume, per reusable stage —
+    // { inputs: {available, pushed_at, tier_dir, meshes, missing}, cameras,
+    //   captures, trained, healed } each with `available` + the recorded stage
+    //   summary/time, plus `local: {plan, stale, tier_dir, tier_mismatch}` for
+    //   what has changed HERE since that push. This is what gates + labels the
+    //   reuse toggles. Costs Volume round trips (server-memoized 30s), so fetch
+    //   it on demand — cell open, after a run, or `refresh` — never per poll.
+    splatModalState: (run, slot, model, refresh = false) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/modal-state/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            { params: refresh ? { refresh: 1 } : undefined },
         ),
     // Modal-hosted Stage-5 reference frames (the remote trained splat's training
     // data — refs never sync locally). `modalRefsTransformsUrl` is the remote
