@@ -57,7 +57,7 @@ from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import committed, divider, generation, object_wipe
 from app.services import llm, prefabs, threed
 from app.services import symmetry as sym_svc
-from app.utils import boardcache, cellsummary, flightlog
+from app.utils import boardcache, cellsummary, flightlog, runclock
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 from app.utils.cellsummary import (
@@ -334,6 +334,33 @@ async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
         spend=_cell_spend(events),
         cap=_effective_cap(events),
     )
+
+
+# --- run clock ----------------------------------------------------------------
+# A cell's runtime is MEASURED here, not derived from its log: the span from its
+# first event to `run.done` also contains every pause, gate park, and
+# crash-to-resume gap, and the log can't even identify those (a resume truncates
+# the trailing `run.paused`, a crash leaves nothing, and a multi-minute silence is
+# just as likely to be one long call as a stopped pipeline). So a heartbeat is
+# appended for each cell that is actually executing, and `runclock.read` folds
+# them back — see `app/utils/runclock.py` for why the GAPS are what make it
+# accurate.
+
+
+async def _clock_loop() -> None:
+    """Heartbeat every executing cell, once per `runclock.TICK_S`. "Executing" is
+    exactly what `derive_status` reports as `running` — a live task not parked at
+    a step gate — so the clock advances precisely while the dashboard shows the
+    cell running, and stops for a pause, a cap trip, a parked gate, or a killed
+    process without any of them having to notify it."""
+    while True:
+        try:
+            for key, task in list(_tasks.items()):
+                if _live(task) and not _gate_awaiting(_cell_gates.get(key)):
+                    runclock.tick(_run_id(*key))
+        except Exception:
+            pass  # a clock fault must never kill the loop
+        await asyncio.sleep(runclock.TICK_S)
 
 
 # Idle-unload sweep: how often it runs, and how long a cell must go untouched (no
@@ -1900,6 +1927,9 @@ def create_app() -> FastAPI:
         cap_task = asyncio.create_task(_cap_enforce_loop())
         # Return idle cells' in-memory event buffers to disk (see _idle_unload_loop).
         idle_task = asyncio.create_task(_idle_unload_loop())
+        # Heartbeat the executing cells so each one's runtime is durable even if
+        # this process is killed mid-run (see _clock_loop).
+        clock_task = asyncio.create_task(_clock_loop())
         try:
             yield
         finally:
@@ -1907,12 +1937,15 @@ def create_app() -> FastAPI:
             cost_task.cancel()
             cap_task.cancel()
             idle_task.cancel()
+            clock_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cost_task
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cap_task
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await idle_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await clock_task
             for slot_log in _slot_logs.values():
                 slot_log.close()
             for run_name, slot_id, model_alias in list(_slot_logs.keys()):
@@ -4618,6 +4651,14 @@ def _slot_summary(
             # Per-cell spend cap panel: settled spend, current ceiling, whether
             # it's tripped, and the override count. None when the cap is off.
             "cap": _cap_summary_from(summary),
+            # Measured execution time (see _clock_loop): `active_s` excludes
+            # pauses, parked gates, and crash gaps, and `spans` counts how many
+            # stretches of execution the cell took. Skipped for a cell that never
+            # ran — there's no heartbeat log to fold.
+            "timing": (
+                runclock.read(_run_id(run, slot.id, alias))
+                if summary["events_count"] else None
+            ),
         }
     return {
         "id": slot.id,

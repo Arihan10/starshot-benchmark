@@ -1,7 +1,7 @@
 // The run board: a pannable/zoomable plane of every (slot × model) cell in
 // the active run, each card showing live status + the step it is on.
 
-import { el, openModal, toast, stepUntilSelect, promptCapValue } from "./ui.js";
+import { el, openModal, toast, stepUntilSelect, promptCapValue, fmtDurationMs } from "./ui.js";
 import { state, emit, on, cellKey, cellSummary } from "./state.js";
 import { api } from "./api.js";
 import { createViewer } from "./scene3d.js";
@@ -68,6 +68,13 @@ boardEl.addEventListener("wheel", (ev) => {
 
 // --- cards ----------------------------------------------------------------------
 
+// Measured execution time, pauses and crash gaps already excluded (server-side
+// `runclock`). Blank for a cell that never ran, or ran for less than one tick.
+function runtimeLabel(summary) {
+  const active = summary.timing?.active_s;
+  return active ? ` · ${fmtDurationMs(active * 1000)}` : "";
+}
+
 function cellCard(slot, model) {
   const summary = slot.runs?.[model] ?? { status: "idle", events_count: 0 };
   const branches = summary.branches ?? [];
@@ -96,7 +103,7 @@ function cellCard(slot, model) {
       summary.stepped ? el("span", { class: "step-mode-tag", text: "step mode", title: "one LLM call per step — advance from the cell view or “step all”" }) : null,
     ),
     el("div", { class: "step-line", text: view.label }),
-    el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events · ${view.state}` }),
+    el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events${runtimeLabel(summary)} · ${view.state}` }),
   );
   if (branches.length) {
     const first = branches[0];

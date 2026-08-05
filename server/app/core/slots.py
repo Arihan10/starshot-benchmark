@@ -114,6 +114,7 @@ MODELS: dict[str, str] = {
     "longcat-sf": "siliconflow/LongCat-2.0",
     "gemini-flash-new": "google/gemini-3.6-flash",
     "laguna": "poolside/laguna-s-2.1",
+    "new-opus-new": "anthropic/claude-opus-5"
 }
 
 # Model ids from MODELS that are actually served by a third-party
@@ -204,7 +205,8 @@ DEFAULT_MODEL = MODELS[DEFAULT_MODEL_ALIAS]
 DEFAULT_REASONING = "xhigh"
 
 REASONING_DOWNGRADE_LIST = [
-    "openai/gpt-5.5"
+    "openai/gpt-5.5",
+    "anthropic/claude-opus-5"
 ]
 
 # OpenRouter model ids whose only provider can't honor structured outputs

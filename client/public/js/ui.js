@@ -508,13 +508,19 @@ export function diffPre(oldStr, newStr) {
 
 const _MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-// Provider latency, formatted like the log ("340 ms" / "1.2 s" / "1m 5s").
+// A duration, formatted like the log ("340 ms" / "1.2 s" / "1m 5s" / "3h 42m").
+// Hours matter because this also renders whole-cell runtimes, not just per-call
+// latency — a scene routinely takes hours.
 export function fmtDurationMs(ms) {
   if (ms == null) return "--";
   if (ms < 1000) return `${ms} ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
-  const m = Math.floor(ms / 60_000);
-  return `${m}m ${Math.round((ms % 60_000) / 1000)}s`;
+  if (ms < 3_600_000) {
+    const m = Math.floor(ms / 60_000);
+    return `${m}m ${Math.round((ms % 60_000) / 1000)}s`;
+  }
+  const mins = Math.round(ms / 60_000);
+  return `${Math.floor(mins / 60)}h ${mins % 60}m`;
 }
 
 // Exact wall-clock of a call boundary ("Jul 18, 05:38:12.481 PM"); `ts` is epoch seconds.

@@ -10,7 +10,7 @@ import {
 	cellBranches,
 	branchSummaryById,
 } from "./state.js";
-import { el, toast, stepUntilSelect, openModal, buildObjectsMenu, promptCapValue } from "./ui.js";
+import { el, toast, stepUntilSelect, openModal, buildObjectsMenu, promptCapValue, fmtDurationMs } from "./ui.js";
 import {
 	openStream,
 	dispatchSceneEvent,
@@ -1374,6 +1374,14 @@ function renderHeader() {
 	let statusText = view.label;
 	if (!branch && summary?.stepped) statusText += " · stepped";
 	statusText += ` · ${cellInfo?.events_count ?? 0} events`;
+	// Measured execution time, pauses excluded. `spans` > 1 means the cell was
+	// interrupted and resumed, so the total is the work across those stretches.
+	const activeS = cellInfo?.timing?.active_s;
+	if (activeS) {
+		const spans = cellInfo.timing.spans ?? 1;
+		statusText += ` · ran ${fmtDurationMs(activeS * 1000)}`;
+		if (spans > 1) statusText += ` (resumed ${spans - 1}×)`;
+	}
 	if (status === "error") {
 		// Put the failure reason where the eye lands first; the log strip below
 		// has the full trail.

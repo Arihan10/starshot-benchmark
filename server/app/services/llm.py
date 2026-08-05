@@ -94,7 +94,7 @@ def _reasoning_effort(model: str) -> str:
     to "minimal" for now — xhigh makes them slow + costly and we're not
     measuring their reasoning depth here; every other provider stays at "xhigh"."""
     
-    return "medium" if (model or "") in REASONING_DOWNGRADE_LIST else DEFAULT_REASONING
+    return "none" if (model or "") in REASONING_DOWNGRADE_LIST else DEFAULT_REASONING
 
 
 # Optional per-task breakpoint. When set, `call_llm` awaits it right before
