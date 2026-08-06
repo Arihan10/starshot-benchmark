@@ -85,9 +85,12 @@ export default function ScenePanel({
 					<Fragment key={roundKey}>
 						<div
 							aria-hidden
-							className="pointer-events-none absolute top-0 right-0 z-10 hidden w-px origin-top bg-mark transition-[scale] md:block"
+							className="pointer-events-none absolute right-0 z-10 hidden w-[3px] origin-top translate-x-1/2 bg-mark transition-[scale] md:block"
 							style={{
 								willChange: "scale",
+								// The masthead's belly bottoms out on this panel's top edge, so
+								// the seam picks up exactly where the moon's limb leaves off.
+								top: 0,
 								// Lands on the bar's top edge. The panel now runs to the foot
 								// of the page, so that is the bar's drop from the bottom plus
 								// the half-height its centre line sits above.

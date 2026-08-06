@@ -1,11 +1,8 @@
 import type { Metadata } from "next";
-import CurvedPrompt from "@/components/CurvedPrompt";
 import VoxelSky from "@/components/site/VoxelSky";
 import ExitBar from "@/components/leaderboard/ExitBar";
-import Fade from "@/components/site/Fade";
-import Podium from "@/components/leaderboard/Podium";
-import StandingsTable from "@/components/leaderboard/StandingsTable";
-import Masthead, { MOON_DIAMETER, MoonArc } from "@/components/site/Masthead";
+import LeaderboardStage from "@/components/leaderboard/LeaderboardStage";
+import Masthead, { Title } from "@/components/site/Masthead";
 import { STANDINGS } from "@/lib/leaderboard";
 
 export const metadata: Metadata = {
@@ -16,41 +13,46 @@ export const metadata: Metadata = {
 
 // #TODO: STANDINGS is placeholder data imported directly.
 
-const PODIUM_BAND = "clamp(190px, 32vh, 340px)";
+// HOW MUCH ROOM THE EXIT BAR TAKES at the foot of the page. Both columns are
+// told the same number rather than each guessing: the bar is laid over them
+// both, and a table that cleared it while the city did not would put a row of
+// rooftops behind the one control that leaves the page.
+const FOOT = 76;
 
+/**
+ * THE BOARD AND THE CITY STAND SIDE BY SIDE, and the split is what makes both of
+ * them work.
+ *
+ * Stacked, each was the wrong shape for what it held. The standings ran the full
+ * measure of the page for five columns of short numbers — a row of figures with
+ * a hand's width of nothing between them — while the city was squeezed into a
+ * strip a few hundred pixels deep, which is not enough height to tell three
+ * towers apart by looking. Neither was short of room; they were short of the
+ * RIGHT room, and they wanted it in different directions.
+ *
+ * Turned on its side the page gives each what it was missing. The board loses
+ * width it was not using and gains rows, which is the axis a list actually grows
+ * along. The city loses width it does not need — a tighter plan reads more like
+ * a city than a sprawl does — and gains the full height of the page, so the
+ * three pillars can stand far enough apart in height that the ranking is legible
+ * as a SHAPE before a single label is read.
+ *
+ * SLIGHTLY WIDER ON THE LEFT. The two are close to even, but the board carries
+ * type and the city carries mass — and type is the one that stops working when
+ * it runs out of room. The city simply gets denser.
+ */
 export default function LeaderboardPage() {
 	const top = STANDINGS.slice(0, 3);
 
 	return (
 		<div className="relative flex h-dvh flex-col overflow-hidden bg-ground">
-			<VoxelSky city />
+			<VoxelSky voxels={false} />
 
 			<Masthead label="Current standings" placement="flow">
-				<MoonArc>
-					<CurvedPrompt
-						text="Leaderboard"
-						diameter={MOON_DIAMETER}
-						voice="name"
-					/>
-				</MoonArc>
+				<Title voice="name">Leaderboard</Title>
 			</Masthead>
 
-			<div className="relative min-h-0 flex-1">
-				<Fade enter={640} delay={120} className="absolute inset-0 z-10">
-					<Podium rows={top} band={PODIUM_BAND} />
-				</Fade>
-
-				<div className="pointer-events-none absolute inset-0 z-30 flex flex-col">
-					<div className="flex-none" style={{ height: PODIUM_BAND }} />
-					<Fade
-						enter={640}
-						delay={200}
-						className="pointer-events-auto mx-auto flex min-h-0 w-full max-w-[1180px] flex-1 flex-col px-lg pb-[76px]"
-					>
-						<StandingsTable rows={STANDINGS} />
-					</Fade>
-				</div>
-			</div>
+				<LeaderboardStage rows={STANDINGS} top={top} foot={FOOT} />
 
 			<div className="absolute inset-x-0 bottom-0 z-40">
 				<ExitBar />

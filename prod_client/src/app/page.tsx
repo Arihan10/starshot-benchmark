@@ -14,9 +14,8 @@ import ScenePanel, {
 import { PairGate } from "@/components/arena/pairGate";
 import { buildStep } from "@/components/arena/buildSequence";
 import Composer from "@/components/arena/Composer";
-import CurvedPrompt from "@/components/CurvedPrompt";
 import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
-import Masthead, { MOON_DIAMETER, MoonArc } from "@/components/site/Masthead";
+import Masthead, { ROLL_ORIGIN, Title } from "@/components/site/Masthead";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
 type Side = "a" | "b";
@@ -168,21 +167,20 @@ export default function Page() {
                 label="Who built it better?"
                 placement="flow"
             >
-                <MoonArc>
-                    <h1
-                        key={round.id}
-                        className={`${
-                            turning
-                                ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
-                                : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
-                        }`}
-                    >
-                        <CurvedPrompt
-                            text={'\u201c' + round.prompt + '\u201d'}
-                            diameter={MOON_DIAMETER}
-                        />
-                    </h1>
-                </MoonArc>
+                {/* THE PIVOT HAS TO BE ON THIS ELEMENT, not on anything around it:
+                    `transform-origin` applies to the box being transformed and is
+                    not inherited, so it belongs wherever the animation does. */}
+                <h1
+                    key={round.id}
+                    style={{ transformOrigin: ROLL_ORIGIN }}
+                    className={`${
+                        turning
+                            ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
+                            : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
+                    }`}
+                >
+                    <Title>{'\u201c' + round.prompt + '\u201d'}</Title>
+                </h1>
             </Masthead>
             </div>
 

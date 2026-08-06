@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { BLOCKS, CUBE, onGround, PILLARS } from "./podiumLayout";
+import { BLOCKS, CUBE, onGround, PILLARS, TALL } from "./podiumLayout";
 
 const RADIUS = CUBE * 0.5;
 
@@ -54,8 +54,9 @@ function field(): Map<number, Box[]> {
 	if (grid) return grid;
 	grid = new Map();
 	const half = CUBE / 2;
-	for (let i = 0; i < BLOCKS.length; i++) {
-		const [x, y, z] = BLOCKS[i].rest;
+	const blocks = BLOCKS;
+	for (let i = 0; i < blocks.length; i++) {
+		const [x, y, z] = blocks[i].rest;
 		add({
 			i,
 			min: new THREE.Vector3(x - half, y - half, z - half),
@@ -70,9 +71,13 @@ function field(): Map<number, Box[]> {
 				p.base,
 				p.z - p.depth / 2,
 			),
+			// AT FULL HEIGHT, not at today's. A pillar's height is a function of a
+			// rating that changes, and the collision grid is built once — measured
+			// against the ceiling the scale can produce, a block can never pass
+			// through a post that happens to be taller than the grid remembers.
 			max: new THREE.Vector3(
 				p.x + p.width / 2,
-				p.base + p.height,
+				p.base + TALL,
 				p.z + p.depth / 2,
 			),
 		});

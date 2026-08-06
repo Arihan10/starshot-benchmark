@@ -129,7 +129,7 @@
   --color-background: var(--background);
   --color-foreground: var(--foreground);
 
-  --font-display: var(--font-anton);
+  --font-display: var(--font-public-sans);
   --font-sans: var(--font-sans-src);
   --font-mono: var(--font-mono-src);
   --font-serif: var(--font-instrument-serif);
@@ -165,64 +165,79 @@ body {
   color: var(--foreground);
 }
 
-@keyframes wordmark-glow {
-  0% {
-    -webkit-mask-position: 100% 50%;
-    mask-position: 100% 50%;
-    opacity: 0;
+/* THE GLEAM IS NO LONGER A KEYFRAME AT ALL — it is a transition on the mask's
+   position, declared where it is used. An animation can only ever play forwards
+   from its first frame: taking the hover away CANCELS it, so the light vanished
+   mid-stroke instead of retreating, and re-applying it in reverse would restart
+   from the far end and jump. A transition interpolates from wherever the property
+   currently IS, so the light walks back out the way it came in — from the middle
+   if that is where it had got to. See Navbar.
+
+   THE STAR TURNS AND BREATHES INSTEAD OF TWINKLING ONCE. What was here was a
+   620ms one-shot that ended at `scale(0.15)` and `opacity: 0` — a spark that
+   arrived and died while the pointer was still on the mark. These two run forever
+   and are PAUSED rather than removed when the hover ends, so the star holds the
+   angle and size it had reached and fades from there. Removing them would snap it
+   back to zero degrees on the way out. */
+
+/* Two animations rather than one because they run at different rates and must not
+   land together — a turn and a pulse on a common clock read as a single throb.
+   They can share an element because they drive SEPARATE properties: `rotate` and
+   `scale` are their own properties now, not two halves of one `transform`, so
+   neither overwrites the other. */
+@keyframes star-turn {
+  from {
+    rotate: 0deg;
   }
-  18% {
-    opacity: 1;
-  }
-  82% {
-    opacity: 1;
-  }
-  100% {
-    -webkit-mask-position: 0% 50%;
-    mask-position: 0% 50%;
-    opacity: 0;
+  to {
+    rotate: 360deg;
   }
 }
 
-@keyframes star-twinkle {
-  0% {
-    opacity: 0;
-    transform: scale(0) rotate(-40deg);
-  }
-  45% {
-    opacity: 1;
-    transform: scale(1) rotate(10deg);
-  }
-  70% {
-    opacity: 0.9;
-    transform: scale(0.82) rotate(26deg);
-  }
+@keyframes star-breathe {
+  0%,
   100% {
-    opacity: 0;
-    transform: scale(0.15) rotate(58deg);
+    scale: 0.82;
+  }
+  50% {
+    scale: 1.16;
   }
 }
 
+/* THE PROMPT ROLLS ALONG THE LIMB. It does not rise and fall — it ROTATES, by a
+   little under two degrees, about a point thousands of pixels below the page: the
+   centre of the disc the masthead is the bottom of. So the caption travels on the
+   moon's own surface, arriving from one side and leaving by the other along the
+   curve it is sitting on, and the 1.7deg is chosen against that radius rather than
+   being an angle anyone would pick by eye.
+
+   The origin is not here — it cannot be, since it moves with the disc. It is set
+   on the element, from the radius the limb publishes. See ROLL_ORIGIN in Masthead.
+
+   THE TRANSLATE THIS REPLACES was the same beat played straight: the prompt slid
+   up 0.55em and the next slid in from 0.7em below. Perfectly reasonable motion for
+   a caption on a flat bar, and the reason the masthead never quite read as round —
+   everything else curved and the one moving thing on it travelled in a line. */
 @keyframes prompt-roll-out {
   0% {
     opacity: 1;
     transform: rotate(0deg);
   }
   70% {
-    opacity: 0.55;
+    opacity: 0.45;
   }
   100% {
     opacity: 0;
-    transform: rotate(-40deg);
+    transform: rotate(-1.7deg);
   }
 }
 
 @keyframes prompt-settle {
   0% {
     opacity: 0;
-    transform: rotate(40deg);
+    transform: rotate(1.7deg);
   }
-  26% {
+  30% {
     opacity: 1;
   }
   100% {

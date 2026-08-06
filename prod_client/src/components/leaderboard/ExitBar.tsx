@@ -5,7 +5,7 @@ export default function ExitBar() {
 		<div className="relative overflow-hidden bg-mark">
 			<Link
 				href="/"
-				className="group/exit relative block w-full py-md text-center font-sans text-sm font-bold tracking-[0.07em] uppercase text-ground"
+				className="group/exit relative block w-full py-md text-center font-sans text-sm font-black tracking-[0.07em] uppercase text-ground"
 			>
 				<span
 					aria-hidden

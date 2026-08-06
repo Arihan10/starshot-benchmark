@@ -31,7 +31,22 @@ import Link from "next/link";
  * accent and a soft bloom of it outside — so a button reads as a thing the moon is
  * catching rather than as a rectangle someone filled in.
  */
-type Variant = "solid" | "ghost" | "quiet";
+/**
+ * The rank of a control: how loud it is, and what it does when pointed at.
+ *
+ * `fill` IS `ghost` THAT COMMITS. Both are the ground with the mark's hairline
+ * round them and the mark's ink for type — identical at rest, and deliberately so.
+ * They part on hover: ghost lifts its ground a shade and stays what it was, fill
+ * turns into `solid`.
+ *
+ * IT IS A RANK OF ITS OWN BECAUSE GHOST'S RESTRAINT IS LOAD-BEARING. Ghost is SKIP
+ * in the arena, sitting between the two white vote slabs — the note under
+ * GROUND.ghost is the argument, and it is that SKIP must not read as a third
+ * choice. A hover that filled it white would make it look exactly like the two
+ * things it is the refusal of. So the behaviour could not simply be added to ghost,
+ * and the pair in the navbar could not simply borrow ghost. Two intents, two names.
+ */
+type Variant = "solid" | "ghost" | "fill" | "quiet";
 
 /**
  * Where this control sits, which decides its silhouette.
@@ -47,6 +62,8 @@ type Variant = "solid" | "ghost" | "quiet";
 type Shape =
 	| "square"
 	| "standalone"
+	| "upright-start"
+	| "upright-end"
 	| "start"
 	| "middle"
 	| "end"
@@ -73,10 +90,38 @@ const RAKE = `${RAKE_PX}px`;
 // can read the same number rather than repeating it.
 const RAKE_VAR = { "--rake": RAKE } as React.CSSProperties;
 
+/**
+ * HOW LONG THE SWEEP TAKES TO ARRIVE.
+ *
+ * Handed to the control as a variable because TWO things are timed to it — the
+ * gradient fading in, and the label crossing to the dark that suits it — and they
+ * are set by different utilities in different layers. A second copy of 420 in
+ * either would be a copy that eventually disagrees, and the failure is silent:
+ * the label simply stops being the right colour for the ground it is on.
+ */
+const SWEEP_MS = "420ms";
+
 const SHAPE: Record<Shape, string | undefined> = {
 	square: undefined,
 	// Both edges raked the same way: a true parallelogram, leaning right.
 	standalone: `polygon(${RAKE} 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
+
+	// STANDALONE, BUT WITH ONE EDGE STOOD UP. The parallelogram above leans at both
+	// ends, which is right for a control floating in the middle of a page and wrong
+	// for one that TERMINATES something — the navbar's pair ends the bar, and a slant
+	// on its outermost edge reads as the bar having been cut short rather than
+	// finished. The suffix names WHICH END IS UPRIGHT, so it reads at the call site:
+	// `upright-end` stands its right edge up, `upright-start` its left.
+	//
+	// THE RAKED EDGE KEEPS THE PARALLELOGRAM'S LEAN, top vertex outboard of bottom —
+	// which is why these are their own entries and not the caps below. A cap rakes
+	// the OTHER way (bottom outboard), so `cap-start` would have stood the CTA's
+	// right edge up correctly and then leaned its left edge against the Leaderboard's
+	// right instead of alongside it: the gap between the two would have opened into a
+	// V rather than staying the constant slanted seam it is. Same figure, mirrored
+	// rake, and only one of the two keeps the pair parallel.
+	"upright-start": `polygon(0 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
+	"upright-end": `polygon(${RAKE} 0, 100% 0, 100% 100%, 0 100%)`,
 	// THE ROW WIDENS UPWARD. Each shape's protruding vertex is at the TOP, so the
 	// group's outline is an inverted trapezoid — broad along its top edge, drawn in
 	// underneath. The other way round it sat like a plinth, which is a shape that
@@ -115,11 +160,23 @@ const GROUND: Record<Variant, string> = {
 	// between them reads as a third, muddier state; pure black with a white edge
 	// reads as the absence of a choice, which is what it means.
 	ghost: "bg-ground group-hover/btn:bg-surface",
+	// IT FILLS TO THE MARK, which is the same ink its own hairline and type are
+	// already drawn in — so the hover is not a new colour arriving, it is the
+	// outline flooding inwards. On the navbar's paper that is a cream slab going
+	// solid black; on the page's own black it would flood white, because every one
+	// of these is a token and the bar re-points what they resolve to.
+	fill: "bg-ground group-hover/btn:bg-mark",
 	// LIGHT ON DARK, and settled. This flipped twice while the moon was changing
 	// size; it is fixed now because the geometry fixed it — the disc is sized to the
 	// GAP between the nav's inner pairs, so by construction no nav item is ever on
 	// the moon. They are always on the page's own black, where dark ink is invisible.
-	quiet: "bg-transparent group-hover/btn:bg-surface",
+	// NOTHING, EVER. The navbar's ABOUT / FAQ / ARENA are words in a row, not slabs,
+	// and their hover is the accent rule that draws in underneath them — see the
+	// nav in Navbar, which owns that line because it is shared between the three.
+	// A ground arriving behind the word as well was the hover landing twice, and
+	// the tinted panel was the half that made three text links look like three
+	// small buttons.
+	quiet: "bg-transparent",
 };
 
 // THE BORDER IS A LAYER, NOT A RING — and it has to be.
@@ -138,17 +195,44 @@ const GROUND: Record<Variant, string> = {
 const EDGE: Record<Variant, string> = {
 	solid: "bg-mark",
 	ghost: "bg-mark group-hover/btn:bg-mark",
-	quiet: "bg-transparent group-hover/btn:bg-mark-16",
+	// UNCHANGED ON HOVER, and it does not need to be: the ground floods to this
+	// exact ink underneath it, so the edge stops being an edge and becomes the
+	// leading millimetre of the fill. Nothing has to fade for that to happen.
+	fill: "bg-mark",
+	// No outline at rest and none on hover: see GROUND.quiet. A hairline appearing
+	// round a text link is the same mistake as a ground appearing behind it.
+	quiet: "bg-transparent",
 };
 
+// THE FACE IS PER-VARIANT, and it has to be declared here rather than shared in the
+// shell below. `font-sans` sat in the shell for every control, and `quiet` — the
+// navbar's ABOUT / FAQ / ARENA — needs Public Sans, which is what the comp sets
+// those in. A second family utility on the same element does not override the first:
+// they carry equal specificity, so which one wins is decided by the order Tailwind
+// emitted them, not by which was written later. The only way to change one rank's
+// face is for each rank to name its own.
 const TEXT: Record<Variant, string> = {
 	// THE LABEL IS THE GROUND. A solid control is the mark carrying type, so its
 	// text is the page it sits on — which is why this is a token and not a colour,
 	// and why the palette has three knobs and not four. Briefly white, which on
 	// #ffff00 measures ~1.07:1 and simply vanished — worth measuring any pairing
 	// before committing to it rather than judging by eye on one background.
-	solid: "text-ground font-black",
-	ghost: "text-ink font-black",
+	solid: "font-sans text-ground font-black",
+	ghost: "font-sans text-ink font-black",
+	// THE LABEL CROSSES WITH THE GROUND, and lands on exactly what `solid` sets:
+	// the page's own colour. Which is the point — filled, this control IS solid, so
+	// it has to be solid's black-on-cream and not an approximation of it. Naming
+	// `text-ground` rather than a literal white is what guarantees that; the two
+	// then cannot come apart, and both invert together wherever the bar does.
+	//
+	// `hover:`, NOT `group-hover/btn:`, for the reason set out at the sweep's own
+	// label rule further down: this map is applied to the SHELL, which is the
+	// element carrying `group/btn`, and the group variant compiles to a descendant
+	// selector. Written as a group variant the rule is emitted, reads correctly in
+	// the stylesheet, and matches nothing — the ground filled in underneath and the
+	// label stayed black, which is exactly how it failed. The group variant belongs
+	// on the LAYERS, which really are children; anything on the shell wants `hover:`.
+	fill: "font-sans text-ink hover:text-ground font-black",
 	// WHITE, NOT GREY. The comp sets every nav control at full ink and reserves
 	// grey for things that are genuinely secondary; a navbar of grey labels reads
 	// as disabled. Grey is now spent only where something IS lesser — a byline, a
@@ -157,7 +241,7 @@ const TEXT: Record<Variant, string> = {
 	// and their weight lives here rather than in the shared string below so it can
 	// differ from the slabs without touching them. `font-medium` reads as a line of
 	// words rather than three small buttons; `font-black` is the comp. One word.
-	quiet: "text-ink font-black",
+	quiet: "font-display text-ink font-bold",
 };
 
 // CENTRING CORRECTION FOR THE SLANTED ENDS.
@@ -165,8 +249,7 @@ const TEXT: Record<Variant, string> = {
 // A parallelogram needs none: both its edges lean the same way, so the box centre
 // and the shape's centre are the same point. A CAP is a trapezoid — one edge
 // upright, one raked — and its centre of area sits away from the raked side. Text
-// centred in the box therefore reads as pushed toward the slant, which on ARENA and
-// LEADERBOARD was plainly visible.
+// centred in the box therefore reads as pushed toward the slant.
 //
 // Half the rake is the correction: it centres the label on the MIDPOINT of the
 // slanted edge rather than on its furthest point, which is where the eye puts the
@@ -183,9 +266,27 @@ const TEXT: Record<Variant, string> = {
 //
 // The sign matters too: a cap's raked edge cuts material AWAY from that side, so
 // the label moves TOWARD the upright edge — right on cap-start, left on cap-end.
+//
+// THE UPRIGHTS TAKE THE SAME CORRECTION AS THE CAP THEY MIRROR, and exactly the
+// same — the correction is set by where the raked edge's MIDPOINT falls, and
+// mirroring which way that edge leans moves both its ends without moving the
+// point halfway between them. So a shape raked on the left is nudged right by the
+// same amount whichever way the rake runs.
+//
+// NOT ON THE CAPS, THOUGH, and that is a deliberate departure from the reasoning
+// above rather than an oversight in it. The caps are the navbar's ABOUT / FAQ /
+// ARENA, and the comp cuts those to the same trapezoid — `polygon(0 0, 100% 0,
+// 100% 100%, 13px 100%)`, the identical 13px rake — while padding them evenly. Its
+// labels therefore sit where the box centres them, not where the shape's area does.
+//
+// It measured as exactly half a rake. About carries the only `cap-start` in the bar,
+// so its 6.5px went into its own width and pushed FAQ and ARENA along with it: all
+// three sat 6.5px right of the comp, one correction showing up three times. The
+// argument for the nudge is a real one and it is kept above for the shapes that
+// still take it; on these two the comp is the authority and the comp does not.
 const NUDGE: Partial<Record<Shape, string>> = {
-	"cap-start": "pl-[calc(var(--btn-px)+var(--rake)/2)]",
-	"cap-end": "pr-[calc(var(--btn-px)+var(--rake)/2)]",
+	"upright-start": "pr-[calc(var(--btn-px)+var(--rake)/2)]",
+	"upright-end": "pl-[calc(var(--btn-px)+var(--rake)/2)]",
 };
 
 // WHICH CORNERS GET SOFTENED, and it is only ever the ones on the OUTSIDE of a
@@ -195,6 +296,12 @@ const NUDGE: Partial<Record<Shape, string>> = {
 const ROUND: Record<Shape, string> = {
 	square: "rounded-[3px]",
 	standalone: "rounded-[3px]",
+	// ALL FOUR, like the parallelogram they are a variant of — a cap rounds only its
+	// outer end because its upright edge is a SEAM with the button next to it, and
+	// these have no button next to them. Rounding follows what an edge abuts, not
+	// whether it happens to be vertical.
+	"upright-start": "rounded-[3px]",
+	"upright-end": "rounded-[3px]",
 	start: "rounded-l-[3px]",
 	middle: "",
 	end: "rounded-r-[3px]",
@@ -205,6 +312,9 @@ const ROUND: Record<Shape, string> = {
 const SIZING: Record<Variant, string> = {
 	solid: "text-sm px-[var(--btn-px)] py-sm",
 	ghost: "text-sm px-[var(--btn-px)] py-sm",
+	// The navbar pair has to measure as a pair, so this is solid's sizing to the
+	// letter rather than a copy of ghost's that happens to match today.
+	fill: "text-sm px-[var(--btn-px)] py-sm",
 	// TIGHT, because the navbar's width is the moon's width. The disc has to fit the
 	// gap between the two inner pairs, so every pixel of padding here is a pixel off
 	// the moon's diameter — this is the narrowest the ground can arrive on hover
@@ -217,6 +327,7 @@ const SIZING: Record<Variant, string> = {
 const PAD: Record<Variant, string> = {
 	solid: "var(--spacing-md)",
 	ghost: "var(--spacing-md)",
+	fill: "var(--spacing-md)",
 	quiet: "var(--spacing-xs)",
 };
 
@@ -272,14 +383,49 @@ export default function Button({
 				// every control, which is right for a slab carrying a label and wrong for
 				// a text link: ABOUT, FAQ and ARENA are words in a row, not buttons, and
 				// at 900 they shouted over the wordmark beside them. See TEXT.
-				"font-sans tracking-[0.05em] whitespace-nowrap uppercase",
+				"tracking-[0.05em] whitespace-nowrap uppercase",
 				"group/btn relative cursor-pointer border-0 bg-transparent",
 				SIZING[variant],
 				NUDGE[shape] ?? "",
 				TEXT[variant],
+				// THE LABEL GOES DARK UNDER THE SWEEP, and it has to. The gradient's
+				// middle is four near-white stops, so whatever the control was written
+				// in, on hover it is type on pale glass. On the black pages `text-ground`
+				// is already black and this changes nothing; in an INVERTED bar the
+				// ground is the paper, and cream on cream is a label that vanishes at
+				// exactly the moment the button is being pointed at.
+				//
+				// Named as the paper's ink rather than as `mark`, deliberately. This is
+				// not the theme's dark — it is the dark that suits the GLASS, and the
+				// glass is the same pale gradient in every context, so the colour that
+				// reads on it cannot be one that inverts with the subtree.
+				//
+				// `hover:`, NOT `group-hover/btn:` — and the difference is the whole
+				// thing. The group variant compiles to a DESCENDANT selector, roughly
+				// `.group\/btn:hover *`, and this class sits on the element that carries
+				// `group/btn`: nothing is its own descendant, so the rule was emitted,
+				// looked correct in devtools' stylesheet, and matched nothing. The group
+				// variant is for the LAYERS below, which really are children.
+				sweep ? "hover:text-[rgb(var(--paper-ink-rgb))]" : "",
 				// A press moves the button, not the page. One pixel reads as travel and
 				// is small enough never to disturb what is beside it.
-				"transition-[color,translate] duration-quick active:translate-y-px",
+				"transition-[color,translate] active:translate-y-px",
+				// TWO CLOCKS, AND NOT THE SAME ONE. The press stays quick — that is a
+				// mechanical response and anything slower reads as lag — while the
+				// label's colour crosses on the SWEEP's, because it is crossing to suit
+				// the gradient and has to land with it. On `duration-quick` for both,
+				// the label finished turning black while the glass was still arriving,
+				// which put black type on a still-black button for a beat: the same
+				// "hover landing twice" this component already refuses in GROUND.solid.
+				//
+				// The durations map onto `transition-[color,translate]` in order, and
+				// they are written as ONE utility per branch rather than as an override
+				// of `duration-quick` — two duration utilities on the same element have
+				// equal specificity, so which one won would be decided by the order
+				// Tailwind happened to emit them in.
+				sweep
+					? "[transition-duration:var(--sweep-ms),var(--duration-quick)]"
+					: "duration-quick",
 				"focus-visible:outline-none",
 		className,
 	].join(" ");
@@ -318,7 +464,7 @@ export default function Button({
 				// only way the two arrive together.
 				<span
 					aria-hidden
-					className={`absolute opacity-0 transition-opacity duration-[420ms] ease-out group-hover/btn:opacity-100 ${
+					className={`absolute opacity-0 transition-opacity duration-(--sweep-ms) ease-out group-hover/btn:opacity-100 ${
 						edge ? "inset-[1px]" : "inset-0"
 					}`}
 					style={{
@@ -333,6 +479,7 @@ export default function Button({
 
 	const style = {
 		...RAKE_VAR,
+		"--sweep-ms": SWEEP_MS,
 		"--btn-px": PAD[variant],
 		...rest.style,
 	} as React.CSSProperties;

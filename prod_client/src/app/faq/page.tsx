@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
-import CurvedPrompt from "@/components/CurvedPrompt";
-import Masthead, { MOON_DIAMETER, MoonArc } from "@/components/site/Masthead";
+import Masthead, { Title } from "@/components/site/Masthead";
 import PageShell from "@/components/site/PageShell";
 import VoxelSky from "@/components/site/VoxelSky";
 import Button from "@/components/ui/Button";
@@ -73,9 +72,7 @@ export default function FaqPage() {
 			<PageShell
 				masthead={
 					<Masthead label="Frequently asked" placement="flow">
-						<MoonArc>
-							<CurvedPrompt text="FAQ" diameter={MOON_DIAMETER} />
-						</MoonArc>
+						<Title voice="name">FAQ</Title>
 					</Masthead>
 				}
 				footer={

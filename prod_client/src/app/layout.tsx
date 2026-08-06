@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Anton, Instrument_Serif, Manrope } from "next/font/google";
+import { Instrument_Serif, Manrope, Public_Sans } from "next/font/google";
 import ColorLab from "@/components/debug/ColorLab";
 import FontLab from "@/components/debug/FontLab";
 import MoonStage from "@/components/site/MoonStage";
@@ -11,10 +11,16 @@ const manrope = Manrope({
 	subsets: ["latin"],
 });
 
-const anton = Anton({
-	variable: "--font-anton",
+// THE WORDMARK'S FACE, and the only thing that uses `--font-display`.
+//
+// Loaded as the VARIABLE font — no `weight` — because the lockup wants a weight
+// the rest of the site does not, and pinning a single static cut here would mean
+// a second download the day anything else wants a different one. Anton, which
+// this replaces, had no choice in the matter: it ships in one weight, which is
+// part of why the wordmark's size had to be tuned by hand against it.
+const publicSans = Public_Sans({
+	variable: "--font-public-sans",
 	subsets: ["latin"],
-	weight: "400",
 	display: "swap",
 });
 
@@ -38,7 +44,7 @@ export default function RootLayout({
 	return (
 		<html
 			lang="en"
-			className={`${manrope.variable} ${anton.variable} ${instrumentSerif.variable} h-full antialiased`}
+			className={`${manrope.variable} ${publicSans.variable} ${instrumentSerif.variable} h-full antialiased`}
 		>
 			<body className="min-h-full font-sans">
 				<MoonStage />

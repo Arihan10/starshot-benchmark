@@ -12,7 +12,7 @@ import type { FontFamily } from "@/app/api/debug/fonts/route";
 const ROLES = [
 	{
 		key: "display",
-		token: "--font-anton",
+		token: "--font-public-sans",
 		label: "Display",
 		generic: "sans-serif",
 	},

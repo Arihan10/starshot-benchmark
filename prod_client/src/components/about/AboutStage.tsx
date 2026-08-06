@@ -2,7 +2,6 @@
 
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
 import Fade from "@/components/site/Fade";
-import { MoonBerth } from "@/components/site/Masthead";
 import MoonAnchor from "@/components/site/MoonAnchor";
 import { VoxelDrift } from "@/components/site/VoxelSky";
 import Navbar from "@/components/site/Navbar";
@@ -141,7 +140,7 @@ export default function AboutStage({ children }: { children: ReactNode }) {
 				ref={bar}
 				className="pointer-events-none absolute inset-x-0 top-0 z-30 bg-paper [&_a]:pointer-events-auto [&_button]:pointer-events-auto"
 			>
-				<Navbar moon={<MoonBerth />} />
+				<Navbar />
 			</div>
 		</div>
 	);

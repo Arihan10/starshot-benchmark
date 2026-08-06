@@ -47,7 +47,21 @@ export default function LogoMark({ className }: { className?: string }) {
 			{/* THE COLOUR, uncovered by the terminator. The mask is twice the width of
 			    the mark and slides from one end to the other, so what crosses the face
 			    is the ellipse's soft edge — and because the mask keeps travelling past
-			    the far limb, the colour is left fully lit rather than half-covered. */}
+			    the far limb, the colour is left fully lit rather than half-covered.
+
+			    AT FULL STRENGTH, which is the point of the reveal — the payoff is the
+			    artwork as it was rendered, and anything short of that is a worse
+			    picture of it.
+
+			    It was briefly held at 45% over the black silhouette, on the reasoning
+			    that a pale glass disc drawn for a black page must be too light to hold
+			    against the cream. The reasoning was fine and the fix was not: scaling
+			    a light-lit render toward black does not relight it as dark glass, it
+			    greys it. Highlight and shadow come down by the same factor, so nothing
+			    is re-lit and the whole disc loses chroma together — the result reads as
+			    a dimmed photograph, not a darker object. If the mark ever does need
+			    more separation from the paper, it needs artwork lit for a light ground
+			    or something to sit against, not a multiplier on this one. */}
 			<Image
 				src="/logo.png"
 				alt=""
@@ -61,9 +75,21 @@ export default function LogoMark({ className }: { className?: string }) {
 			    on the glass instead of sweeping a rectangle across the header, and
 			    positioned so that at both ends of its travel the bright band sits off
 			    the mark entirely — it exists only in passing, which is what a specular
-			    is. */}
+			    is.
+
+			    THE BAND IS PAPER, NOT INK, and that is the whole of the fix. It was
+			    written as `--ink-rgb`, which meant "the light" only for as long as the
+			    page was black — inverted for the bar, ink resolves to near-black and
+			    the highlight became a dark band raking across a dark disc. A specular
+			    that DARKENS is not a specular; it is a smear, and it was landing on the
+			    one moment the mark is meant to look lit.
+
+			    `--paper-rgb` is the right name for it because it is a literal at :root
+			    and never re-pointed, so it stays light in every subtree — which is what
+			    a highlight has to be. It is 236 against ink's 237, so this is invisibly
+			    different on the black pages and correct on this one. */}
 			<span
-				className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgb(var(--ink-rgb)_/_0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]"
+				className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgb(var(--paper-rgb)_/_0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]"
 			/>
 		</span>
 	);

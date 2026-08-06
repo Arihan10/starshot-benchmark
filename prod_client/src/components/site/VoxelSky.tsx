@@ -150,12 +150,18 @@ const BAR_REACH = "calc(var(--text-xs) * 5 + var(--spacing-sm) * 2)";
 
 const BELOW_BAR = `linear-gradient(to bottom, transparent 0, transparent ${BAR_REACH}, #000 calc(${BAR_REACH} + var(--spacing-lg)))`;
 
+// The podium and the standings hold a fixed measure down the middle. The city
+// is laid out in the gutters either side of it rather than across the window,
+// so a cube is never placed where the content is and never drifts into it.
+const KEEP_CLEAR = 1180;
+
+const EDGES = ["left", "right"] as const;
+
 // A COLUMN ROUGHLY EVERY 128px, so the field reads at the same density on a
 // laptop and on a wide display rather than being a fixed count that thins out.
-// Clamped at both ends: below the floor a wide-open page looks abandoned, above
-// the ceiling the cubes start reading as noise behind the standings.
+// Capped so a wide display does not turn the gutters into noise; the floor is
+// one per side, since a gutter that holds nothing simply draws nothing.
 const SPAN = 128;
-const FEWEST = 5;
 const MOST = 24;
 
 // Deterministic, so the layout is identical on the server and the client and
@@ -177,8 +183,9 @@ export function VoxelCity() {
 		() => window.innerWidth,
 		() => 0,
 	);
-	const columns = width
-		? Math.max(FEWEST, Math.min(MOST, Math.round(width / SPAN)))
+	const gutter = Math.max(0, (width - KEEP_CLEAR) / 2);
+	const perSide = gutter
+		? Math.max(1, Math.min(Math.round(MOST / 2), Math.round(gutter / SPAN)))
 		: 0;
 
 	return (
@@ -188,38 +195,43 @@ export function VoxelCity() {
 			className="pointer-events-none absolute inset-0 overflow-hidden"
 			style={{ maskImage: BELOW_BAR, WebkitMaskImage: BELOW_BAR }}
 		>
-			{Array.from({ length: columns }, (_, i) => {
-				const n = (salt: number) => noise(i, salt);
-				const size = Math.round(15 + n(1) * 43);
-				return (
-					<span
-						key={i}
-						className="absolute"
-						style={{
-							// Each cube owns one column and sits somewhere inside it, so the
-							// city spreads over the whole width without falling into a grid.
-							left: `${(((i + 0.14 + n(2) * 0.72) / columns) * 100).toFixed(2)}%`,
-							top: `${(5 + n(3) * 82).toFixed(1)}%`,
-						}}
-					>
-						<Voxel
-							size={size}
-							opacity={(0.13 + n(4) * 0.27).toFixed(2)}
-							drift={[
-								Math.round((n(5) - 0.5) * 46),
-								Math.round((n(6) - 0.5) * 54),
-							]}
-							turn={[
-								Math.round((n(7) - 0.5) * 180),
-								Math.round((n(8) - 0.5) * 180),
-							]}
-							seconds={Math.round(24 + n(9) * 22)}
-							turnSeconds={Math.round(19 + n(10) * 18)}
-							delay={Number((n(11) * 14).toFixed(1))}
-						/>
-					</span>
-				);
-			})}
+			{EDGES.flatMap((edge, side) =>
+				Array.from({ length: perSide }, (_, i) => {
+					const n = (salt: number) => noise(i + side * MOST, salt);
+					const size = Math.round(15 + n(1) * 43);
+					const sway = Math.round((n(5) - 0.5) * 46);
+					// What the cube can occupy has to fit the gutter: its own width plus
+					// the furthest the drift can carry it inward. Anything that cannot
+					// clear the measure is not drawn rather than trimmed to fit.
+					const room = gutter - size - Math.abs(sway);
+					if (room <= 0) return null;
+					return (
+						<span
+							key={`${edge}-${i}`}
+							className="absolute"
+							style={{
+								// Each cube owns one column of the gutter and sits somewhere
+								// inside it, so the field spreads without falling into a grid.
+								[edge]: `${(((i + 0.14 + n(2) * 0.72) / perSide) * room).toFixed(1)}px`,
+								top: `${(5 + n(3) * 82).toFixed(1)}%`,
+							}}
+						>
+							<Voxel
+								size={size}
+								opacity={(0.13 + n(4) * 0.27).toFixed(2)}
+								drift={[sway, Math.round((n(6) - 0.5) * 54)]}
+								turn={[
+									Math.round((n(7) - 0.5) * 180),
+									Math.round((n(8) - 0.5) * 180),
+								]}
+								seconds={Math.round(24 + n(9) * 22)}
+								turnSeconds={Math.round(19 + n(10) * 18)}
+								delay={Number((n(11) * 14).toFixed(1))}
+							/>
+						</span>
+					);
+				}),
+			)}
 		</div>
 	);
 }
@@ -267,7 +279,25 @@ export function VoxelDrift() {
 	);
 }
 
-export default function VoxelSky({ city = false }: { city?: boolean }) {
+/**
+ * `voxels` turns off the drifting cube field and leaves the shooting stars.
+ *
+ * IT EXISTS FOR THE LEADERBOARD, which now draws an actual voxel city in its
+ * right-hand column. The field here is scenery for a page whose middle is TYPE:
+ * it hangs cubes in the gutters either side of a centred measure, and a page
+ * that is two full-bleed columns has no gutters — so its cubes came down on the
+ * standings on one side and on the real city's rooftops on the other, where a
+ * flat translucent square floating over a lit model reads as a rendering fault
+ * rather than as atmosphere. The stars stay: they are behind everything and
+ * belong to the sky rather than to the layout.
+ */
+export default function VoxelSky({
+	city = false,
+	voxels = true,
+}: {
+	city?: boolean;
+	voxels?: boolean;
+}) {
 	return (
 		<>
 			<div
@@ -309,7 +339,7 @@ export default function VoxelSky({ city = false }: { city?: boolean }) {
 			})}
 
 			</div>
-			{city ? <VoxelCity /> : <VoxelDrift />}
+			{voxels && (city ? <VoxelCity /> : <VoxelDrift />)}
 		</>
 	);
 }
