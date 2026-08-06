@@ -42,7 +42,9 @@ export default function LogoMark({ className }: { className?: string }) {
 			    instead (the glint below already works this way), it is a `bg-mark`
 			    rectangle showing through the logo's own alpha, so it takes whatever the
 			    mark currently is and needs no second artwork. */}
-			<span className="absolute inset-0 bg-mark [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain]" />
+			<span className="absolute inset-0 [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain]">
+				<span className="absolute inset-0 bg-mark transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:linear-gradient(#000_0_0),radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:center,130%_50%] [mask-repeat:no-repeat] [mask-size:100%_100%,215%_100%] [mask-composite:subtract] group-hover/mark:[mask-position:center,0%_50%]" />
+			</span>
 
 			{/* THE COLOUR, uncovered by the terminator. The mask is twice the width of
 			    the mark and slides from one end to the other, so what crosses the face
@@ -61,14 +63,23 @@ export default function LogoMark({ className }: { className?: string }) {
 			    is re-lit and the whole disc loses chroma together — the result reads as
 			    a dimmed photograph, not a darker object. If the mark ever does need
 			    more separation from the paper, it needs artwork lit for a light ground
-			    or something to sit against, not a multiplier on this one. */}
+			    or something to sit against, not a multiplier on this one.
+
+			    IT STARTS CLEAR OF THE MARK, and at 100% it did not. The mask is 215%
+			    wide with its ellipse centred at 10% of that and opaque to 58% of a 72%
+			    radius, fading out at 80% — so from 100% the fade reached 30% of the way
+			    across the face and the leading edge of the colour sat at roughly 89%
+			    alpha before the pointer arrived. Solved rather than nudged: the
+			    transparent boundary clears the left edge once the position passes
+			    126.4%, and 130% takes that with a little room. Same trap as the
+			    wordmark's gleam, which is solved the same way in Navbar. */}
 			<Image
 				src="/logo.png"
 				alt=""
 				fill
 				sizes="86px"
 				priority
-				className="object-contain transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:100%_50%] [mask-repeat:no-repeat] [mask-size:215%_100%] group-hover/mark:[mask-position:0%_50%]"
+				className="object-contain transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:130%_50%] [mask-repeat:no-repeat] [mask-size:215%_100%] group-hover/mark:[mask-position:0%_50%]"
 			/>
 
 			{/* THE GLINT. Masked to the artwork's own silhouette so the highlight stays

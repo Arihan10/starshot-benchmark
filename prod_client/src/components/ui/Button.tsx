@@ -34,19 +34,24 @@ import Link from "next/link";
 /**
  * The rank of a control: how loud it is, and what it does when pointed at.
  *
- * `fill` IS `ghost` THAT COMMITS. Both are the ground with the mark's hairline
- * round them and the mark's ink for type — identical at rest, and deliberately so.
- * They part on hover: ghost lifts its ground a shade and stays what it was, fill
- * turns into `solid`.
+ * `outline` AND `ghost` ARE THE SAME OBJECT AT REST — the ground with the mark's
+ * hairline round it and the mark's ink for type — and they are deliberately
+ * identical there. What separates them is what they do when pointed at, which is
+ * the whole of what a rank is.
  *
- * IT IS A RANK OF ITS OWN BECAUSE GHOST'S RESTRAINT IS LOAD-BEARING. Ghost is SKIP
- * in the arena, sitting between the two white vote slabs — the note under
- * GROUND.ghost is the argument, and it is that SKIP must not read as a third
- * choice. A hover that filled it white would make it look exactly like the two
- * things it is the refusal of. So the behaviour could not simply be added to ghost,
- * and the pair in the navbar could not simply borrow ghost. Two intents, two names.
+ * GHOST MOVES; OUTLINE DOES NOT. Ghost is SKIP in the arena, and the note at
+ * MOTION.ghost is the argument for why its hover has to be a widening rather than
+ * a colour: it sits between the two white vote slabs and anything that lightens it
+ * reads as a third choice. Outline is the navbar's board — a slab whose hover
+ * belongs to the row it stands in, so the control itself stays still and the
+ * caller supplies the rule that draws under it.
+ *
+ * `outline` WAS `fill`, which flooded to solid on hover. That made a second solid
+ * control appear beside the only one meant to be solid; the flood is gone and the
+ * name went with it, because a variant named for a fill it no longer performs is
+ * worse than no name at all.
  */
-type Variant = "solid" | "ghost" | "fill" | "quiet";
+type Variant = "solid" | "ghost" | "outline" | "quiet";
 
 /**
  * Where this control sits, which decides its silhouette.
@@ -156,16 +161,16 @@ const GROUND: Record<Variant, string> = {
 	// gradient over the next 260, which reads as the hover landing twice. The sweep
 	// is the hover; a solid button that wants one supplies the layer.
 	solid: "bg-mark",
-	// BLACK, not a grey tint. SKIP sits between two white slabs and a grey ground
+	// BLACK, and it STAYS black. SKIP sits between two white slabs and a grey ground
 	// between them reads as a third, muddier state; pure black with a white edge
-	// reads as the absence of a choice, which is what it means.
-	ghost: "bg-ground group-hover/btn:bg-surface",
-	// IT FILLS TO THE MARK, which is the same ink its own hairline and type are
-	// already drawn in — so the hover is not a new colour arriving, it is the
-	// outline flooding inwards. On the navbar's paper that is a cream slab going
-	// solid black; on the page's own black it would flood white, because every one
-	// of these is a token and the bar re-points what they resolve to.
-	fill: "bg-ground group-hover/btn:bg-mark",
+	// reads as the absence of a choice, which is what it means. It used to lift to
+	// `surface` on hover, which was that muddier state arriving at exactly the
+	// moment the control was being considered — see MOTION.ghost for what replaced
+	// it.
+	ghost: "bg-ground",
+	// The same ground, and nothing happens to it. Whatever this control does on
+	// hover is the row's business, not the slab's.
+	outline: "bg-ground",
 	// LIGHT ON DARK, and settled. This flipped twice while the moon was changing
 	// size; it is fixed now because the geometry fixed it — the disc is sized to the
 	// GAP between the nav's inner pairs, so by construction no nav item is ever on
@@ -195,10 +200,9 @@ const GROUND: Record<Variant, string> = {
 const EDGE: Record<Variant, string> = {
 	solid: "bg-mark",
 	ghost: "bg-mark group-hover/btn:bg-mark",
-	// UNCHANGED ON HOVER, and it does not need to be: the ground floods to this
-	// exact ink underneath it, so the edge stops being an edge and becomes the
-	// leading millimetre of the fill. Nothing has to fade for that to happen.
-	fill: "bg-mark",
+	// The hairline is the whole of this control's edge and it is never anything
+	// else — the shape it draws is what the hover moves, not the colour.
+	outline: "bg-mark",
 	// No outline at rest and none on hover: see GROUND.quiet. A hairline appearing
 	// round a text link is the same mistake as a ground appearing behind it.
 	quiet: "bg-transparent",
@@ -219,20 +223,11 @@ const TEXT: Record<Variant, string> = {
 	// before committing to it rather than judging by eye on one background.
 	solid: "font-sans text-ground font-black",
 	ghost: "font-sans text-ink font-black",
-	// THE LABEL CROSSES WITH THE GROUND, and lands on exactly what `solid` sets:
-	// the page's own colour. Which is the point — filled, this control IS solid, so
-	// it has to be solid's black-on-cream and not an approximation of it. Naming
-	// `text-ground` rather than a literal white is what guarantees that; the two
-	// then cannot come apart, and both invert together wherever the bar does.
-	//
-	// `hover:`, NOT `group-hover/btn:`, for the reason set out at the sweep's own
-	// label rule further down: this map is applied to the SHELL, which is the
-	// element carrying `group/btn`, and the group variant compiles to a descendant
-	// selector. Written as a group variant the rule is emitted, reads correctly in
-	// the stylesheet, and matches nothing — the ground filled in underneath and the
-	// label stayed black, which is exactly how it failed. The group variant belongs
-	// on the LAYERS, which really are children; anything on the shell wants `hover:`.
-	fill: "font-sans text-ink hover:text-ground font-black",
+	// GHOST'S TYPE, TO THE LETTER, because the two are one object at rest and the
+	// navbar's board has to measure against the offer beside it. It used to cross to
+	// `text-ground` on hover to stay legible while the ground flooded; with no flood
+	// there is nothing to cross for.
+	outline: "font-sans text-ink font-black",
 	// WHITE, NOT GREY. The comp sets every nav control at full ink and reserves
 	// grey for things that are genuinely secondary; a navbar of grey labels reads
 	// as disabled. Grey is now spent only where something IS lesser — a byline, a
@@ -314,7 +309,7 @@ const SIZING: Record<Variant, string> = {
 	ghost: "text-sm px-[var(--btn-px)] py-sm",
 	// The navbar pair has to measure as a pair, so this is solid's sizing to the
 	// letter rather than a copy of ghost's that happens to match today.
-	fill: "text-sm px-[var(--btn-px)] py-sm",
+	outline: "text-sm px-[var(--btn-px)] py-sm",
 	// TIGHT, because the navbar's width is the moon's width. The disc has to fit the
 	// gap between the two inner pairs, so every pixel of padding here is a pixel off
 	// the moon's diameter — this is the narrowest the ground can arrive on hover
@@ -322,12 +317,24 @@ const SIZING: Record<Variant, string> = {
 	quiet: "text-xs px-[var(--btn-px)] py-sm",
 };
 
+/**
+ * WHAT A RANK DOES WHEN POINTED AT, in the cases where the answer is movement
+ * rather than colour.
+ *
+ * ON THE SHELL, which is why these are `hover:` and not `group-hover/btn:`. The
+ * shell is the element carrying `group/btn` and the group variant compiles to a
+ * descendant selector — nothing is its own descendant, so a group variant here
+ * would emit, read correctly in devtools and match nothing. Same trap as the
+ * sweep's label rule. It also HAS to be the shell: the ground and the edge are
+ * separate layers, so scaling either one alone would stretch the fill out from
+ * under its own hairline.
+ */
 // The horizontal padding each rank runs at, published as a variable so NUDGE can
 // add to it rather than restate it.
 const PAD: Record<Variant, string> = {
 	solid: "var(--spacing-md)",
 	ghost: "var(--spacing-md)",
-	fill: "var(--spacing-md)",
+	outline: "var(--spacing-md)",
 	quiet: "var(--spacing-xs)",
 };
 

@@ -2,7 +2,6 @@
 
 import { Fragment, useEffect, useRef } from "react";
 import OrbitViewer, { type OrbitViewerHandle } from "@/components/OrbitViewer";
-import { GROUND_LINE } from "@/lib/orbit/engine";
 import type { LocalCell } from "@/lib/localScenes";
 import { buildStep } from "./buildSequence";
 import PctReadout from "./PctReadout";
@@ -107,18 +106,6 @@ export default function ScenePanel({
 						/>
 					</Fragment>
 				)}
-
-				<div
-					aria-hidden
-					className="pointer-events-none absolute inset-0 z-1 mix-blend-screen"
-					style={{
-						background: [
-							// #TODO approximate — should project the scene's ground plane.
-							`linear-gradient(to top, rgba(148,163,184,0.05) 0%, rgba(148,163,184,0.018) ${(GROUND_LINE * 100).toFixed(1)}%, transparent 82%)`,
-						].join(", "),
-					}}
-				/>
-
 				<div className="absolute inset-0">
 					<OrbitViewer
 						ref={viewerRef}
@@ -144,8 +131,10 @@ export default function ScenePanel({
 					className="pointer-events-none absolute inset-0 z-10 transition-opacity duration-520 ease-[cubic-bezier(0.25,0.8,0.3,1)]"
 					style={{
 						opacity: outcome === "won" ? 1 : 0,
-						boxShadow:
-							"inset 0 0 0 1px rgb(var(--mark-rgb) / 0.85), inset 0 0 34px rgb(var(--mark-rgb) / 0.3), inset 0 0 90px rgb(var(--mark-rgb) / 0.16)",
+						// The frame states the win on its own. It used to carry a 34px and a
+						// 90px bloom inside it as well, which lit the edges of the render
+						// rather than the panel and read as the scene itself glowing.
+						boxShadow: "inset 0 0 0 1px rgb(var(--mark-rgb) / 0.85)",
 					}}
 				/>
 				<div

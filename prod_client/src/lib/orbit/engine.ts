@@ -22,8 +22,6 @@ import {
 	Vector3,
 	WebGLRenderer,
 	WebGLRenderTarget,
-	NormalBlending,
-	PlaneGeometry,
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
@@ -56,7 +54,11 @@ import { SurfaceCursor } from "./cursor";
 import { LightRig } from "./lighting";
 import { prepareLitScene } from "./prepare";
 import { MarkerLayer } from "./markerLayer";
-import { SplatLayer, IDENTITY_TRANSFORM, type SplatTransform } from "./splatLayer";
+import {
+	SplatLayer,
+	IDENTITY_TRANSFORM,
+	type SplatTransform,
+} from "./splatLayer";
 import { collectObjects, ObjectAddressing } from "./objectAddressing";
 import { type PanoEntry, PanoStreamer } from "./panoTextures";
 import { Projection } from "./projection";
@@ -101,7 +103,8 @@ const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const describeObject = (o: Object3D): string => {
 	for (let n: Object3D | null = o; n; n = n.parent) {
 		const label = n.userData?.objLabel as string | undefined;
-		if (n.name) return label && label !== n.name ? `${n.name} [${label}]` : n.name;
+		if (n.name)
+			return label && label !== n.name ? `${n.name} [${label}]` : n.name;
 		if (label) return `[${label}]`;
 	}
 	return o.type;
@@ -314,13 +317,21 @@ function centrePan(
 	camera.position.copy(pos).addScaledVector(upAxis, up);
 	camera.lookAt(_panAim.copy(target).addScaledVector(upAxis, up));
 	camera.updateMatrixWorld(true);
-	const right = _centreRight.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+	const right = _centreRight
+		.setFromMatrixColumn(camera.matrixWorld, 0)
+		.normalize();
 	let pan = 0;
 
 	for (let pass = 0; pass < 4; pass++) {
-		camera.position.copy(pos).addScaledVector(upAxis, up).addScaledVector(right, pan);
+		camera.position
+			.copy(pos)
+			.addScaledVector(upAxis, up)
+			.addScaledVector(right, pan);
 		camera.lookAt(
-			_panAim.copy(target).addScaledVector(upAxis, up).addScaledVector(right, pan),
+			_panAim
+				.copy(target)
+				.addScaledVector(upAxis, up)
+				.addScaledVector(right, pan),
 		);
 		camera.updateMatrixWorld(true);
 
@@ -343,7 +354,11 @@ function centrePan(
 	return pan;
 }
 
-const BROWSE_SPIN_SPEED = 1.05;
+// A RATE PER SECOND, not per frame — see the update(dt) in tick. OrbitControls
+// turns `2π / 60 * speed` radians a second, so this is one orbit every 28.6s on
+// every display. The number went back UP when the clock changed: at 1.05 it was
+// reading double on a 120Hz screen, which is the speed that was signed off.
+const BROWSE_SPIN_SPEED = 2.1;
 
 const _centreRight = new Vector3();
 const _fitFwd = new Vector3();
@@ -512,7 +527,8 @@ export class OrbitEngine {
 
 	private readonly renderer: WebGLRenderer;
 	private readonly canvas: HTMLCanvasElement;
-	private captureWaiting: ((c: HTMLCanvasElement | null) => void) | null = null;
+	private captureWaiting: ((c: HTMLCanvasElement | null) => void) | null =
+		null;
 	private readonly travelFade: HTMLDivElement;
 	private readonly iris: HTMLDivElement;
 	private readonly reticle: HTMLDivElement;
@@ -615,7 +631,8 @@ export class OrbitEngine {
 	private rcDownY = 0;
 
 	private navGraph: NavGraph | null = null;
-	private warmed: { source: TourSource; prepared: PreparedTour } | null = null;
+	private warmed: { source: TourSource; prepared: PreparedTour } | null =
+		null;
 	private warming: {
 		source: TourSource;
 		promise: Promise<PreparedTour | null>;
@@ -636,7 +653,6 @@ export class OrbitEngine {
 	private sceneBottomY = 0;
 	private sceneScale: SceneScale = DEFAULT_SCALE;
 	private metrics: NavMetrics = DEFAULT_METRICS;
-	private stageGlow: Mesh | null = null;
 	private framingHull: Vector3[] = [];
 	private readonly groundAnchor = new Vector3();
 	private readonly browsePos = new Vector3();
@@ -809,7 +825,10 @@ export class OrbitEngine {
 		window.addEventListener("keydown", this.onKeyDown);
 		window.addEventListener("keyup", this.onKeyUp);
 		window.addEventListener("blur", this.onWindowBlur);
-		document.addEventListener("pointerlockchange", this.onPointerLockChange);
+		document.addEventListener(
+			"pointerlockchange",
+			this.onPointerLockChange,
+		);
 		document.addEventListener("mousemove", this.onLockedMouseMove);
 
 		this.ro = new ResizeObserver(() => {
@@ -842,7 +861,10 @@ export class OrbitEngine {
 		window.removeEventListener("keydown", this.onKeyDown);
 		window.removeEventListener("keyup", this.onKeyUp);
 		window.removeEventListener("blur", this.onWindowBlur);
-		document.removeEventListener("pointerlockchange", this.onPointerLockChange);
+		document.removeEventListener(
+			"pointerlockchange",
+			this.onPointerLockChange,
+		);
 		document.removeEventListener("mousemove", this.onLockedMouseMove);
 		this.releaseLock();
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
@@ -1162,12 +1184,18 @@ export class OrbitEngine {
 		this.camera.aspect = w / h;
 		this.camera.updateProjectionMatrix();
 
-		if (this.mode === "overview" && !this.move && this.controls.autoRotate) {
+		if (
+			this.mode === "overview" &&
+			!this.move &&
+			this.controls.autoRotate
+		) {
 			this.frameOverview();
 			this.camera.position.copy(this.browsePos);
 			this.controls.target.copy(this.browseTarget);
 			this.camera.updateProjectionMatrix();
-			this.controls.update();
+			// Zero elapsed: this is flushing a camera change, not a frame of time, and
+			// a bare update() here would nudge the spin on every resize event.
+			this.controls.update(0);
 		}
 	}
 
@@ -1264,7 +1292,8 @@ export class OrbitEngine {
 			if (this.lookSampledAt > 0 && step > 0.001) {
 				const k = 1 - Math.exp(-(step * 1000) / LOOK_SAMPLE_TAU);
 				this.lookVel.lon +=
-					(angleDelta(this.lon, look.lon) / step - this.lookVel.lon) * k;
+					(angleDelta(this.lon, look.lon) / step - this.lookVel.lon) *
+					k;
 				this.lookVel.lat +=
 					((look.lat - this.lat) / step - this.lookVel.lat) * k;
 			}
@@ -1379,7 +1408,8 @@ export class OrbitEngine {
 		}
 		if (!this.dollying) return { in: false, out: false };
 		const dist =
-			this.dollyGoal ?? this.camera.position.distanceTo(this.controls.target);
+			this.dollyGoal ??
+			this.camera.position.distanceTo(this.controls.target);
 		return {
 			in: dist > this.controls.minDistance * ZOOM_SLACK,
 			out: dist * ZOOM_SLACK < this.controls.maxDistance,
@@ -1401,7 +1431,8 @@ export class OrbitEngine {
 		}
 		if (!this.dollying) return;
 		const from =
-			this.dollyGoal ?? this.camera.position.distanceTo(this.controls.target);
+			this.dollyGoal ??
+			this.camera.position.distanceTo(this.controls.target);
 		if (!from) return;
 		this.dollyGoal = MathUtils.clamp(
 			from * Math.exp(-step * DOLLY_PER_STEP),
@@ -1540,7 +1571,11 @@ export class OrbitEngine {
 			return;
 		}
 		const flyKey = freeflyKey(ev.code);
-		if (flyKey !== null && FREEFLY_ENTER_KEYS.has(flyKey) && this.canEnterFreefly()) {
+		if (
+			flyKey !== null &&
+			FREEFLY_ENTER_KEYS.has(flyKey) &&
+			this.canEnterFreefly()
+		) {
 			ev.preventDefault();
 			this.requestLock();
 			this.freeflyKeys.add(flyKey);
@@ -1622,20 +1657,11 @@ export class OrbitEngine {
 			this.arrowReach = null;
 			this.emit();
 		}
-		const spot = this.markers.pickNav(
-			aimX,
-			aimY,
-			this.camera,
-			this.canvas,
-		);
+		const spot = this.markers.pickNav(aimX, aimY, this.camera, this.canvas);
 		this.markers.setNavHover(spot);
 		const idx = spot ? (spot.userData.to as number) : -1;
 		const obj = this.highlightEnabled
-			? this.addressing.pickAt(
-					aimX,
-					aimY,
-					this.activeObjectRoot(),
-				)
+			? this.addressing.pickAt(aimX, aimY, this.activeObjectRoot())
 			: null;
 		if (idx >= 0) {
 			const rendered = this.navNode(this.currentIndex)?.rendered;
@@ -1691,7 +1717,10 @@ export class OrbitEngine {
 	private hitIsPickable(h: Intersection): boolean {
 		const splat = this.splat.isActive;
 		for (let o: Object3D | null = h.object; o; o = o.parent) {
-			if (splat && (o === this.proxyGroup || o === this.projection.proxyBase))
+			if (
+				splat &&
+				(o === this.proxyGroup || o === this.projection.proxyBase)
+			)
 				return true;
 			if (!o.visible) return false;
 		}
@@ -1722,7 +1751,11 @@ export class OrbitEngine {
 		this.cursorRay.setFromCamera(_cursorNdc, this.camera);
 		for (const h of this.cursorRay.intersectObject(root, true)) {
 			let visible = true;
-			for (let o: Object3D | null = h.object; o && o !== root; o = o.parent)
+			for (
+				let o: Object3D | null = h.object;
+				o && o !== root;
+				o = o.parent
+			)
 				if (!o.visible) {
 					visible = false;
 					break;
@@ -1831,9 +1864,12 @@ export class OrbitEngine {
 		known?: ReturnType<OrbitEngine["columnAt"]>,
 	): number {
 		const spans = known ?? this.columnAt(x, z);
-		const inside = spans.find((sp) => probeY > sp.bottom && probeY < sp.top);
+		const inside = spans.find(
+			(sp) => probeY > sp.bottom && probeY < sp.top,
+		);
 		if (inside) return inside.top;
-		for (const sp of spans) if (sp.standable && sp.top <= probeY) return sp.top;
+		for (const sp of spans)
+			if (sp.standable && sp.top <= probeY) return sp.top;
 		let above: number | null = null;
 		for (const sp of spans) if (sp.standable) above = sp.top;
 		return above ?? probeY;
@@ -1868,13 +1904,15 @@ export class OrbitEngine {
 		let clear = this.isTargetClear(v3(this.panos[index].position));
 
 		const curLevel =
-			this.currentIndex >= 0 ? (this.panoLevel[this.currentIndex] ?? -1) : -1;
-		if (!clear && curLevel >= 0 && (this.panoLevel[index] ?? -1) !== curLevel) {
-			const pinned = this.nearestPanoTo(
-				eye,
-				this.currentIndex,
-				curLevel,
-			);
+			this.currentIndex >= 0
+				? (this.panoLevel[this.currentIndex] ?? -1)
+				: -1;
+		if (
+			!clear &&
+			curLevel >= 0 &&
+			(this.panoLevel[index] ?? -1) !== curLevel
+		) {
+			const pinned = this.nearestPanoTo(eye, this.currentIndex, curLevel);
 			if (pinned >= 0) {
 				index = pinned;
 				clear = this.isTargetClear(v3(this.panos[index].position));
@@ -1910,7 +1948,11 @@ export class OrbitEngine {
 		const targets = this.interiorTargets();
 		let blocked: Intersection | undefined;
 		for (let i = 0; targets.length > 0 && i < WALK_HEIGHTS.length; i++) {
-			_walkFrom.set(from.x, ground + m.eyeHeight * WALK_HEIGHTS[i], from.z);
+			_walkFrom.set(
+				from.x,
+				ground + m.eyeHeight * WALK_HEIGHTS[i],
+				from.z,
+			);
 			this.walkRay.set(_walkFrom, _walkDir);
 			this.walkRay.near = 0;
 			this.walkRay.far = dist;
@@ -1919,7 +1961,8 @@ export class OrbitEngine {
 				.find((x) => this.hitIsPickable(x));
 			if (h && (!blocked || h.distance < blocked.distance)) blocked = h;
 		}
-		const pushable = !!blocked && this.planNormal(blocked, _walkDir, _walkNrm);
+		const pushable =
+			!!blocked && this.planNormal(blocked, _walkDir, _walkNrm);
 		_walkPt.copy(from).addScaledVector(_walkDir, dist);
 		let planNormal: [number, number, number] | null = null;
 		if (pushable) {
@@ -1938,7 +1981,11 @@ export class OrbitEngine {
 				if (span > 1e-6) {
 					_walkAlt.divideScalar(span);
 					let stop = span;
-					for (let i = 0; targets.length > 0 && i < WALK_HEIGHTS.length; i++) {
+					for (
+						let i = 0;
+						targets.length > 0 && i < WALK_HEIGHTS.length;
+						i++
+					) {
 						_walkFrom.set(
 							from.x,
 							ground + m.eyeHeight * WALK_HEIGHTS[i],
@@ -2045,9 +2092,7 @@ export class OrbitEngine {
 	}
 
 	private standingEye(waypoint: Vector3): Vector3 {
-		return _wpEye
-			.copy(waypoint)
-			.setY(waypoint.y + this.metrics.eyeHeight);
+		return _wpEye.copy(waypoint).setY(waypoint.y + this.metrics.eyeHeight);
 	}
 
 	private columnAt(
@@ -2063,12 +2108,18 @@ export class OrbitEngine {
 		const ys = this.dropRay
 			.intersectObjects(targets, true)
 			.map((h) => h.point.y);
-		const out: Array<{ top: number; bottom: number; standable: boolean }> = [];
+		const out: Array<{ top: number; bottom: number; standable: boolean }> =
+			[];
 		for (let i = 0; i < ys.length; i += 2) {
 			const top = ys[i];
 			const bottom = i + 1 < ys.length ? ys[i + 1] : top;
-			const air = out.length === 0 ? Infinity : out[out.length - 1].bottom - top;
-			out.push({ top, bottom, standable: air >= this.metrics.standHeadroom });
+			const air =
+				out.length === 0 ? Infinity : out[out.length - 1].bottom - top;
+			out.push({
+				top,
+				bottom,
+				standable: air >= this.metrics.standHeadroom,
+			});
 		}
 		return out;
 	}
@@ -2555,7 +2606,8 @@ export class OrbitEngine {
 	}
 
 	enter(index: number | null = null) {
-		if (this.mode !== "overview" || this.move || this.panos.length === 0) return;
+		if (this.mode !== "overview" || this.move || this.panos.length === 0)
+			return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
 		this.setInside(true);
 		this.history = [];
@@ -2616,7 +2668,9 @@ export class OrbitEngine {
 		this.freeflyFrom = this.currentIndex;
 
 		const tex =
-			this.currentIndex >= 0 ? this.panos[this.currentIndex]?.texture : null;
+			this.currentIndex >= 0
+				? this.panos[this.currentIndex]?.texture
+				: null;
 		this.mode = "freefly";
 		this.setFreeflyView();
 		if (tex && !this.reducedMotion) {
@@ -2632,7 +2686,8 @@ export class OrbitEngine {
 			this.splatRevealMs = Math.min(
 				SPLAT_REVEAL_MAX_MS,
 				SPLAT_REVEAL_MS +
-					Math.abs(this.camera.fov - FREEFLY_FOV) * REVEAL_FOV_MS_PER_DEG,
+					Math.abs(this.camera.fov - FREEFLY_FOV) *
+						REVEAL_FOV_MS_PER_DEG,
 			);
 		} else {
 			this.clearPanoOverlay();
@@ -2787,7 +2842,7 @@ export class OrbitEngine {
 						this.controls.target.copy(this.browseTarget);
 						this.camera.position.copy(this.browsePos);
 						this.controls.enabled = true;
-						this.controls.update();
+						this.controls.update(0);
 						this.controls.autoRotate = true;
 						this.emit();
 					},
@@ -2940,7 +2995,8 @@ export class OrbitEngine {
 		const { axis, sign } = this.mapBasis;
 		this.locateClip.normal.set(0, 0, 0).setComponent(axis, -sign);
 		this.locateClip.constant =
-			sign * (userPos.getComponent(axis) + sign * this.metrics.sliceAboveEye);
+			sign *
+			(userPos.getComponent(axis) + sign * this.metrics.sliceAboveEye);
 		this.renderer.clippingPlanes = [this.locateClip];
 		const flat = userPos.clone().sub(this.sceneCenter);
 		flat.y = 0;
@@ -3028,12 +3084,6 @@ export class OrbitEngine {
 		}
 		for (const m of this.proxyColorMats) m.dispose();
 		this.proxyColorMats = [];
-		if (this.stageGlow) {
-			this.scene.remove(this.stageGlow);
-			this.stageGlow.geometry.dispose();
-			(this.stageGlow.material as ShaderMaterial).dispose();
-			this.stageGlow = null;
-		}
 		this.projection.clearBase(this.scene);
 		this.streamer.reset();
 		this.connectors = [];
@@ -3098,11 +3148,16 @@ export class OrbitEngine {
 		for (const l of this.sonarLabels) l.style.display = "none";
 	}
 
-	async prepareTour(source: TourSource, token: number): Promise<PreparedTour | null> {
+	async prepareTour(
+		source: TourSource,
+		token: number,
+	): Promise<PreparedTour | null> {
 		{
 			let manifest: TourManifest | null = null;
 			if (source.manifestUrl) {
-				const res = await fetch(source.manifestUrl, { cache: "no-store" });
+				const res = await fetch(source.manifestUrl, {
+					cache: "no-store",
+				});
 				if (token !== this.loadToken || this.disposed) return null;
 				if (res.ok) manifest = (await res.json()) as TourManifest;
 			}
@@ -3147,7 +3202,9 @@ export class OrbitEngine {
 					? manifest.connectors
 					: [];
 			const objectIds =
-				manifest && Array.isArray(manifest.objects) ? manifest.objects : [];
+				manifest && Array.isArray(manifest.objects)
+					? manifest.objects
+					: [];
 			const mapLabels =
 				manifest && Array.isArray(manifest.map_labels)
 					? manifest.map_labels
@@ -3186,7 +3243,9 @@ export class OrbitEngine {
 			if (breathe) await breathe();
 
 			const panoLevel = entries.map((p) =>
-				typeof p.level === "number" && p.level >= 0 && p.level < minimaps.length
+				typeof p.level === "number" &&
+				p.level >= 0 &&
+				p.level < minimaps.length
 					? p.level
 					: levelForPosition(minimaps, p.position),
 			);
@@ -3197,16 +3256,29 @@ export class OrbitEngine {
 			const framed = lite ?? proxyRoot;
 			if (!framed) {
 				return {
-					entries, proxyRoot, lite, connectors, objectIds,
-					minimaps, minimapPrefetch, mapLabels, mapBasis, levelWord,
-					panoLevel, splatReady, splatTransform: source.splatTransform,
-					box: null, sceneScale: DEFAULT_SCALE, metrics: DEFAULT_METRICS,
+					entries,
+					proxyRoot,
+					lite,
+					connectors,
+					objectIds,
+					minimaps,
+					minimapPrefetch,
+					mapLabels,
+					mapBasis,
+					levelWord,
+					panoLevel,
+					splatReady,
+					splatTransform: source.splatTransform,
+					box: null,
+					sceneScale: DEFAULT_SCALE,
+					metrics: DEFAULT_METRICS,
 					navGraph: null,
 				};
 			}
 
 			framed.updateMatrixWorld(true);
-			if (proxyRoot && proxyRoot !== framed) proxyRoot.updateMatrixWorld(true);
+			if (proxyRoot && proxyRoot !== framed)
+				proxyRoot.updateMatrixWorld(true);
 			if (breathe) await breathe();
 
 			const box = new Box3().setFromObject(framed);
@@ -3237,9 +3309,23 @@ export class OrbitEngine {
 			}
 
 			return {
-				entries, proxyRoot, lite, connectors, objectIds,
-				minimaps, minimapPrefetch, mapLabels, mapBasis, levelWord,
-				panoLevel, splatReady, box, center, sceneScale, metrics, navGraph,
+				entries,
+				proxyRoot,
+				lite,
+				connectors,
+				objectIds,
+				minimaps,
+				minimapPrefetch,
+				mapLabels,
+				mapBasis,
+				levelWord,
+				panoLevel,
+				splatReady,
+				box,
+				center,
+				sceneScale,
+				metrics,
+				navGraph,
 				splatTransform: source.splatTransform,
 			};
 		}
@@ -3267,7 +3353,8 @@ export class OrbitEngine {
 
 	warmTour(source: TourSource) {
 		if (this.disposed) return;
-		if (this.warmed?.source === source || this.warming?.source === source) return;
+		if (this.warmed?.source === source || this.warming?.source === source)
+			return;
 		const token = this.loadToken;
 		const promise = this.prepareTour(source, token)
 			.then((prepared) => {
@@ -3282,7 +3369,10 @@ export class OrbitEngine {
 		this.warming = { source, promise };
 	}
 
-	async loadTour(source: TourSource, commitVia?: (commit: () => void) => void) {
+	async loadTour(
+		source: TourSource,
+		commitVia?: (commit: () => void) => void,
+	) {
 		const token = ++this.loadToken;
 		if (this.isEmpty) this.showOverlay("loading scene…");
 		try {
@@ -3392,44 +3482,6 @@ export class OrbitEngine {
 		this.buildSceneDirectory(entries);
 
 		this.markers.build(this.sceneMaxDim, this.metrics);
-
-		const foot = Math.max(size.x, size.z) * 1.45;
-		const glowMat = new ShaderMaterial({
-			transparent: true,
-			depthWrite: false,
-			depthTest: true,
-			blending: NormalBlending,
-			uniforms: { uColor: { value: new Color(0.886, 0.91, 0.94) } },
-			vertexShader: `
-				varying vec2 vUv;
-				void main() {
-					vUv = uv;
-					gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-				}
-			`,
-			fragmentShader: `
-				uniform vec3 uColor;
-				varying vec2 vUv;
-				void main() {
-					float d = length(vUv - 0.5) * 2.0;
-					float a = clamp(1.0 - d, 0.0, 1.0);
-					a = a * a * 0.34;
-					gl_FragColor = vec4(uColor * a, a);
-				}
-			`,
-		});
-		const glow = new Mesh(new PlaneGeometry(1, 1), glowMat);
-		glow.rotation.x = -Math.PI / 2;
-		glow.scale.set(foot, foot, 1);
-		glow.position.set(
-			this.sceneCenter.x,
-			box.min.y + this.sceneMaxDim * 0.002,
-			this.sceneCenter.z,
-		);
-		glow.renderOrder = -1;
-		this.stageGlow = glow;
-		this.scene.add(glow);
-
 		this.framingHull = framingHull(box, this.sceneCenter);
 		this.groundAnchor.copy(groundAnchor(box, this.sceneCenter));
 		this.frameOverview();
@@ -3438,7 +3490,7 @@ export class OrbitEngine {
 		this.camera.updateProjectionMatrix();
 		this.controls.target.copy(this.browseTarget);
 		this.controls.enabled = true;
-		this.controls.update();
+		this.controls.update(0);
 		this.controls.autoRotate = true;
 
 		this.setOverviewView();
@@ -3484,7 +3536,9 @@ export class OrbitEngine {
 			0,
 			_panShift,
 		);
-		_centreRight.setFromMatrixColumn(this.camera.matrixWorld, 0).normalize();
+		_centreRight
+			.setFromMatrixColumn(this.camera.matrixWorld, 0)
+			.normalize();
 		this.browsePos.addScaledVector(_centreRight, across);
 		this.browseTarget.addScaledVector(_centreRight, across);
 
@@ -3598,14 +3652,21 @@ export class OrbitEngine {
 		const box = new Box3().setFromObject(clone);
 		if (box.isEmpty()) return;
 		const centre = box.getCenter(new Vector3());
-		const radius = Math.max(1e-3, box.getSize(new Vector3()).length() * 0.5);
+		const radius = Math.max(
+			1e-3,
+			box.getSize(new Vector3()).length() * 0.5,
+		);
 		clone.position.sub(centre);
 		const pivot = new Group();
 		pivot.add(clone);
 		scene.add(pivot);
-		this.inspectCam.position.set(0.62, 0.42, 1).normalize().multiplyScalar(
-			(radius / Math.sin((this.inspectCam.fov * Math.PI) / 360)) * 1.12,
-		);
+		this.inspectCam.position
+			.set(0.62, 0.42, 1)
+			.normalize()
+			.multiplyScalar(
+				(radius / Math.sin((this.inspectCam.fov * Math.PI) / 360)) *
+					1.12,
+			);
 		this.inspectCam.near = Math.max(0.01, radius * 0.05);
 		this.inspectCam.far = radius * 20;
 		this.inspectCam.lookAt(0, 0, 0);
@@ -3687,9 +3748,7 @@ export class OrbitEngine {
 			items.push({
 				index,
 				up: step > 0,
-				pos: here
-					.clone()
-					.setY(here.y + step * this.metrics.arrowDist),
+				pos: here.clone().setY(here.y + step * this.metrics.arrowDist),
 			});
 		}
 		this.markers.buildFloorArrows(items);
@@ -3761,7 +3820,11 @@ export class OrbitEngine {
 		} else if (this.crossfade) {
 			this.tickCrossfade(now);
 		} else if (this.mode === "overview") {
-			this.controls.update();
+			// SECONDS, NOT FRAMES. Given no argument OrbitControls advances the spin by
+			// a fixed angle PER CALL — its own docs quote the speed "at 60fps" — so the
+			// scene turned 2.4x fast on a 144Hz display and slowed with the frame rate
+			// through a hitch. Handed the frame's own dt it turns at a rate per second.
+			this.controls.update(dt);
 		} else if (this.mode === "interior") {
 			if (this.move) {
 				const mv = this.move;
@@ -4083,7 +4146,11 @@ export class OrbitEngine {
 			);
 			ghosted = true;
 		} else if (hit && this.mode === "freefly") {
-			const targetIdx = this.autoHomeTarget(hit, this.floorAt(hit.point), -1);
+			const targetIdx = this.autoHomeTarget(
+				hit,
+				this.floorAt(hit.point),
+				-1,
+			);
 			if (targetIdx >= 0) {
 				this.cursor.setColor(CURSOR_CLEAR);
 				this.markers.showGhost(
@@ -4107,7 +4174,11 @@ export class OrbitEngine {
 				const destLevel = this.panoLevel[targetIdx] ?? -1;
 				if (occluded) {
 					this.cursor.setColor(NAV_COLORS.portal);
-					reach = { index: targetIdx, level: destLevel, levelDelta: 0 };
+					reach = {
+						index: targetIdx,
+						level: destLevel,
+						levelDelta: 0,
+					};
 					this.markers.showGhost(
 						marker,
 						{ to: targetIdx, type: "portal", dy: 0 },
@@ -4117,7 +4188,9 @@ export class OrbitEngine {
 					ghosted = true;
 				} else {
 					const crossesLevel =
-						curLevel >= 0 && destLevel >= 0 && destLevel !== curLevel;
+						curLevel >= 0 &&
+						destLevel >= 0 &&
+						destLevel !== curLevel;
 					this.cursor.setColor(
 						crossesLevel ? NAV_COLORS.vertical : CURSOR_CLEAR,
 					);
@@ -4130,7 +4203,8 @@ export class OrbitEngine {
 			}
 		}
 		if (!ghosted) this.markers.hideGhost();
-		const changed = (this.cursorReach?.index ?? -1) !== (reach?.index ?? -1);
+		const changed =
+			(this.cursorReach?.index ?? -1) !== (reach?.index ?? -1);
 		this.cursorReach = reach;
 		if (changed) {
 			if (reach) this.requestPano(reach.index);
@@ -4147,7 +4221,8 @@ export class OrbitEngine {
 				: onSurface
 					? String(RETICLE_ON_SURFACE)
 					: String(RETICLE_IN_VOID);
-		if (this.reticle.style.opacity !== want) this.reticle.style.opacity = want;
+		if (this.reticle.style.opacity !== want)
+			this.reticle.style.opacity = want;
 	}
 
 	private updateSonarLabels() {

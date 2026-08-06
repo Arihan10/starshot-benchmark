@@ -185,80 +185,48 @@ export default function Navbar() {
 	// raked, and the right-hand pair became two standalone buttons some time ago, so
 	// it was already deciding between one live branch and one dead one; with the
 	// left-hand rake gone it decides nothing at all.
+	// THE ARENA IS ONLY ACTIVE ON EXACTLY "/". Every path starts with a slash, so a
+	// `startsWith` test would light it on every page of the site.
+	const isHere = (href?: string) =>
+		href
+			? href === "/"
+				? pathname === "/"
+				: pathname.startsWith(href)
+			: false;
+
+	const ruled = (label: string, active: boolean) => (
+		<span className='relative'>
+			{label}
+			<span
+				aria-hidden
+				className={`pointer-events-none absolute left-0 -bottom-0.75 h-[1.5px] bg-mark transition-[width] duration-settle ease-out group-hover/nav:w-0 group-hover/nav:group-hover/btn:w-full ${
+					active ? "w-full" : "w-0"
+				}`}
+			/>
+		</span>
+	);
+
 	const pair = (items: { label: string; href?: string }[]) =>
 		items.map((item) => {
-			// THE ARENA IS ONLY ACTIVE ON EXACTLY "/". Every path starts with a slash,
-			// so a `startsWith` test would light it on every page of the site.
-			const active = item.href
-				? item.href === "/"
-					? pathname === "/"
-					: pathname.startsWith(item.href)
-				: false;
-			const inner = (
-				<span className="relative">
-					{item.label}
-					{
-						// ONE LINE FOR THE THREE OF THEM, and it goes where the pointer is.
-						//
-						// Every item carries a rule now, not just the active one, and which
-						// of them is drawn is decided by three rules whose ORDER OF
-						// PRECEDENCE IS THEIR SPECIFICITY — never the order Tailwind
-						// happened to emit them in, which is a coin-toss between two
-						// variants of equal weight and the way this exact kind of rule
-						// silently stops working:
-						//
-						//   base                                (0,1,0)  the active page's
-						//                                                line, at rest
-						//   group-hover/nav:                    (0,2,0)  a pointer anywhere
-						//                                                in the nav takes it
-						//                                                back
-						//   group-hover/nav:group-hover/btn:    (0,3,0)  except on the item
-						//                                                actually under it
-						//
-						// So at rest the current page is underlined; the moment the pointer
-						// enters the nav that line retreats and the one under the pointer
-						// draws in; and moving between items hands it along. Leave, and it
-						// returns to the page you are on. Never two lines at once — which
-						// is what "whichever button we are hovering" has to mean, and what
-						// a second permanent line under the active item would break.
-						//
-						// IT DRAWS AND UNDRAWS FROM THE LEFT. `origin-left` pins that end
-						// so the rule is written and taken back the way a line is written,
-						// rather than growing out of its own middle.
-						//
-						// The transition names `scale`, NOT `transform` — Tailwind v4's
-						// `scale-x-*` utilities write the standalone `scale` property, so
-						// `transition-transform` covers nothing they do.
-						<span
-							aria-hidden
-							className={`pointer-events-none absolute inset-x-0 -bottom-[0.45em] h-[2px] origin-left rounded-full bg-accent transition-[scale] duration-settle ease-out group-hover/nav:scale-x-0 group-hover/nav:group-hover/btn:scale-x-100 ${
-								active ? "scale-x-100" : "scale-x-0"
-							}`}
-							// THE TRIPLET, not `var(--color-accent)`. The line itself is
-							// `bg-accent`, which writes `rgb(var(--accent-rgb))` into the
-							// utility and so takes the bar's deep violet; the glow read the
-							// `--color-accent` ALIAS, which is declared on `:root` and
-							// therefore froze at the black page's periwinkle before ON_PAPER
-							// ever ran. A violet line with a pale blue halo — the one thing
-							// ON_PAPER names `--accent-rgb` specifically to prevent.
-							style={{ boxShadow: "0 0 10px -1px rgb(var(--accent-rgb))" }}
-						/>
-					}
-				</span>
-			);
+			const active = isHere(item.href);
 			return item.href ? (
 				<Button
 					key={item.label}
 					href={item.href}
 					aria-current={active ? "page" : undefined}
-					variant="quiet"
-					shape="square"
+					variant='quiet'
+					shape='square'
 				>
-					{inner}
+					{ruled(item.label, active)}
 				</Button>
 			) : (
-				<Button key={item.label} variant="quiet" shape="square" onClick={() => {}}>
-					{inner}
+				<Button
+					key={item.label}
+					variant='quiet'
+					shape='square'
+					onClick={() => {}}
+				>
+					{ruled(item.label, active)}
 				</Button>
 			);
 		});
@@ -266,10 +234,10 @@ export default function Navbar() {
 	return (
 		<header
 			style={ON_PAPER}
-			className="relative z-20 flex items-center justify-between gap-lg px-sm pt-[2px] pb-xs"
+			className='relative z-20 flex items-center justify-between gap-lg px-sm pt-[2px] pb-xs'
 		>
 			{/* --- the mark ---------------------------------------------------- */}
-			<div className="flex items-center gap-md">
+			<div className='flex items-center gap-md'>
 				{/* THE LOCKUP GOES HOME, and it is an ANCHOR now rather than a button
 				    with a handler — the same rule the Button component is written to:
 				    a control that navigates has to be middle-clickable, copyable and
@@ -286,7 +254,7 @@ export default function Navbar() {
 				    the current page would say it on every visit to "/" and mean nothing
 				    the nav item has not already said. */}
 				<Link
-					href="/"
+					href='/'
 					// ONE SIZE FOR THE WHOLE LOCKUP. The byline runs at `--lockup` and the
 					// wordmark at a fixed multiple of it, so scaling the pair is one number
 					// and the flush relationship cannot be broken by resizing either alone.
@@ -305,14 +273,14 @@ export default function Navbar() {
 					// the browser's default 16px against a wordmark computed from 12.96.
 					// That is where the last 38px of misalignment came from.
 					style={{ ["--lockup" as string]: "var(--text-2xs)" }}
-					aria-label="SceneBench by Starshot Labs"
+					aria-label='SceneBench by Starshot Labs'
 					// `text-left` went with the button: it existed only to undo the
 					// centring a <button> applies to its own contents, and an anchor
 					// never had it to undo.
-					className="group/mark flex flex-none cursor-pointer items-center gap-2xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+					className='group/mark flex flex-none cursor-pointer items-center gap-2xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent'
 				>
-					<LogoMark className="size-[calc(var(--spacing-xl)*1.45)] flex-none" />
-					<div className="flex flex-col justify-center gap-2xs">
+					<LogoMark className='size-[calc(var(--spacing-xl)*1.45)] flex-none' />
+					<div className='flex flex-col justify-center gap-2xs'>
 						{/* THE TYPE IS SET ON THE WRAPPER, not on each copy, and that is
 						    what actually holds the two in register. Both copies now
 						    INHERIT one declaration from a common ancestor rather than
@@ -338,7 +306,9 @@ export default function Navbar() {
 						    here makes the strut the wordmark's own, so the line box is the
 						    word's own box and the two copies land on one baseline by
 						    construction rather than by coincidence. */}
-						<span className={`relative inline-block ${WORDMARK_TYPE}`}>
+						<span
+							className={`relative inline-block ${WORDMARK_TYPE}`}
+						>
 							<span>SCENEBENCH</span>
 							{/* THE GLEAM: the same word again, in WHITE, with a soft window
 							    travelling along it — so only the stretch of the name inside
@@ -379,7 +349,7 @@ export default function Navbar() {
 								// two numbers are derived in GLEAM_REST / GLEAM_PAST above,
 								// which is where the working is; they have to appear literally
 								// here to exist at all.
-								className="pointer-events-none absolute inset-0 [--gleam:135%] group-hover/mark:[--gleam:-35%]"
+								className='pointer-events-none absolute inset-0 [--gleam:135%] group-hover/mark:[--gleam:-35%]'
 								style={{
 									// SET HERE RATHER THAN AS A UTILITY, because WORDMARK_TYPE
 									// ends in `text-mark` and a second colour class on the same
@@ -452,13 +422,17 @@ export default function Navbar() {
 							    hanging on for 700ms after the mark is cold. */}
 							<span
 								aria-hidden
-								className="pointer-events-none absolute -top-[0.42em] -right-[0.3em] size-xs text-accent opacity-0 transition-opacity delay-0 duration-260 ease-out [animation-play-state:paused] group-hover/mark:opacity-100 group-hover/mark:delay-700 group-hover/mark:[animation-play-state:running] motion-safe:animate-[star-turn_9s_linear_infinite,star-breathe_1.9s_ease-in-out_infinite]"
+								className='pointer-events-none absolute -top-[0.42em] -right-[0.3em] size-xs text-mark opacity-0 transition-opacity delay-0 duration-260 ease-out [animation-play-state:paused] group-hover/mark:opacity-100 group-hover/mark:delay-700 group-hover/mark:[animation-play-state:running] motion-safe:animate-[star-turn_9s_linear_infinite,star-breathe_1.9s_ease-in-out_infinite]'
 							>
-								<svg viewBox="0 0 24 24" fill="currentColor" className="size-full">
+								<svg
+									viewBox='0 0 24 24'
+									fill='currentColor'
+									className='size-full'
+								>
 									{/* A four-point spark with concave sides — the shape a
 									    point of light makes, not the five-point badge on a
 									    sheriff. */}
-									<path d="M12 0c0 6.6 5.4 12 12 12-6.6 0-12 5.4-12 12 0-6.6-5.4-12-12-12 6.6 0 12-5.4 12-12z" />
+									<path d='M12 0c0 6.6 5.4 12 12 12-6.6 0-12 5.4-12 12 0-6.6-5.4-12-12-12 6.6 0 12-5.4 12-12z' />
 								</svg>
 							</span>
 						</span>
@@ -501,7 +475,7 @@ export default function Navbar() {
 						    ink and the whole nav — which lands on the comp to the pixel —
 						    slides right by that much. Pulling exactly one letter-space back
 						    off the end trims the box to the glyphs. */}
-						<span className="font-label text-[length:var(--lockup)] leading-none tracking-[0.3774em] -mr-[0.3774em] whitespace-nowrap text-mark-40">
+						<span className='font-label text-[length:var(--lockup)] leading-none tracking-[0.3774em] -mr-[0.3774em] whitespace-nowrap text-mark-40'>
 							BY STARSHOT LABS
 						</span>
 					</div>
@@ -512,14 +486,14 @@ export default function Navbar() {
 				    the three links are its descendants, so each one can be styled on
 				    whether the row is hot as well as on whether it is itself. */}
 				<nav
-					aria-label="About SceneBench"
-					className="group/nav flex items-center"
+					aria-label='About SceneBench'
+					className='group/nav flex items-center'
 				>
 					{pair(NAV_LEFT)}
 				</nav>
 			</div>
 
-{/* --- the offer ------------------------------------------------------
+			{/* --- the offer ------------------------------------------------------
 			    The one solid button up here, and the only one on the page outside the
 			    vote itself.
 
@@ -530,48 +504,40 @@ export default function Navbar() {
 			    replacing it, because `background-image` does not interpolate: a
 			    gradient set on hover would snap in while everything else eased.
 			    Fading a copy over the ink is the only way the two arrive together. */}
-			<div className="flex items-center">
+			<div className='flex items-center gap-2xs'>
+				{/* THE BOARD KEEPS ITS SLAB AND LOSES ITS FLOOD. It is still cut to
+				    interlock with the offer beside it — same sizing, same type, the
+				    outer edge stood up and the inner one raked, so the two read as one
+				    bar that ends where it ends — and only what happens on hover has
+				    changed. It used to fill to the mark, which is the ink the offer
+				    already wears at REST: pointing at the quieter half turned it into a
+				    copy of the louder one, and for that moment the bar carried two solid
+				    controls and no hierarchy.
 
-				{/* TWO SLABS, SIDE BY SIDE AND NOT TOUCHING, and the rake is now only on
-				    the two edges that FACE EACH OTHER. The pair used to be a pair of
-				    parallelograms leaning at all four edges; the outermost two are stood
-				    up, so the group reads as a bar that ENDS where it ends — flush to the
-				    moon on the left and square to the window on the right. A slant on
-				    either outer edge read as the bar having been cut short, and the one
-				    on the right in particular left the site's most important control
-				    tapering away toward the corner of the page.
+				    WHAT IT DOES INSTEAD BELONGS TO THE ROW. The accent rule draws under
+				    its label exactly as it does under ABOUT, FAQ and ARENA — so the four
+				    destinations in this bar answer the pointer the same way wherever they
+				    sit, and the slab itself holds still. See MOTION.outline in Button.
 
-				    THE INNER SLANTS ARE UNTOUCHED, and they are what the shapes are for:
-				    both still rake the same way, so the space between them stays a seam
-				    of constant width rather than a wedge.
-
-				    A GAP, DELIBERATELY. Cut to interlock (pulled together by one rake)
-				    the two slants land on the same line and the pair reads as ONE control
-				    split by a slanted seam — which is wrong, because they are two
-				    different destinations. Held a hair apart they read as a pair
-				    travelling together, which is what they are.
-
-				    THE SAME CONTROL, INVERTED. Leaderboard takes the ground with the
-				    mark as its edge and its type, against the CTA's solid mark — same
-				    face, same size, same weight, so the two are legible as a pair and
-				    the difference between them is only which way round they are. The
-				    offer stays the solid one; a board you can go and read is not an
-				    offer. */}
-				{/* IT FILLS IN TO BECOME ITS TWIN. At rest the two are one control
-				    printed both ways round — cream with black type against black with
-				    cream — and pointing at this one floods it black, so it lands on
-				    exactly the colours the offer beside it is already wearing.
-
-				    Which is the argument for it: the pair reads as one thing and its
-				    inverse, and the hover says the quieter half is a destination too
-				    rather than a caption on the loud one. They do not collide while it
-				    happens — the offer is only ever black at REST, and the moment it is
-				    the one being pointed at it is under its gradient. */}
-				<Button href="/leaderboard" variant="fill" shape="upright-start">
-					Leaderboard
-				</Button>
+				    IT CARRIES ITS OWN `group/nav` because that rule is written against a
+				    group; the reasoning is at `ruled`. */}
+				<nav
+					aria-label='SceneBench standings'
+					className='group/nav flex items-center'
+				>
+					<Button
+						href='/leaderboard'
+						aria-current={
+							isHere("/leaderboard") ? "page" : undefined
+						}
+						variant='outline'
+						shape='upright-start'
+					>
+						{ruled("Leaderboard", isHere("/leaderboard"))}
+					</Button>
+				</nav>
 				<Button
-					variant="solid"
+					variant='solid'
 					sweep
 					// THE EDGE IS BACK, and the note that removed it had the mechanism
 					// right and the conclusion backwards. It is drawn in `mark` and so is
@@ -580,15 +546,12 @@ export default function Navbar() {
 					// and leave a black frame round the gradient on hover.
 					//
 					// That frame is the point. Under the sweep the button is four pale
-					// stops of near-white glass, and in a cream bar a pale slab with no
+					// stops of near-white glass, and in a light bar a pale slab with no
 					// edge has nothing to end it: the control dissolves into the paper at
 					// exactly the moment it is being pointed at. The border is what keeps
-					// the silhouette — the rake, the uprights, the whole shape the pair
-					// is cut to — legible while the fill is at its lightest.
-					shape="upright-end"
-					// Close, not joined. One rake of overlap would make the slants
-					// coincide and fuse the two into a single silhouette.
-					className="ml-2xs"
+					// the silhouette — the rake, the upright, the whole shape it is cut
+					// to — legible while the fill is at its lightest.
+					shape='upright-end'
 					// #TODO: no action yet. This should take a prompt from the visitor
 					// and queue a build on both models.
 					onClick={() => {}}

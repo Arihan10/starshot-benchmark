@@ -8,8 +8,10 @@ import VoteButton from "./VoteButton";
 import Button from "@/components/ui/Button";
 
 const SIDE_VOTING = "calc(var(--spacing-xl) * 4.3)";
+const SIDE_SKIP_HOVER = "calc(var(--spacing-xl) * 4.04375)";
 const SIDE_REVEALED = "calc(var(--spacing-xl) * 7.4)";
 const MIDDLE = "calc(var(--spacing-xl) * 2.05)";
+const MIDDLE_SKIP_HOVER = "calc(var(--spacing-xl) * 2.5625)";
 const EXPAND_MS = 880;
 const EXPAND = `${EXPAND_MS}ms cubic-bezier(0.62,0.02,0.24,1)`;
 
@@ -22,23 +24,27 @@ function Side({
 	width,
 	align,
 	children,
+	hoverWidth,
 }: {
 	expanded: boolean;
 	width: number | null;
 	align: "left" | "right";
 	children: ReactNode;
+	hoverWidth?: string;
 }) {
 	return (
 		<div
-			className={`flex overflow-hidden ${align === "right" ? "justify-end" : ""}`}
+			className={`flex overflow-hidden ${
+				align === "right" ? "justify-end" : ""
+			}`}
 			style={{
 				width: expanded
 					? width
 						? `max(${SIDE_VOTING}, ${width}px)`
 						: SIDE_REVEALED
-					: SIDE_VOTING,
+					: hoverWidth ?? SIDE_VOTING,
 				maxWidth: SIDE_MAX,
-				transition: `width ${EXPAND}`,
+				transition: expanded ? `width ${EXPAND}` : "width var(--duration-settle) ease-out",
 			}}
 		>
 			{children}
@@ -61,6 +67,7 @@ export default function VoteBar({
 }) {
 	const [left, right] = cells;
 	const voted = vote !== null;
+	const [skipHovered, setSkipHovered] = useState(false);
 
 	const cardA = useRef<HTMLDivElement>(null);
 	const cardB = useRef<HTMLDivElement>(null);
@@ -92,7 +99,12 @@ export default function VoteBar({
 				voted ? "" : "[&>*+*]:-ml-[13px]"
 			}`}
 		>
-			<Side expanded={voted} width={revealWidth} align="left">
+			<Side
+				expanded={voted}
+				width={revealWidth}
+				align="left"
+				hoverWidth={skipHovered ? SIDE_SKIP_HOVER : undefined}
+			>
 				{voted ? (
 					<RevealCard
 							ref={cardA}
@@ -106,22 +118,42 @@ export default function VoteBar({
 				)}
 			</Side>
 
-			<div data-vote-middle className="flex" style={{ width: MIDDLE }}>
+			<div
+				data-vote-middle
+				className="flex justify-center"
+				style={{
+					width: skipHovered && !voted ? MIDDLE_SKIP_HOVER : MIDDLE,
+					transition: "width var(--duration-settle) ease-out",
+				}}
+			>
 				{voted ? (
 					<NextTimer onNext={onNext} paused={paused} />
 				) : (
-					<Button
-						shape="middle"
-						edge={false}
-						onClick={() => onVote("skip")}
-						className="w-full border-y border-mark px-xs"
-					>
-						Skip
-					</Button>
+					<div className="relative z-10 flex w-full shrink-0">
+						<Button
+							shape="middle"
+							onClick={() => {
+								setSkipHovered(false);
+								onVote("skip");
+							}}
+							onMouseEnter={() => setSkipHovered(true)}
+							onMouseLeave={() => setSkipHovered(false)}
+							onFocus={() => setSkipHovered(true)}
+							onBlur={() => setSkipHovered(false)}
+							className="w-full px-xs"
+						>
+							Skip
+						</Button>
+					</div>
 				)}
 			</div>
 
-			<Side expanded={voted} width={revealWidth} align="right">
+			<Side
+				expanded={voted}
+				width={revealWidth}
+				align="right"
+				hoverWidth={skipHovered ? SIDE_SKIP_HOVER : undefined}
+			>
 				{voted ? (
 					<RevealCard
 							ref={cardB}

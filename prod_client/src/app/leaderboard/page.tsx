@@ -40,6 +40,11 @@ const FOOT = 76;
  * SLIGHTLY WIDER ON THE LEFT. The two are close to even, but the board carries
  * type and the city carries mass — and type is the one that stops working when
  * it runs out of room. The city simply gets denser.
+ *
+ * A PHONE HAS NEITHER DIRECTION TO SPARE, so the split becomes a sequence: the
+ * standings take the first screen whole and the island is a swipe below them.
+ * Which one is the default is not a toss-up — this route is the BOARD, and the
+ * city is how it is read at a glance. See LeaderboardStage.
  */
 export default function LeaderboardPage() {
 	const top = STANDINGS.slice(0, 3);

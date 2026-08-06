@@ -25,8 +25,10 @@
 
 // The paper the row turns to — `--paper-rgb` in globals.css. A literal here on
 // purpose: this module runs before it has anything to read the token off, and the
-// number it needs is the one constant in the question being asked.
-const PAPER: [number, number, number] = [236, 233, 226];
+// number it needs is the one constant in the question being asked. KEEP IT IN STEP
+// with the token; it was the old warm cream for a while after the light system was
+// unified, which is a silent 0.5% error in every contrast reading taken here.
+const PAPER: [number, number, number] = [237, 237, 237];
 
 // Big enough that a thin monogram survives rasterising, small enough that reading
 // it back is free. The measurement is a weighted average over the whole mark, so

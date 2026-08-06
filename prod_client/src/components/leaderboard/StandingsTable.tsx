@@ -6,15 +6,21 @@ import BrandMark from "./BrandMark";
 
 type Key = "name" | "elo" | "winRate" | "votes";
 
+// `narrow` is which columns survive a phone. Rank, model and Elo are the board:
+// a rank with nothing to rank by is a list, and the Elo is what the order means.
+// The win bar and the vote count are corroboration — worth the width when there
+// is width, and worth less than a model name that does not truncate when there
+// is not.
 const COLUMNS: {
 	key: Key;
 	label: string;
 	first: "asc" | "desc";
+	narrow: boolean;
 }[] = [
-	{ key: "name", label: "Model", first: "asc" },
-	{ key: "elo", label: "Elo", first: "desc" },
-	{ key: "winRate", label: "Win rate", first: "desc" },
-	{ key: "votes", label: "Votes", first: "desc" },
+	{ key: "name", label: "Model", first: "asc", narrow: true },
+	{ key: "elo", label: "Elo", first: "desc", narrow: true },
+	{ key: "winRate", label: "Win rate", first: "desc", narrow: false },
+	{ key: "votes", label: "Votes", first: "desc", narrow: false },
 ];
 
 const READOUT = "font-mono uppercase";
@@ -280,20 +286,26 @@ export default function StandingsTable({
 						    trimming has to protect: rank and Elo are what the board is
 						    FOR and stay unhurried, while votes — the least-read figure
 						    here — gives up the most. */}
-						<col className="w-[72px]" />
+						{/* THE DROPPED COLUMNS GO TO ZERO as well as having their cells
+						    hidden. `table-fixed` takes its grid from the colgroup, so a
+						    column left at 148px with nothing in it would hold that width
+						    open and starve the one column that holds words. */}
+						{/* 56 is what the WORD costs, not the digits: "Rank" tracked out to
+						    0.22em measures 43px, and the two numerals under it only 26. */}
+						<col className="w-[56px] md:w-[72px]" />
 						<col />
-						<col className="w-[132px]" />
-						<col className="w-[148px]" />
-						<col className="w-[96px]" />
+						<col className="w-[92px] md:w-[132px]" />
+						<col className="w-0 md:w-[148px]" />
+						<col className="w-0 md:w-[96px]" />
 					</colgroup>
 					<thead>
 						<tr>
 							<th
 								scope="col"
-								className="sticky top-0 z-10 bg-ground p-0 pl-[22px] shadow-[inset_0_-1px_0_var(--color-mark-16)]"
+								className="sticky top-0 z-10 bg-ground p-0 pl-[14px] shadow-[inset_0_-1px_0_var(--color-mark-16)] md:pl-[22px]"
 							>
 								<span
-									className={`${READOUT} flex h-[38px] items-center px-[9px] text-[9.5px] tracking-[0.22em] text-ink-40`}
+									className={`${READOUT} flex h-[38px] items-center px-[5px] text-[9.5px] tracking-[0.22em] text-ink-40 md:px-[9px]`}
 								>
 									Rank
 								</span>
@@ -312,8 +324,13 @@ export default function StandingsTable({
 												: "none"
 										}
 										className={`sticky top-0 z-10 bg-ground p-0 shadow-[inset_0_-1px_0_var(--color-mark-16)] ${
-											i === COLUMNS.length - 1 ? "pr-[22px]" : ""
-										}`}
+											column.narrow ? "" : "max-md:hidden"
+										} ${
+											// Elo is the last column standing on a phone, so it
+											// carries the right inset the votes column carries
+											// everywhere else.
+											column.key === "elo" ? "max-md:pr-[14px]" : ""
+										} ${i === COLUMNS.length - 1 ? "pr-[22px]" : ""}`}
 									>
 										<button
 											type="button"
@@ -380,7 +397,7 @@ export default function StandingsTable({
 								    just above and this never heard about it. A 237-white bar on
 								    the 236-cream it lands on is a bar nobody can see. Same trap as
 								    the brand marks — see the note at BrandMark's INK. */}
-								<td className="pl-[22px] align-middle transition-shadow duration-[160ms] group-hover/row:shadow-[inset_3px_0_0_rgb(var(--mark-rgb))]">
+								<td className="pl-[14px] align-middle transition-shadow duration-[160ms] group-hover/row:shadow-[inset_3px_0_0_rgb(var(--mark-rgb))] md:pl-[22px]">
 									{/* THE RANK IS THE BIGGEST THING IN THE ROW, and it should be:
 									    it is the one number the board exists to state, and at
 									    15px in 40% ink it was set as a row label — smaller and
@@ -400,7 +417,7 @@ export default function StandingsTable({
 									    rows are the unit the visible-count is computed from, and
 									    a taller line here silently drops one off the page. */}
 									<span
-										className={`${READOUT} block px-[9px] text-[27px] leading-none tracking-[-0.01em] text-ink tabular-nums`}
+										className={`${READOUT} block px-[9px] text-[22px] leading-none tracking-[-0.01em] text-ink tabular-nums md:text-[27px]`}
 									>
 										{String(row.rank).padStart(2, "0")}
 									</span>
@@ -411,7 +428,7 @@ export default function StandingsTable({
 											<BrandMark lab={row.lab} size={28} />
 										</span>
 										<span className="flex min-w-0 flex-col gap-[5px]">
-											<span className="truncate text-[17px] leading-none text-ink">
+											<span className="truncate text-[15px] leading-none text-ink md:text-[17px]">
 												{row.name}
 											</span>
 											<span
@@ -423,9 +440,9 @@ export default function StandingsTable({
 									</div>
 								</td>
 
-								<td className="px-[9px] text-center align-middle">
+								<td className="px-[9px] text-center align-middle max-md:pr-[14px]">
 									<span className="flex items-baseline justify-center gap-[9px]">
-										<span className="text-[21px] leading-none tracking-[-0.02em] tabular-nums text-ink">
+										<span className="text-[18px] leading-none tracking-[-0.02em] tabular-nums text-ink md:text-[21px]">
 											{row.elo}
 										</span>
 										<span
@@ -438,7 +455,7 @@ export default function StandingsTable({
 									</span>
 								</td>
 
-								<td className="px-[9px] align-middle">
+								<td className="px-[9px] align-middle max-md:hidden">
 									{/* THE BAR GIVES UP THE WIDTH, NOT THE FIGURE. Both had to
 									    give something back to fit the narrower column, and only
 									    one of the two is read for a value — the bar is here to
@@ -462,7 +479,7 @@ export default function StandingsTable({
 									</div>
 								</td>
 
-								<td className="pr-[22px] pl-[9px] text-center align-middle">
+								<td className="pr-[22px] pl-[9px] text-center align-middle max-md:hidden">
 									<span
 										className={`${READOUT} text-[12px] tracking-[0.06em] tabular-nums text-ink-40`}
 									>

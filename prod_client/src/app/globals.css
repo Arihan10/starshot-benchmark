@@ -17,9 +17,14 @@
      no variable left to re-point, so scoped inversions and the dev tuner both
      fail silently on it. Written as `rgb(var(--x-rgb))` the reference survives
      into the utility and the colour can be swapped for any subtree. */
-  --paper-rgb: 236 233 226;
+  /* ONE LIGHT, AND EVERY LIGHT SURFACE IS IT. The paper was a warm cream against
+     the mark's neutral 237, so the navbar, the moon and the vote slabs were three
+     different whites on one screen. The vote buttons are the reference — they are
+     the brightest thing the page has and the one it is built around — so paper is
+     now the same value, and its surface a neutral step down from it. */
+  --paper-rgb: 237 237 237;
   --paper-ink-rgb: 17 17 17;
-  --paper-surface-rgb: 221 217 208;
+  --paper-surface-rgb: 221 221 221;
 
   --surface-rgb: 19 19 19;
   --surface-lit-rgb: 38 38 38;
@@ -30,9 +35,14 @@
   --rise-rgb: 53 196 106;
   --fall-rgb: 229 52 43;
 
-  --moon-cool-rgb: 166 194 242;
-  --moon-mid-rgb: 204 183 220;
-  --moon-warm-rgb: 230 159 146;
+  /* THE FACE IS LIT, NOT TINTED. These were a cool blue, a mid violet and a warm
+     salmon, which made the moon the one large light shape on the page that was not
+     the page's light colour. All three now read the mark, so the disc keeps its
+     modelling — the highlight and the terminator below are what shape it — and
+     loses the chroma. Re-point any one of them to tint it again. */
+  --moon-cool-rgb: var(--mark-rgb);
+  --moon-mid-rgb: var(--mark-rgb);
+  --moon-warm-rgb: var(--mark-rgb);
 
   --font-sans-src: var(--font-manrope);
   --font-mono-src: var(--font-manrope);
@@ -76,8 +86,8 @@
     radial-gradient(
       circle at 50% 48%,
       transparent 50%,
-      rgb(46 32 64 / 0.15) 80%,
-      rgb(46 32 64 / 0.36) 100%
+      rgb(38 38 38 / 0.15) 80%,
+      rgb(38 38 38 / 0.36) 100%
     ),
     linear-gradient(
       104deg,
@@ -104,10 +114,10 @@
 
   --moon-wash: radial-gradient(
     closest-side ellipse,
-    rgb(226 233 255 / 0.05) 0%,
-    rgb(174 176 246 / 0.038) 30%,
-    rgb(132 106 208 / 0.026) 56%,
-    rgb(92 68 156 / 0.011) 78%,
+    rgb(var(--moon-rgb) / 0.05) 0%,
+    rgb(var(--moon-rgb) / 0.038) 30%,
+    rgb(var(--moon-rgb) / 0.026) 56%,
+    rgb(var(--moon-rgb) / 0.011) 78%,
     transparent 100%
   );
 
@@ -299,6 +309,15 @@ body {
   }
   to {
     transform: rotate(-360deg);
+  }
+}
+
+@keyframes moon-texture-marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(50%);
   }
 }
 
