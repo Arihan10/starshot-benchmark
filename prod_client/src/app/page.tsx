@@ -16,7 +16,6 @@ import { buildStep } from "@/components/arena/buildSequence";
 import Composer from "@/components/arena/Composer";
 import CurvedPrompt from "@/components/CurvedPrompt";
 import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
-import VoxelBand from "@/components/arena/VoxelBand";
 import Masthead, { MOON_DIAMETER, MoonArc } from "@/components/site/Masthead";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
@@ -191,7 +190,6 @@ export default function Page() {
                 className="relative min-h-0 flex-1"
                 style={{
                     marginTop: toured !== null ? `${-seam.head}px` : 0,
-                    marginBottom: toured !== null ? 0 : "var(--seam-drop)",
                     transitionProperty: "margin",
                     transitionDuration: `${SOLO_TRANSITION_MS}ms`,
                     transitionTimingFunction: SOLO_EASING,
@@ -257,8 +255,6 @@ export default function Page() {
                 </div>
 
             </div>
-
-            <VoxelBand shown={built && toured === null} />
 
             <div
                 ref={stackRef}

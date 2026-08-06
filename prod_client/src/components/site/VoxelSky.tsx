@@ -1,3 +1,6 @@
+"use client";
+
+import { useSyncExternalStore } from "react";
 
 const EX = [0.7071, 0.4082];
 const EZ = [-0.7071, 0.4082];
@@ -147,6 +150,80 @@ const BAR_REACH = "calc(var(--text-xs) * 5 + var(--spacing-sm) * 2)";
 
 const BELOW_BAR = `linear-gradient(to bottom, transparent 0, transparent ${BAR_REACH}, #000 calc(${BAR_REACH} + var(--spacing-lg)))`;
 
+// A COLUMN ROUGHLY EVERY 128px, so the field reads at the same density on a
+// laptop and on a wide display rather than being a fixed count that thins out.
+// Clamped at both ends: below the floor a wide-open page looks abandoned, above
+// the ceiling the cubes start reading as noise behind the standings.
+const SPAN = 128;
+const FEWEST = 5;
+const MOST = 24;
+
+// Deterministic, so the layout is identical on the server and the client and
+// survives every re-render. Math.random() here would re-scatter the city on any
+// state change and mismatch during hydration.
+const noise = (i: number, salt: number) => {
+	const x = Math.sin((i + 1) * 127.1 + salt * 311.7) * 43758.5453;
+	return x - Math.floor(x);
+};
+
+const listen = (onChange: () => void) => {
+	window.addEventListener("resize", onChange);
+	return () => window.removeEventListener("resize", onChange);
+};
+
+export function VoxelCity() {
+	const width = useSyncExternalStore(
+		listen,
+		() => window.innerWidth,
+		() => 0,
+	);
+	const columns = width
+		? Math.max(FEWEST, Math.min(MOST, Math.round(width / SPAN)))
+		: 0;
+
+	return (
+		<div
+			data-voxels
+			aria-hidden
+			className="pointer-events-none absolute inset-0 overflow-hidden"
+			style={{ maskImage: BELOW_BAR, WebkitMaskImage: BELOW_BAR }}
+		>
+			{Array.from({ length: columns }, (_, i) => {
+				const n = (salt: number) => noise(i, salt);
+				const size = Math.round(15 + n(1) * 43);
+				return (
+					<span
+						key={i}
+						className="absolute"
+						style={{
+							// Each cube owns one column and sits somewhere inside it, so the
+							// city spreads over the whole width without falling into a grid.
+							left: `${(((i + 0.14 + n(2) * 0.72) / columns) * 100).toFixed(2)}%`,
+							top: `${(5 + n(3) * 82).toFixed(1)}%`,
+						}}
+					>
+						<Voxel
+							size={size}
+							opacity={(0.13 + n(4) * 0.27).toFixed(2)}
+							drift={[
+								Math.round((n(5) - 0.5) * 46),
+								Math.round((n(6) - 0.5) * 54),
+							]}
+							turn={[
+								Math.round((n(7) - 0.5) * 180),
+								Math.round((n(8) - 0.5) * 180),
+							]}
+							seconds={Math.round(24 + n(9) * 22)}
+							turnSeconds={Math.round(19 + n(10) * 18)}
+							delay={Number((n(11) * 14).toFixed(1))}
+						/>
+					</span>
+				);
+			})}
+		</div>
+	);
+}
+
 export function VoxelDrift() {
 	return (
 		<div
@@ -190,7 +267,7 @@ export function VoxelDrift() {
 	);
 }
 
-export default function VoxelSky() {
+export default function VoxelSky({ city = false }: { city?: boolean }) {
 	return (
 		<>
 			<div
@@ -232,7 +309,7 @@ export default function VoxelSky() {
 			})}
 
 			</div>
-			<VoxelDrift />
+			{city ? <VoxelCity /> : <VoxelDrift />}
 		</>
 	);
 }

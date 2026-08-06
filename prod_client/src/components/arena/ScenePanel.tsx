@@ -14,11 +14,6 @@ export const SOLO_TRANSITION_MS = 1000;
 
 export const SOLO_EASING = "cubic-bezier(0.25,0.8,0.3,1)";
 
-const FADE = "clamp(130px, 22vh, 260px)";
-
-const FADE_STOPS =
-	"rgb(var(--ground-rgb)) 0%, rgb(var(--ground-rgb) / 0.72) 28%, rgb(var(--ground-rgb) / 0.26) 60%, transparent 100%";
-
 export default function ScenePanel({
 	cell,
 	outcome,
@@ -85,22 +80,6 @@ export default function ScenePanel({
 			}}
 		>
 			<div ref={stageRef} className="relative isolate min-h-0 flex-1">
-				<div
-					aria-hidden
-					className="pointer-events-none absolute inset-x-0 top-0 z-5"
-					style={{
-						height: FADE,
-						background: `linear-gradient(to bottom, ${FADE_STOPS})`,
-					}}
-				/>
-				<div
-					aria-hidden
-					className="pointer-events-none absolute inset-x-0 bottom-0 z-5"
-					style={{
-						height: FADE,
-						background: `linear-gradient(to top, ${FADE_STOPS})`,
-					}}
-				/>
 				{dividerRight && role === "paired" && (outcome === null || skipped) && (
 					// eslint-disable-next-line react/jsx-key
 					<Fragment key={roundKey}>
@@ -109,11 +88,11 @@ export default function ScenePanel({
 							className="pointer-events-none absolute top-0 right-0 z-10 hidden w-px origin-top bg-mark transition-[scale] md:block"
 							style={{
 								willChange: "scale",
-								// Lands ON the bar rather than short of it. `--seam-break` is
-								// half the bar's height and the panel's own bottom sits on
-								// the bar's centre line, so this is exactly its top edge —
-								// which the middle segment, SKIP, occupies.
-								bottom: "var(--seam-break, 0px)",
+								// Lands on the bar's top edge. The panel now runs to the foot
+								// of the page, so that is the bar's drop from the bottom plus
+								// the half-height its centre line sits above.
+								bottom:
+									"calc(var(--seam-drop, 0px) + var(--seam-break, 0px))",
 								scale: built ? "1 1" : "1 0",
 								...buildStep("ray", built),
 								...(untuck

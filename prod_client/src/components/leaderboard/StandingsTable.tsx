@@ -198,7 +198,16 @@ export default function StandingsTable({ rows }: { rows: Standing[] }) {
 						{visible.map((row) => (
 							<tr
 								key={row.name}
-								className="group/row h-[clamp(56px,5.8vh,68px)] border-b border-mark-8 transition-colors duration-[160ms] hover:bg-mark-8"
+								// THE ROW INVERTS RATHER THAN TINTS. Every value in it is already
+							// written against `ink` and `mark`, so re-pointing those two for
+							// the row is the whole change — the name, the rank, the elo, the
+							// win bar and the rule under it all re-derive on their own. Naming
+							// a hover colour per element would be the same edit five times.
+							//
+							// The spans carry the transition themselves: a transition on the
+							// row does not cascade, and without it the type would snap while
+							// the ground behind it faded.
+							className="group/row h-[clamp(56px,5.8vh,68px)] border-b border-mark-8 transition-colors duration-[160ms] hover:bg-paper hover:[--ink-rgb:var(--paper-ink-rgb)] hover:[--mark-rgb:var(--paper-ink-rgb)] [&_span]:transition-colors [&_span]:duration-[160ms]"
 							>
 								<td className="pl-[22px] align-middle transition-shadow duration-[160ms] group-hover/row:shadow-[inset_3px_0_0_var(--color-mark)]">
 									<span

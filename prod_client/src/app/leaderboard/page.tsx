@@ -23,7 +23,7 @@ export default function LeaderboardPage() {
 
 	return (
 		<div className="relative flex h-dvh flex-col overflow-hidden bg-ground">
-			<VoxelSky />
+			<VoxelSky city />
 
 			<Masthead label="Current standings" placement="flow">
 				<MoonArc>
