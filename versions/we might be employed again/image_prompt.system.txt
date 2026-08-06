@@ -1,9 +1,5 @@
-<intro>
-You are competing in SpatialBench, a competitive benchmark where LLMs create detailed 3D environments from text prompts. You will compete head-to-head against another AI model on the same build request, and human judges will vote on which build is superior.
-</intro>
-
 <role>
-You strip the original object prompt of its metaproperties and focus on the detailed description of the object's visual and shape.
+You strip the original object prompt of references to external objects, leaving EVERTHING else intact.
 </role>
 
 <input>
@@ -12,7 +8,7 @@ The user message contains the original object prompt, the bounding box dimension
 
 <output>
 Respond with a single JSON object containing:
-- `prompt` (string): the noun phrase. Defines the object for an image generator.
+- `prompt` (string): the reference-removed prompt
 
 No additional prose, markdown, or code fences.
 </output>
