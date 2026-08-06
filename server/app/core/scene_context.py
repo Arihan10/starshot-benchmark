@@ -70,15 +70,13 @@ def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str, *, compac
 
     `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), `parent_dimensions` (that parent's size), and `parent_global_origin_corner` (its world position). `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>).
 
-    `noun_phrase` (the concise visual subject distilled during the object's asset-generation pass) is shown right under `prompt` whenever the object has one — i.e. its image was already generated; objects not yet generated (and zones) omit the line.
+    The distilled `noun_phrase` is deliberately NOT emitted here. It is produced by the secondary `image_prompt` pass, which now runs off the structural critical path (see generation._resolve_and_generate); rendering it would make every structural step wait on that pass, and the authored `prompt` already carries the object's identity. It survives only in the image-prompt context below, which is itself a secondary call.
 
-    With `compact=True` (the `{SCENE_CONTEXT_COMPACT}` variant) only the SEMANTIC fields are emitted — id, prompt, `noun_phrase` (when generated), semantic parent (`parent: <id> (<kind>)`), `parent_region` id, placement, relationships, the orientation phrase, and the object's own bbox dimensions. Every world/parent coordinate (global + local origin corners, parent + region dimensions/origins), the numeric yaw, and the proxy shape are dropped."""
+    With `compact=True` (the `{SCENE_CONTEXT_COMPACT}` variant) only the SEMANTIC fields are emitted — id, prompt, semantic parent (`parent: <id> (<kind>)`), `parent_region` id, placement, relationships, the orientation phrase, and the object's own bbox dimensions. Every world/parent coordinate (global + local origin corners, parent + region dimensions/origins), the numeric yaw, and the proxy shape are dropped."""
     lines = [
         f"Name: {obj.id}",
         f'prompt: "{obj.prompt}"',
     ]
-    if obj.noun_phrase:
-        lines.append(f'noun_phrase/description: "{obj.noun_phrase}"')
     if obj.parent_id is not None:
         kind_str = obj.parent_kind.value if obj.parent_kind is not None else "(unknown)"
         if compact:
@@ -663,7 +661,6 @@ def image_prompt_vars(
     prompt: str,
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
-    prior_prompts: list[str],
     zone: Node | None = None,
     nodes: list[Node] | None = None,
 ) -> dict[str, str]:
@@ -677,13 +674,12 @@ def image_prompt_vars(
     subregion (`{OTHER_SUBREGIONS_BRIEF}`) — as bare id / prompt / noun phrase.
     The heavy `{SCENE_CONTEXT}` / `{ROOT_HEADER}` / `{ZONE_OBJECTS}` blocks are
     intentionally NOT built here. `zone`/`nodes` are optional; without them only
-    the object's own fields populate and the scene vars stay empty."""
+    the object's own fields populate and the scene vars stay empty.
+
+    Everything here derives from the subject's own spec plus already-committed
+    structural state, so two distills in the same batch never depend on each
+    other and the whole pass fans out concurrently."""
     w, h, d = bbox.size
-    if prior_prompts:
-        prior_lines = "\n".join(f"  {i + 1}. {p}" for i, p in enumerate(prior_prompts))
-        prior_block = f"Prior subject phrases in this scene ({len(prior_prompts)} total):\n{prior_lines}"
-    else:
-        prior_block = "Prior subject phrases in this scene: (none — this is the first object; you are setting the aesthetic baseline)."
     out = base_vars()
     if zone is not None and nodes:
         root = util.find_root(nodes)
@@ -705,7 +701,6 @@ def image_prompt_vars(
         "IMAGE_TEMPLATE_FRONT": wrap_image_prompt(SUBJECT_SLOT, proxy_shape, (w, h, d), view="front"),
         "IMAGE_TEMPLATE_SIDE": wrap_image_prompt(SUBJECT_SLOT, proxy_shape, (w, h, d), view="side"),
         "IMAGE_TEMPLATE_TOP": wrap_image_prompt(SUBJECT_SLOT, proxy_shape, (w, h, d), view="top"),
-        "PRIOR_SUBJECTS": prior_block,
     })
     return out
 
@@ -859,16 +854,16 @@ def sample_variables() -> dict[str, str]:
         [(rejected, "relationships target 'window' does not exist in the scene context")]
     )
 
-    # OBJECT_* / PROXY_SHAPE / IMAGE_TEMPLATE_* / PRIOR_SUBJECTS: the image-prompt
-    # step's set, sampled for the sofa. (image_prompt_vars rebuilds the zone set
-    # for the sofa's zone, so only the image-specific keys are taken from it.)
+    # OBJECT_* / PROXY_SHAPE / IMAGE_TEMPLATE_*: the image-prompt step's set,
+    # sampled for the sofa. (image_prompt_vars rebuilds the zone set for the
+    # sofa's zone, so only the image-specific keys are taken from it.)
     img = image_prompt_vars(
         prompt=sofa.prompt, bbox=sofa.bbox, proxy_shape=sofa.proxy_shape,
-        prior_prompts=[floor.prompt, table.prompt, lamp.prompt], zone=living, nodes=nodes,
+        zone=living, nodes=nodes,
     )
     for k in (
         "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE",
-        "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
+        "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP",
         "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
     ):
         out[k] = img[k]

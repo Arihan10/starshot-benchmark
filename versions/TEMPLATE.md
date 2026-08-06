@@ -99,6 +99,11 @@ are injected automatically at the LLM call boundary and never appear in
 templates. (`DEEPSEEK_SUFFIX` from older snapshots still resolves, to the
 empty string.)
 
+`PRIOR_SUBJECTS` is retired the same way. It listed the noun phrases distilled
+for the objects before this one, which chained every `image_prompt` call to its
+predecessor; the pass now runs concurrently and off the structural path, so the
+token resolves to the empty string in the snapshots that still carry it.
+
 ### Target-zone variables
 
 Natively populated on every step that operates on a region (`zone_plan`,
@@ -135,7 +140,6 @@ its prompt (and plan, for `overall_bbox`) known. For `child_bbox_batch` the
 | `` `{OBJECT_DIMENSIONS}` `` | `image_prompt` | `width=W.WWm, height=H.HHm, depth=D.DDm` |
 | `` `{PROXY_SHAPE}` `` | `image_prompt` | `BOX` / `SPHERE` / `CAPSULE` / `HEMISPHERE` |
 | `` `{IMAGE_TEMPLATE_FRONT}` `` / `` `{IMAGE_TEMPLATE_SIDE}` `` / `` `{IMAGE_TEMPLATE_TOP}` `` | `image_prompt` | the fixed image-generation wrapper for each view with `<<<SUBJECT>>>` marking where the model's phrase is slotted |
-| `` `{PRIOR_SUBJECTS}` `` | `image_prompt` | numbered list of subject phrases already submitted in this scene (or a first-object placeholder) |
 | `` `{SIBLING_OBJECTS}` `` | `image_prompt` | the objects already placed directly within the subject's OWN region (its siblings), each with id, prompt, noun phrase, structural parent (`<id> (<kind>)`), placement, relationships, and dimensions — no world coordinates |
 | `` `{ROOT_OBJECTS_BRIEF}` `` | `image_prompt` | the root-region objects (shared shells / ground / fill) in bare form — id, prompt, and noun phrase only |
 | `` `{OTHER_SUBREGIONS_BRIEF}` `` | `image_prompt` | every region EXCEPT the root and the subject's own region, as a flat list — each its name + prompt with a bare id/prompt/noun-phrase list of the objects inside it |

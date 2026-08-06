@@ -81,14 +81,17 @@ ALL_VARIABLES: list[str] = [
     "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
     "TO_PLACE", "PROPOSED_OBJECTS", "RETRY_BLOCK", "ADJACENT_ZONES",
     "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE", "IMAGE_TEMPLATE_FRONT",
-    "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
+    "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP",
 ]
 
 # Tokens that USED to be variables. They resolve to "" so a run snapshot
 # created before their removal keeps rendering; they are no longer offered
 # in the editor or docs. DEEPSEEK_SUFFIX became a runtime injection at the
-# LLM call boundary (see services/llm.apply_model_quirks).
-LEGACY_VARIABLES: list[str] = ["DEEPSEEK_SUFFIX"]
+# LLM call boundary (see services/llm.apply_model_quirks). PRIOR_SUBJECTS fed
+# each image_prompt call the phrases distilled for the objects before it, which
+# chained every distill to its predecessor; the pass now runs concurrently off
+# the structural path, so the token is retired rather than re-serialized.
+LEGACY_VARIABLES: list[str] = ["DEEPSEEK_SUFFIX", "PRIOR_SUBJECTS"]
 
 # The variables each step NATIVELY populates with real values (see
 # versions/TEMPLATE.md) — everything else renders empty/placeholder there.
@@ -121,7 +124,7 @@ STEP_VARIABLES: dict[str, list[str]] = {
         "ZONE_ID", "ZONE_PROMPT", "ZONE_PLAN", "ZONE_PLACEMENT",
         "SIBLING_OBJECTS", "OTHER_SUBREGIONS_BRIEF",
         "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE", "IMAGE_TEMPLATE_FRONT",
-        "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
+        "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP",
     ],
 }
 

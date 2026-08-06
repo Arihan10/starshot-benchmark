@@ -18,8 +18,17 @@ Per scenario: decompose objects (LLM, a single call) -> split any object the
 mesh step can't build as one coherent mesh into its constituent pieces (the
 optional `object_decomp` pass, `_split_objects`; a pass-through on versions
 without it) -> resolve every object's bbox in a single batch LLM call (trusted,
-no retry) -> spawn background Trellis 2 jobs that fan out via SSE events as each
-mesh lands.
+no retry) -> hand the batch to a detached task that distills each object's noun
+phrase and realizes its mesh, fanning out via SSE events as each one lands.
+
+Those last calls are SECONDARY: cheap gemini-flash-lite work (noun-phrase
+distill, library match, symmetry plane) plus the mesh backends. They are
+deliberately off the structural critical path — no structural prompt reads a
+noun phrase (see scene_context._object_entry), so the divider never waits on
+one, and the whole scene's secondary traffic runs concurrently under
+`SECONDARY_CALL_CONCURRENCY`. `await_pending` still holds the run open until it
+has all landed.
+
 There is NO validate-and-retry step: a decomposition whose ids collide with
 already-placed nodes is accepted as-is (the retry could never resolve a
 genuine boundary/anchor overlap and just re-billed the call), and the
@@ -123,11 +132,14 @@ _OPTIMIZE_SCRIPT = _OPTIMIZE_DIR / "optimize.mjs"
 _NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
 _OPTIMIZE_FANOUT = asyncio.Semaphore(4)
 
-# Cap on concurrent library-asset match calls (flash-lite) when realizing a whole
-# scene's assets in one batch. call_llm has no client-side rate limit, so this
-# bounds the fan-out under OpenRouter's ceiling while still matching in parallel.
-LIBRARY_MATCH_CONCURRENCY = 12
-_library_match_slot = asyncio.Semaphore(LIBRARY_MATCH_CONCURRENCY)
+# Cap on concurrent SECONDARY (flash-lite) calls — noun-phrase distills, library
+# matches, symmetry cut planes. These run detached from the structural pipeline
+# (see `_realize_assets`), so several regions' batches can be in flight at once
+# and the fan-out is no longer bounded by one batch's size. call_llm has no
+# client-side rate limit, so this is what keeps the whole scene's secondary
+# traffic under the provider ceiling while still running in parallel.
+SECONDARY_CALL_CONCURRENCY = 12
+_secondary_slot = asyncio.Semaphore(SECONDARY_CALL_CONCURRENCY)
 
 # Versioned from-scratch generated builds (Nano-Banana + a mesh backend). A cell
 # can hold ANY number of independent generated versions of the SAME scene —
@@ -628,68 +640,119 @@ async def _resolve_and_generate(
             orientation=orientations[spec.id],
         )
 
-    # Distill each object's verbose seed into its concise visual subject phrase
-    # (the `image_prompt` LLM step), for BOTH the library and from-scratch flows.
-    # The distilled phrase is the object's canonical "what it is" description and
-    # drives every downstream decision that wants a direct physical description
-    # rather than the placement-laden seed: library matching, the symmetry cut
-    # plane, prefab grouping, and the Nano-Banana image. The prior-subjects
-    # context fed to each call is the bare distilled phrases of already-placed
-    # nodes (Node.noun_phrase), never the wrapped Nano-Banana directives — leaking
-    # the wrapper boilerplate would just teach the model to echo it back.
-    committed_subjects = [n.noun_phrase or n.prompt for n in all_nodes if n.mesh_url is not None]
-    subjects: dict[str, str] = {}
-    prior_subjects = list[str](committed_subjects)
-    for spec in specs:
-        subject = await _distill_subject(
-            spec_id=spec.id,
+    # Everything the structural pipeline needs is now known: id, prompt, bbox,
+    # yaw, anchor, and the deterministic url the object's mesh will land at
+    # (`objects/<id>.glb`, identical in both the library and from-scratch paths).
+    # Hand those back immediately and let the SECONDARY work — the noun-phrase
+    # distill and whatever realizes the mesh — run detached. `noun_phrase` is
+    # deliberately left unset: it is a product of that detached pass, no
+    # structural step reads it (see scene_context._object_entry), and leaving it
+    # off is what keeps the next decompose / next_object call from waiting on a
+    # flash-lite round-trip.
+    objs_dir = runs_dir / run_id / "objects"
+    placed = [
+        Node(
+            id=spec.id,
             prompt=spec.prompt,
             bbox=bboxes[spec.id],
             proxy_shape=spec.proxy_shape,
-            prior_prompts=prior_subjects,
-            zone=zone,
-            nodes=all_nodes,
+            orientation=orientations[spec.id],
+            orientation_description=spec.orientation,
+            placement=spec.placement,
+            referenced_ids=list(spec.referenced_ids),
+            parent_id=spec.parent,
+            parent_kind=spec.parent_kind,
+            parent_region=zone.id,
+            mesh_url=_artifact_url(runs_dir, objs_dir / f"{spec.id}.glb"),
         )
-        subjects[spec.id] = subject
-        prior_subjects.append(subject)
-
-    if _USE_ASSET_LIBRARY:
-        return await _match_library_assets(
-            specs=specs,
-            bboxes=bboxes,
-            orientations=orientations,
-            subjects=subjects,
-            scenario=scenario,
-            runs_dir=runs_dir,
-            run_id=run_id,
-            zone_id=zone.id,
+        for spec in specs
+    ]
+    # Registered on `_pending`, so `await_pending` still holds the run open until
+    # every asset has landed and `cancel_pending` still tears them down.
+    _pending.setdefault(run_id, []).append(
+        asyncio.create_task(
+            _realize_assets(
+                specs=specs,
+                bboxes=bboxes,
+                orientations=orientations,
+                zone=zone,
+                scene=list(all_nodes),
+                scenario=scenario,
+                runs_dir=runs_dir,
+                run_id=run_id,
+            )
         )
+    )
+    return placed
 
-    # From-scratch: resolve the symmetry cut plane FROM the distilled subject
-    # (not the verbose seed), then wrap that subject into the Nano-Banana
-    # studio-shot directive for the resolved view.
-    resolved: list[Node] = []
-    for spec in specs:
-        bbox = bboxes[spec.id]
-        subject_prompt = subjects[spec.id]
+
+async def _realize_assets(
+    *,
+    specs: list[Any],
+    bboxes: dict[str, BoundingBox],
+    orientations: dict[str, int],
+    zone: Node,
+    scene: list[Node],
+    scenario: Literal["anchor", "encapsulating", "negative-space"],
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """The secondary (gemini-flash-lite) half of placing a batch, detached from
+    the structural pipeline: distill every object's noun phrase, then realize its
+    mesh — a library match, or the from-scratch cut-plane + Nano-Banana + Trellis
+    chain. Nothing here feeds a structural prompt, so the divider races ahead
+    while this runs; the assets announce themselves through `image` / `model`
+    events as they land.
+
+    `scene` is the snapshot of already-placed nodes taken when the batch was
+    handed off, so the context these calls see does not depend on how far the
+    structural pipeline has since run ahead.
+
+    Failures are logged per batch and swallowed, matching `_generate_one`: a
+    secondary call that dies must not take the run down with it, and
+    `await_pending` gathers with `return_exceptions=True` anyway."""
+    try:
+        subjects = await _distill_subjects(
+            specs=specs, bboxes=bboxes, zone=zone, scene=scene,
+        )
+        if _USE_ASSET_LIBRARY:
+            await _match_library_assets(
+                specs=specs,
+                bboxes=bboxes,
+                orientations=orientations,
+                subjects=subjects,
+                scenario=scenario,
+                runs_dir=runs_dir,
+                run_id=run_id,
+                zone_id=zone.id,
+            )
+            return
+
+        # From-scratch: resolve the symmetry cut plane FROM the distilled subject
+        # (not the verbose seed), then wrap that subject into the Nano-Banana
+        # studio-shot directive for the resolved view. Each object's plane depends
+        # only on its own phrase, so the whole batch resolves at once.
         encapsulating = scenario == "encapsulating"
-        cut_plane = await symmetry.resolve_cut_plane(
-            prompt=subject_prompt,
-            node_id=spec.id,
-            encapsulating=encapsulating,
-        )
-        view = symmetry.image_view_for(
-            cut_plane=cut_plane, encapsulating=encapsulating,
-        )
-        image_prompt = scene_context.wrap_image_prompt(
-            subject_prompt, spec.proxy_shape, bbox.size, view=view,
-        )
-        resolved.append(
-            Node(
+
+        async def _prepare(spec: Any) -> Node:
+            subject_prompt = subjects[spec.id]
+            async with _secondary_slot:
+                cut_plane = await symmetry.resolve_cut_plane(
+                    prompt=subject_prompt,
+                    node_id=spec.id,
+                    encapsulating=encapsulating,
+                )
+            view = symmetry.image_view_for(
+                cut_plane=cut_plane, encapsulating=encapsulating,
+            )
+            bbox = bboxes[spec.id]
+            return Node(
                 id=spec.id,
                 prompt=spec.prompt,
                 noun_phrase=subject_prompt,
-                image_prompt=image_prompt,
+                image_prompt=scene_context.wrap_image_prompt(
+                    subject_prompt, spec.proxy_shape, bbox.size, view=view,
+                ),
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
                 orientation=orientations[spec.id],
@@ -701,14 +764,55 @@ async def _resolve_and_generate(
                 symmetry_cut_plane=cut_plane,
                 parent_region=zone.id,
             )
+
+        resolved = list(await asyncio.gather(*(_prepare(s) for s in specs)))
+        await _spawn_meshes(
+            resolved=resolved,
+            runs_dir=runs_dir,
+            run_id=run_id,
+            scenario=scenario,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logging.log(
+            "mesh.error",
+            id=specs[0].id if specs else zone.id,
+            message=f"realize: {type(e).__name__}: {e}",
         )
 
-    return await _spawn_meshes(
-        resolved=resolved,
-        runs_dir=runs_dir,
-        run_id=run_id,
-        scenario=scenario,
-    )
+
+async def _distill_subjects(
+    *,
+    specs: list[Any],
+    bboxes: dict[str, BoundingBox],
+    zone: Node,
+    scene: list[Node],
+) -> dict[str, str]:
+    """Distill every spec's verbose seed into its concise visual subject phrase
+    (the `image_prompt` step), for BOTH the library and from-scratch flows. The
+    phrase is the object's canonical "what it is" description and drives every
+    downstream decision that wants a direct physical description rather than the
+    placement-laden seed: library matching, the symmetry cut plane, prefab
+    grouping, and the Nano-Banana image.
+
+    Each call's context is built from its own spec plus `scene`, never from a
+    phrase distilled earlier in this batch, so the batch fans out in one round
+    instead of chaining object by object."""
+
+    async def _one(spec: Any) -> str:
+        async with _secondary_slot:
+            return await _distill_subject(
+                spec_id=spec.id,
+                prompt=spec.prompt,
+                bbox=bboxes[spec.id],
+                proxy_shape=spec.proxy_shape,
+                zone=zone,
+                nodes=scene,
+            )
+
+    phrases = await asyncio.gather(*(_one(s) for s in specs))
+    return {spec.id: phrase for spec, phrase in zip(specs, phrases, strict=True)}
 
 
 async def _match_library_assets(
@@ -769,7 +873,8 @@ async def _match_library_assets(
         # so the distilled subject carries through to that gate's cut-plane /
         # prefab / Nano-Banana decisions.
         subject = subjects[spec.id]
-        match = await library.match(subject)
+        async with _secondary_slot:
+            match = await library.match(subject)
         asset = library.asset_path(match.library_id)
 
         logging.log(
@@ -861,7 +966,6 @@ async def _distill_subject(
     prompt: str,
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
-    prior_prompts: list[str],
     zone: Node | None = None,
     nodes: list[Node] | None = None,
     force: bool = False,
@@ -894,7 +998,6 @@ async def _distill_subject(
         prompt=prompt,
         bbox=bbox,
         proxy_shape=proxy_shape,
-        prior_prompts=prior_prompts,
         zone=zone,
         nodes=nodes,
     )
@@ -942,7 +1045,6 @@ async def _build_image_prompt(
     prompt: str,
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
-    prior_prompts: list[str],
     view: str = "front",
     include_dimensions: bool = True,
     zone: Node | None = None,
@@ -963,7 +1065,6 @@ async def _build_image_prompt(
         prompt=prompt,
         bbox=bbox,
         proxy_shape=proxy_shape,
-        prior_prompts=prior_prompts,
         zone=zone,
         nodes=nodes,
     )
@@ -995,7 +1096,7 @@ async def _refresh_node_image_prompt(
     view = symmetry.image_view_for(cut_plane=cut_plane)
     if regen_noun_phrase:
         # Re-distill against the SAME scene context the original image_prompt step
-        # saw (`{ROOT_HEADER}`, `{ZONE_*}`, `{SCENE_CONTEXT}`, prior phrases),
+        # saw (`{ZONE_*}`, `{SIBLING_OBJECTS}`, the far-region briefs),
         # reconstructed by the caller — not an empty render. The node being
         # described is dropped from that context: the live first pass distills
         # before appending the node to `all_nodes`, and excluding it stops a re-roll
@@ -1003,13 +1104,11 @@ async def _refresh_node_image_prompt(
         # are None when the caller couldn't rebuild the tree, in which case the
         # step still runs, just context-free.
         scene = [n for n in nodes if n.id != node.id] if nodes else nodes
-        priors = [n.noun_phrase for n in (scene or []) if n.noun_phrase is not None]
         subject = await _distill_subject(
             spec_id=node.id,
             prompt=seed_prompt or node.prompt,
             bbox=node.bbox,
             proxy_shape=node.proxy_shape,
-            prior_prompts=priors,
             zone=zone,
             nodes=scene,
             force=True,
@@ -1024,7 +1123,6 @@ async def _refresh_node_image_prompt(
             prompt=subject,
             bbox=node.bbox,
             proxy_shape=node.proxy_shape,
-            prior_prompts=[],
             view=view,
         )
     return node.model_copy(
@@ -2043,21 +2141,27 @@ async def reset_from_raw_one(
 
 
 async def await_pending(run_id: str) -> None:
-    """Block until every background mesh task for this run has finished.
-    Errors inside individual tasks were logged + swallowed by `_generate_one`,
-    so this gather only waits — it never raises."""
-    tasks = _pending.pop(run_id, [])
+    """Block until every background asset task for this run has finished.
+    Errors inside individual tasks were logged + swallowed by `_realize_assets` /
+    `_generate_one`, so this gather only waits — it never raises.
+
+    Drains in a loop rather than a single pop: an asset task spawns the mesh
+    tasks for its batch, so tasks queued after the first pop would otherwise be
+    left running and the run would report done with meshes still building."""
     _admitted_ids.pop(run_id, None)
-    if tasks:
+    while tasks := _pending.pop(run_id, []):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def cancel_pending(run_id: str) -> None:
-    """Cancel any in-flight mesh tasks for this run. Called when the run
-    itself is being torn down (cancellation or fatal error)."""
+    """Cancel any in-flight asset / mesh tasks for this run. Called when the run
+    itself is being torn down (cancellation or fatal error). Cancelling an asset
+    task before it reaches `_spawn_meshes` also stops the meshes it would have
+    queued."""
     _admitted_ids.pop(run_id, None)
-    for t in _pending.pop(run_id, []):
-        t.cancel()
+    while tasks := _pending.pop(run_id, []):
+        for t in tasks:
+            t.cancel()
 
 
 def _next_object_cap() -> int | None:

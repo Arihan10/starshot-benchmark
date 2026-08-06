@@ -87,8 +87,13 @@ BARE_UPPER_RE = re.compile(r"(?<!`)\{[A-Z][A-Z0-9_]*\}(?!`)")
 # Runtime contract: every render receives the FULL vocabulary (variables a
 # step can't back resolve to empty/placeholder), so any variable is legal in
 # any template. prompt_store.STEP_VARIABLES keeps the "natively populated"
-# subsets for docs + the editor's chip styling.
-PROVIDED = {step: set(prompt_store.ALL_VARIABLES) for step in prompt_store.STEPS}
+# subsets for docs + the editor's chip styling. Retired tokens are part of the
+# contract too — scene_context.base_vars still supplies them (as "") so older
+# version folders keep rendering — so an old template carrying one is legal.
+PROVIDED = {
+    step: set(prompt_store.ALL_VARIABLES) | set(prompt_store.LEGACY_VARIABLES)
+    for step in prompt_store.STEPS
+}
 
 _passed: list[str] = []
 _failed: list[tuple[str, str]] = []
@@ -420,7 +425,7 @@ def render_all_steps() -> dict[str, str]:
 
     iv = scene_context.image_prompt_vars(
         prompt="a worn tan leather armchair", bbox=by_id["sofa"].bbox,
-        proxy_shape=None, prior_prompts=["a broad concrete ground slab", "a flat-woven wool area rug"])
+        proxy_shape=None)
     out["image_prompt"] = ps.system("image_prompt", iv) + "\n###\n" + ps.user("image_prompt", iv)
     return out
 
@@ -509,23 +514,20 @@ def test_information_routing() -> None:
     v["RETRY_BLOCK"] = retry
     expect("PRIOR ATTEMPTS" in ps.user("anchor_decompose", v), "retry block not injected")
 
-    # image_prompt: dims/proxy/prior routing + all proxy shapes render
+    # image_prompt: dims/proxy routing + all proxy shapes render
     iv = scene_context.image_prompt_vars(
         prompt="a worn tan leather armchair", bbox=bb((0, 0, 0), (2.4, 0.8, 1.0)),
-        proxy_shape=None, prior_prompts=[])
+        proxy_shape=None)
     u = ps.user("image_prompt", iv)
     expect("width=2.40m, height=0.80m, depth=1.00m" in u, "image dims wrong")
     expect("Proxy shape: BOX" in u, "proxy shape wrong")
     expect("<<<SUBJECT>>>" in u, "subject slot missing")
-    expect("(none — this is the first object; you are setting the aesthetic baseline)" in u,
-           "empty prior-subjects placeholder missing")
     for shape, term in ((ProxyShape.SPHERE, "ellipsoid"), (ProxyShape.CAPSULE, "vertical capsule"),
                         (ProxyShape.HEMISPHERE, "dome"), (None, "rectangular prism")):
         iv = scene_context.image_prompt_vars(
-            prompt="x", bbox=bb((0, 0, 0), (1, 1, 1)), proxy_shape=shape, prior_prompts=["a rug"])
+            prompt="x", bbox=bb((0, 0, 0), (1, 1, 1)), proxy_shape=shape)
         u = ps.user("image_prompt", iv)
         expect(term in u, f"hitbox term for {shape} missing")
-        expect("1. a rug" in u, "prior subjects list missing")
 
     # deepseek pin is a CALL-BOUNDARY quirk now, never template content:
     # no template/variable mentions it, and apply_model_quirks owns it.

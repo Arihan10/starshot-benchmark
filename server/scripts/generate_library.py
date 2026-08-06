@@ -120,7 +120,6 @@ async def _generate_one(
                     prompt=prompt,
                     bbox=_DEFAULT_BBOX,
                     proxy_shape=None,
-                    prior_prompts=[],
                     view=view,
                     include_dimensions=False,
                 )

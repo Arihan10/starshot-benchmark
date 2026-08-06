@@ -216,6 +216,7 @@ Only needed if you run the corresponding model alias. On HTTP 429, keys in the
 | `LONGCAT_API_KEY` (`_ARRAY`) | `longcat` |
 | `SILICONFLOW_API_KEY` (`_ARRAY`) | `longcat-sf` |
 | `ALIBABA_API_KEY` | `qwen-max-preview` |
+| `MODEL_API_KEY` | `muse-spark-contributor` |
 
 ### Tuning knobs
 

@@ -63,7 +63,7 @@ from starshot_paths import runs_root  # noqa: E402
 DEFAULT_RUNS_DIR = runs_root() / "collection-gemini-flash"
 OBJECTS_SUBDIR = "objects"
 
-# Match the live fan-out cap (generation.LIBRARY_MATCH_CONCURRENCY) so a
+# Match the live fan-out cap (generation.SECONDARY_CALL_CONCURRENCY) so a
 # --rematch bounds concurrent flash-lite calls the same way.
 MATCH_CONCURRENCY = 12
 

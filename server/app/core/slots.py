@@ -116,7 +116,8 @@ MODELS: dict[str, str] = {
     "longcat-sf": "siliconflow/LongCat-2.0",
     "gemini-flash-new": "google/gemini-3.6-flash",
     "laguna": "poolside/laguna-s-2.1",
-    "new-opus-new": "anthropic/claude-opus-5"
+    "new-opus-new": "anthropic/claude-opus-5",
+    "muse-spark-contributor": "meta/muse-spark-1.2-contributor",
 }
 
 # Model ids from MODELS that are actually served by a third-party
@@ -165,6 +166,18 @@ OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
         # sheet and adjust if it differs.
         price_in=1.20,
         price_out=6.00,
+    ),
+    "meta/muse-spark-1.2-contributor": OpenAICompatModel(
+        model="muse-spark-1.2-contributor",
+        base_url="https://api.meta.ai/v1",
+        api_key_env="META_API_KEY",
+        extra={"reasoning_effort": "xhigh"},
+        # Contributor tier — heavily discounted in exchange for Meta training on
+        # the prompts and completions sent. Cached input bills at $0.002/1M, but
+        # the transport captures no cached-token count, so a cache hit still
+        # prices at the full input rate (spend reads high, never low).
+        price_in=0.10,
+        price_out=0.20,
     ),
 }
 

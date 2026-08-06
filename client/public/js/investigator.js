@@ -77,7 +77,7 @@ const VARIABLE_GLOSSARY = [
   ["RETRY_BLOCK", "empty on the first attempt; after a rejected attempt, the prior emissions + rejection reasons the step must fix."],
   ["ADJACENT_ZONES", "the regions adjacent to the target (nearest in each direction), rendered like SCENE_CONTEXT but trimmed to neighbours."],
   ["OBJECT_PROMPT / OBJECT_DIMENSIONS / PROXY_SHAPE", "for image_prompt: the object's prompt, size, and collision-proxy shape (BOX / SPHERE / CAPSULE / HEMISPHERE)."],
-  ["SIBLING_OBJECTS / ROOT_OBJECTS_BRIEF / OTHER_SUBREGIONS_BRIEF / PRIOR_SUBJECTS", "the reduced, aesthetic-coherence context image_prompt runs on."],
+  ["SIBLING_OBJECTS / ROOT_OBJECTS_BRIEF / OTHER_SUBREGIONS_BRIEF", "the reduced, aesthetic-coherence context image_prompt runs on."],
 ];
 
 function pipelineDoc(mode) {
