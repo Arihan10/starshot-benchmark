@@ -4,6 +4,7 @@ import ColorLab from "@/components/debug/ColorLab";
 import FontLab from "@/components/debug/FontLab";
 import MoonStage from "@/components/site/MoonStage";
 import PageTransition from "@/components/site/PageTransition";
+import { DEBUG_ENABLED } from "@/lib/flags";
 import "./globals.css";
 
 const manrope = Manrope({
@@ -49,7 +50,7 @@ export default function RootLayout({
 			<body className="min-h-full font-sans">
 				<MoonStage />
 				<PageTransition>{children}</PageTransition>
-				{process.env.NODE_ENV === "development" && (
+				{DEBUG_ENABLED && (
 					<>
 						<FontLab />
 						<ColorLab />

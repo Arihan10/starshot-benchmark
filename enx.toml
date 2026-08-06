@@ -94,7 +94,7 @@ command = "cd server && uv run uvicorn app.main:app --port 8765"
 description = "Run production server."
 
 [tasks."prod:client"]
-command = "cd prod_client && bun dev"
+command = "cd prod_client && pnpm dev"
 description = "Run production client."
 # [open] maps target name -> URL or shell command for `enx open <target>`.
 [open]

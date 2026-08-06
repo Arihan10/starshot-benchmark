@@ -1,3 +1,4 @@
+import { TOURS_ENABLED } from "./flags";
 import type { TourSource } from "./orbit/types";
 import { assetUrl, cfImageUrl } from "./r2";
 
@@ -15,7 +16,7 @@ function cellSource(
 		splatUrl: dir
 			? `/scenes/${dir}/trained.web.sog`
 			: assetUrl(`${cell}/splat/trained.web.sog`),
-		manifestUrl: tour("tour.json"),
+		manifestUrl: TOURS_ENABLED ? tour("tour.json") : null,
 		resolvePano: (file) => ({
 			url: tour(file),
 			placeholderUrl: cfImageUrl(`${cell}/tour/${file}`, {
@@ -46,6 +47,7 @@ export type LocalRound = {
 };
 
 // #TODO: pinned run ids — rounds should arrive from the server with their own keys.
+// #TODO temporary — one pair, so every round is the two modern houses.
 export const LOCAL_ROUNDS: readonly LocalRound[] = [
 	{
 		id: "modern-house",
@@ -73,31 +75,6 @@ export const LOCAL_ROUNDS: readonly LocalRound[] = [
 					// #TODO temporary — delete once the SOG encode is fixed.
 					{ position: [55.6, -52.4, -16.9], rotation: [0, 0, 0], scale: 1 },
 				),
-			},
-		],
-	},
-	{
-		id: "platformer-hotel",
-		// #TODO: still two different prompts; shown prompt belongs to neither cleanly.
-		prompt: "A super mario style platformer level",
-		leftShare: 61,
-		cells: [
-			{
-				id: "platformer-level-opus-new",
-				slot: "platformer-level",
-				model: "Claude Opus",
-				elo: 2108,
-				source: cellSource(
-					"ahhhhhhhh/platformer-level/opus-new",
-					"platformer-level-opus-new",
-				),
-			},
-			{
-				id: "hotel-room-gemini-pro",
-				slot: "hotel-room",
-				model: "Gemini Pro",
-				elo: 2143,
-				source: cellSource("good_opus_new_hotel2/hotel-room/gemini-pro"),
 			},
 		],
 	},

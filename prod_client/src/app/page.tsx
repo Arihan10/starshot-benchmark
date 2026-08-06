@@ -59,8 +59,10 @@ export default function Page() {
             window.clearTimeout(second);
         };
     }, [vote]);
-    const warmA = warmStep >= 1 ? nextUp.cells[0].source : null;
-    const warmB = warmStep >= 2 ? nextUp.cells[1].source : null;
+    // A one-pair queue is already on screen; re-preparing it strands the staging.
+    const repeats = nextUp === round;
+    const warmA = warmStep >= 1 && !repeats ? nextUp.cells[0].source : null;
+    const warmB = warmStep >= 2 && !repeats ? nextUp.cells[1].source : null;
 
     const [gate, setGate] = useState(() => new PairGate(2));
     const [gateFor, setGateFor] = useState(shown);

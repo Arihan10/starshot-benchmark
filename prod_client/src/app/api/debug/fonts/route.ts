@@ -1,3 +1,5 @@
+import { DEBUG_ENABLED } from "@/lib/flags";
+
 export const dynamic = "force-dynamic";
 
 const METADATA = "https://fonts.google.com/metadata/fonts";
@@ -45,7 +47,7 @@ async function load(): Promise<FontFamily[]> {
 }
 
 export async function GET() {
-	if (process.env.NODE_ENV !== "development") {
+	if (!DEBUG_ENABLED) {
 		return new Response(null, { status: 404 });
 	}
 
