@@ -3,10 +3,6 @@
 import type { EdgeType } from "@/lib/orbit/navGraph";
 import type { HoverPreview } from "@/lib/orbit/types";
 
-// One palette + vocabulary for the five edge types. It lives with the card
-// because the card is the only thing that still prints it — but it stays a table
-// rather than a switch so a new edge type is one row, and any future affordance
-// that needs the same grammar imports it instead of inventing a second one.
 export const EDGE_META: Record<EdgeType, { label: string; verb: string; color: string }> = {
 	walk: { label: "Walk", verb: "walk over", color: "#8fd0ff" },
 	portal: { label: "Doorway", verb: "step through", color: "#ffc46b" },
@@ -15,9 +11,6 @@ export const EDGE_META: Record<EdgeType, { label: string; verb: string; color: s
 	far: { label: "Travel", verb: "travel across", color: "#9aa7b4" },
 };
 
-// The hover preview: destination thumbnail panned to its arrival heading, plus
-// the LLM-authored name + distance. Floats at the affordance's screen point;
-// pointer-transparent so it never blocks a click.
 export default function HoverCard({ preview }: { preview: HoverPreview }) {
 	const meta = EDGE_META[preview.type];
 	return (

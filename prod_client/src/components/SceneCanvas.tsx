@@ -5,8 +5,6 @@ import { Canvas } from "@react-three/fiber";
 import { Bounds, Center, OrbitControls, useGLTF } from "@react-three/drei";
 
 function SceneModel({ url }: { url: string }) {
-	// Vertex-colored, meshopt-compressed GLB. drei wires up the Meshopt decoder
-	// by default, and there are no texture maps to load.
 	const { scene } = useGLTF(url);
 	return <primitive object={scene} />;
 }

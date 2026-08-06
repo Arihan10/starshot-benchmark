@@ -3,9 +3,6 @@
 import { useEffect, useState } from "react";
 import type { OrbitState } from "@/lib/orbit/types";
 
-// Arrival narration ("Archive · sealed room, phased through the wall") — invariant
-// #4 in text form. The caller keys this on `arrival.ts`, so each arrival mounts a
-// fresh toast: the fade-out timer re-arms and the transition replays.
 export default function ArrivalToast({
 	arrival,
 	trapped,

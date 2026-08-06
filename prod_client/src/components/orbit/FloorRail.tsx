@@ -6,29 +6,6 @@ import type { OrbitEngine } from "@/lib/orbit/engine";
 import type { OrbitState } from "@/lib/orbit/types";
 import { storey, Storey } from "./labels";
 
-// The floor control. Inter-floor travel is the one move the scene itself cannot
-// offer — the floor you stand on hides everything below it, and a generated scene
-// cannot be assumed to model stairs — so the control that CAN offer it gets a
-// corner to itself.
-//
-// It rests as a bare column of storey numbers and opens on hover into the full
-// list with names. That split is the point: at rest it costs the 3D almost
-// nothing, and it only takes the room needed to read a floor name at the moment
-// you are actually reading one.
-//
-// Laid out HIGHEST STOREY AT THE TOP (flex-col-reverse), so the control is a
-// section through the building: moving up the list moves up the scene. Hover a row
-// to preview that floor's plan in the minimap, click to go. Unvisited floors
-// breathe (the floor-unvisited keyframes) until you have actually stood on them.
-//
-// Anchored bottom-RIGHT so the pinned edge is the right one and opening grows the
-// panel leftward and upward: out of its corner, never across the middle of the
-// view.
-// Collapsed width is the chip (32) + the button's own padding (12) + the panel's
-// (24). That panel padding is deliberately generous: the unvisited pulse is a
-// box-shadow reaching ~11px past each button, and the panel clips its overflow to
-// keep the names from spilling out while narrow — too tight a padding and the glow
-// would be shaved off exactly where it is meant to draw the eye.
 const RAIL_COLLAPSED = "w-[68px]";
 const RAIL_EXPANDED = "w-72";
 
@@ -76,7 +53,6 @@ export default function FloorRail({
 				{levels.map((lv) => {
 					const isCurrent = lv.level === currentLevel;
 					const isViewed = lv.level === viewedLevel;
-					// Viewing is not visiting: the pulse holds until you go.
 					const isUnvisited = unvisited.has(lv.level);
 					return (
 						<button

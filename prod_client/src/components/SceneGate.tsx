@@ -4,9 +4,6 @@ import type { ReactNode } from "react";
 import { useScene } from "@/components/SceneProvider";
 import type { Scene } from "@/lib/scenes";
 
-// Renders viewer content only once a scene is selected, showing a centered
-// status message otherwise. Keeps the loading / error / empty handling in one
-// place across the 3D, panorama, and orbit pages.
 export default function SceneGate({ children }: { children: (scene: Scene) => ReactNode }) {
 	const { selected, status, error } = useScene();
 

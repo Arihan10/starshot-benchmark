@@ -11,16 +11,7 @@ export const metadata: Metadata = {
 		"How SceneBench pairs models, how the ratings move, and what the renders you are voting on actually are.",
 };
 
-/**
- * #TODO: PLACEHOLDER COPY. Every answer below is filler written to size the page,
- * not to be believed — the rating maths in particular describes what the arena
- * currently fakes (a fixed ±12 swing, see page.tsx) rather than a real Elo, and the
- * model list is whatever had captures when this was written. Nothing here should
- * ship to a reader until the server owns pairings and ratings.
- *
- * Held as data rather than markup so the page is a list of questions and the
- * treatment is written once. A dozen hand-set `<section>`s is how the type drifts.
- */
+// #TODO: placeholder copy — rewrite once pairings and ratings are real.
 const FAQS: { q: string; a: string[] }[] = [
 	{
 		q: "What am I actually looking at?",
@@ -74,20 +65,9 @@ const FAQS: { q: string; a: string[] }[] = [
 	},
 ];
 
-/**
- * The FAQ.
- *
- * A READING PAGE, so it takes `PageShell` and its measure rather than the arena's
- * full-bleed screen — the same frame About sits in. The only thing it adds is the
- * sky, which is now the site's rather than the leaderboard's (see VoxelSky).
- *
- * A SERVER COMPONENT. Nothing here has state, so nothing here needs the browser.
- */
 export default function FaqPage() {
 	return (
 		<div className="relative">
-			{/* Behind the shell rather than inside it: the shell carries the measure,
-			    and a sky clipped to a 900px column is a decorated card. */}
 			<VoxelSky />
 
 			<PageShell
@@ -99,7 +79,6 @@ export default function FaqPage() {
 					</Masthead>
 				}
 				footer={
-					// The page ends where the site does: back to the thing it describes.
 					<div className="flex items-center justify-center gap-md border-t border-mark-8 bg-ground px-lg py-md">
 						<span className="font-label text-2xs text-ink-40">
 							Still wondering?
@@ -112,8 +91,6 @@ export default function FaqPage() {
 			>
 				<dl className="relative z-10 flex flex-col">
 					{FAQS.map((item) => (
-						// A RULE ABOVE EACH, the same mark the About page's steps use — a
-						// sequence divided rather than a stack of boxes.
 						<div
 							key={item.q}
 							className="border-t border-mark-8 py-lg first:border-t-0 first:pt-0"

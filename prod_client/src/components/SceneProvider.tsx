@@ -15,9 +15,6 @@ type SceneContextValue = {
 
 const SceneContext = createContext<SceneContextValue | null>(null);
 
-// Fetches the D1 catalog once and holds the current selection. Lives in the root
-// layout, so it persists across client-side navigation between the 3D / panorama
-// / orbit pages — every viewer reads the same selected scene from here.
 export function SceneProvider({ children }: { children: ReactNode }) {
 	const [scenes, setScenes] = useState<Scene[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -30,7 +27,7 @@ export function SceneProvider({ children }: { children: ReactNode }) {
 			.then((list) => {
 				if (!active) return;
 				setScenes(list);
-				setSelectedId(list.length ? sceneId(list[0]) : null); // default to newest
+				setSelectedId(list.length ? sceneId(list[0]) : null);
 				setStatus("ready");
 			})
 			.catch((e: unknown) => {

@@ -1,24 +1,3 @@
-// The lit-rendering rig for the dollhouse / proxy views.
-//
-// Related to client/public/js/splatlight.js (the capture rig, mirrored from
-// splat/stage5.py) but deliberately NOT the same numbers, because it lights very
-// different geometry. The capture shades RAW meshes: real topology, real normals,
-// real textures, rendered as hero frames. This lights the vertex-colour DOLLHOUSE:
-// `simplifySloppy`-decimated to a fraction of its triangles, no normals, no
-// textures, viewed from outside as a map. A 3.5-intensity sun with hard shadow
-// maps — correct for the capture — turns that into a mess of blown facets and
-// black slivers cast by every stray bolt.
-//
-// So this rig is AMBIENT-DOMINANT: a neutral uniform environment (not three's
-// RoomEnvironment, whose emissive studio panels reflect as a fake hotspot) plus a
-// hemisphere fill carry the exposure, and a soft directional key only supplies
-// enough gradient to read form. Shading stays in linear light and is displayed
-// through ACES-filmic + sRGB.
-//
-// No shadow maps. On decimated, non-manifold geometry a hard sun produces
-// self-shadow acne and hard-edged noise from hundreds of small objects, which
-// actively hurts legibility on an overview — and skipping the pass keeps the
-// renderer light. Form comes from the key/fill gradient instead.
 
 import {
 	ACESFilmicToneMapping,
@@ -35,14 +14,11 @@ import {
 	type WebGLRenderer,
 } from "three";
 
-// Tuned for the decimated vertex-colour dollhouse. Angles: 0° azimuth = +Z,
-// 90° = +X. Raise `key` for more dramatic form, raise `env`/`fill` for a flatter,
-// brighter read.
 export const LIGHTING = {
 	exposure: 1.0,
-	key: 1.2, // soft gradient, not a hero sun (the capture rig uses 3.5)
+	key: 1.2,
 	fill: 0.4,
-	env: 0.7, // ambient does the heavy lifting here
+	env: 0.7,
 	azimuth: 34,
 	elevation: 48,
 };
@@ -70,10 +46,6 @@ export class LightRig {
 		this.key = new DirectionalLight(0xffffff, LIGHTING.key);
 		scene.add(this.hemi, this.key, this.key.target);
 
-		// The display transform. Materials shade in linear light; ACES + sRGB happen
-		// on the way out. (The pano / projection shaders are deliberately NOT colour
-		// managed — their panos already carry this transform baked in — which is why
-		// the composer works in an sRGB buffer and blits verbatim.)
 		renderer.toneMapping = ACESFilmicToneMapping;
 		renderer.toneMappingExposure = LIGHTING.exposure;
 		renderer.outputColorSpace = SRGBColorSpace;
@@ -86,8 +58,6 @@ export class LightRig {
 			.normalize();
 	}
 
-	// Aim the key at the scene from a distance that scales with it, so the same
-	// angles read the same way at any scene size.
 	fit(box: Box3 | null) {
 		if (box && !box.isEmpty()) box.getCenter(this.center);
 		else this.center.set(0, 0, 0);

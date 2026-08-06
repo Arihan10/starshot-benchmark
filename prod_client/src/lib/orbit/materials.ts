@@ -8,13 +8,9 @@ import {
 	Vector3,
 } from "three";
 
-// Backdrop sphere radius, and how many panos blend per fragment (the K nearest
-// the camera) in projection mode.
 export const SPHERE_RADIUS = 60;
 export const PROJ_K = 4;
 
-// 1×1 black stand-in so the sampler array is always fully bound; unused slots
-// carry weight 0 and never contribute.
 export const DUMMY_TEX = new DataTexture(
 	new Uint8Array([0, 0, 0, 255]),
 	1,
@@ -23,20 +19,17 @@ export const DUMMY_TEX = new DataTexture(
 );
 DUMMY_TEX.needsUpdate = true;
 
-// Equirect backdrop / sphere-mode pano. Same direction→uv convention as the
-// capture stitch: u = atan2(z,x)/2π + 0.5, v = asin(y)/π + 0.5. An opacity
-// uniform drives crossfades without dragging in any lighting/tonemap chunks.
 export function makePanoMaterial(): ShaderMaterial {
 	return new ShaderMaterial({
 		uniforms: { map: { value: null }, opacity: { value: 1.0 } },
-		vertexShader: /* glsl */ `
+		vertexShader: `
 			varying vec3 vDir;
 			void main() {
 				vDir = position;
 				gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
 			}
 		`,
-		fragmentShader: /* glsl */ `
+		fragmentShader: `
 			uniform sampler2D map;
 			uniform float opacity;
 			varying vec3 vDir;
@@ -56,10 +49,6 @@ export function makePanoMaterial(): ShaderMaterial {
 	});
 }
 
-// View-dependent texture mapping: for each of the K nearest captures, turn the
-// fragment's world position into a direction from that capture point, sample its
-// equirect there, and blend by proximity + surface-facing. Gluing the texture to
-// real geometry is what gives correct parallax as the camera moves.
 export function makeProjectionMaterial(): ShaderMaterial {
 	return new ShaderMaterial({
 		uniforms: {
@@ -71,7 +60,7 @@ export function makeProjectionMaterial(): ShaderMaterial {
 			uCount: { value: 0 },
 		},
 		side: DoubleSide,
-		vertexShader: /* glsl */ `
+		vertexShader: `
 			varying vec3 vWorldPos;
 			varying vec3 vWorldNormal;
 			void main() {
@@ -81,7 +70,7 @@ export function makeProjectionMaterial(): ShaderMaterial {
 				gl_Position = projectionMatrix * viewMatrix * wp;
 			}
 		`,
-		fragmentShader: /* glsl */ `
+		fragmentShader: `
 			uniform sampler2D uTex[${PROJ_K}];
 			uniform vec3 uCenter[${PROJ_K}];
 			uniform float uWeight[${PROJ_K}];
@@ -116,8 +105,6 @@ export function makeProjectionMaterial(): ShaderMaterial {
 	});
 }
 
-// Flat-shaded matte for the bare dollhouse proxy (when no separate lite export
-// exists, the proxy itself stands in for the overview).
 export function makePolyMaterial(): MeshStandardMaterial {
 	return new MeshStandardMaterial({
 		color: 0x9aa7b4,

@@ -7,10 +7,6 @@ import { sceneId, type Scene } from "@/lib/scenes";
 
 type Side = "left" | "right";
 
-// Two orbit engines side by side for A/B comparison. Both share the dollhouse
-// orbit until one is entered; "enter interior" expands that panel to full screen
-// and collapses its sibling — the engine reports its camera leaving the orbit
-// via onFocusedChange. Each panel picks its own scene from the shared catalog.
 export default function OrbitWorkspace() {
 	const { scenes, status, error } = useScene();
 	const [leftId, setLeftId] = useState<string | null>(null);
@@ -33,7 +29,6 @@ export default function OrbitWorkspace() {
 		return <Message error>failed to load scenes: {error}</Message>;
 	if (scenes.length === 0) return <Message>no scenes published yet</Message>;
 
-	// Default the panels to the first two scenes; a manual pick sticks per side.
 	const left = scenes.find((s) => sceneId(s) === leftId) ?? scenes[0];
 	const right =
 		scenes.find((s) => sceneId(s) === rightId) ?? scenes[1] ?? scenes[0];

@@ -1,26 +1,15 @@
 import { type NavGraph, routeCosts, shortestPath } from "./navGraph";
 
-// One beat of the tour: a zone, the anchor at its centre, and the hops that walk
-// there from the previous beat (the last entry of `route` is the centrepoint).
 export type TourStop = { zone: string; index: number; route: number[] };
 
 export type TourProgress = { stop: number; stops: number; zone: string };
 
-// A full revolution, so the heading ends exactly where it began — the walkthrough
-// carries your heading across a hop, so finishing the sweep where it started
-// means the next leg departs facing the way you already were.
 const PAN_TURN = Math.PI * 2;
-const PAN_RAMP = 0.15; // eased start/stop, as a fraction of the sweep
-const LEVEL_AT = 0.2; // pitch is back to level a fifth of the way round
+const PAN_RAMP = 0.15;
+const LEVEL_AT = 0.2;
 
-// Anchors in between are walked through, not arrived at: the hop is quicker and
-// it doesn't narrate, so a three-anchor hallway doesn't fire three toasts.
 export const PASS_DUR_SCALE = 0.55;
 
-// What the director needs from the engine. It deliberately never touches the
-// camera itself: hops go through the walkthrough's own typed traversal, so the
-// transitions, FX and narration are exactly the ones a user gets by clicking,
-// and the sweep is written onto the same yaw/pitch that drag-look writes.
 export type TourHost = {
 	busy: () => boolean;
 	hop: (index: number, pass: boolean) => void;
@@ -29,10 +18,6 @@ export type TourHost = {
 	onProgress: () => void;
 };
 
-// A zone's centrepoint: the anchor with the lowest total walking cost to the rest
-// of its zone (the medoid). Deliberately not the centroid of the coordinates —
-// that lands wherever the average happens to fall, which in an L-shaped room or a
-// zone wrapped round a stairwell is often inside a wall.
 function zoneCenterpoint(graph: NavGraph, members: number[]): number {
 	if (members.length < 3) return members[0];
 	let best = members[0];
@@ -51,9 +36,6 @@ function zoneCenterpoint(graph: NavGraph, members: number[]): number {
 	return best;
 }
 
-// Plan a zone-by-zone tour from wherever the user is standing: one centrepoint
-// per zone, ordered nearest-first by walking cost so the route never crosses the
-// scene and doubles back, each carrying the anchors that walk you there.
 export function planZoneTour(
 	graph: NavGraph,
 	zoneOf: (index: number) => string,
@@ -73,8 +55,6 @@ export function planZoneTour(
 		centers.set(zone, zoneCenterpoint(graph, members));
 	}
 
-	// Open in the zone the user is already in, then chain to whichever remaining
-	// centrepoint is the shortest walk from the one we just showed.
 	const pending = new Set(centers.keys());
 	const order: string[] = [];
 	const startZone = zoneOf(startIndex);
@@ -91,7 +71,7 @@ export function planZoneTour(
 				nextZone = zone;
 			}
 		}
-		if (nextZone === null) break; // the rest is unreachable — show what we can
+		if (nextZone === null) break;
 		pending.delete(nextZone);
 		order.push(nextZone);
 		at = centers.get(nextZone) as number;
@@ -107,23 +87,13 @@ export function planZoneTour(
 	return stops;
 }
 
-// Trapezoidal ease: accelerate over the first `ramp`, hold a constant rate, then
-// decelerate. A constant-rate sweep is what reads as "looking around", but
-// starting and stopping it dead reads as a machine — this gives the steady middle
-// without the jerk at either end. Returns normalized displacement for t in [0,1].
 function rampProgress(t: number, ramp: number): number {
-	const area = 1 - ramp; // total under the velocity profile
+	const area = 1 - ramp;
 	if (t <= ramp) return (t * t) / (2 * ramp) / area;
 	if (t >= 1 - ramp) return (area - ((1 - t) * (1 - t)) / (2 * ramp)) / area;
 	return (ramp / 2 + (t - ramp)) / area;
 }
 
-// Runs a planned tour as a two-phase loop per stop: walk the route, then sweep.
-// Stopping drops the queue and never moves the camera, so the user keeps exactly
-// the spot they're standing in. The one exception is a hop already in flight: the
-// walkthrough is anchored to capture points (projection, affordances, exits all
-// assume you're AT one), so we let that hop land and stop on arrival rather than
-// abandoning the camera between anchors.
 export class TourDirector {
 	private stops: TourStop[] = [];
 	private stopIdx = 0;
@@ -161,8 +131,6 @@ export class TourDirector {
 		this.host.onProgress();
 	}
 
-	// Let go as soon as it's safe to: right now if we're sweeping or idle, else
-	// once the hop in flight has landed.
 	stop() {
 		if (!this.running) return;
 		if (!this.sweeping && this.host.busy()) {
@@ -172,8 +140,6 @@ export class TourDirector {
 		this.abort();
 	}
 
-	// Drop everything now — scene swap or teardown, where there's no camera left
-	// to be considerate of.
 	abort() {
 		if (!this.running) return;
 		this.running = false;

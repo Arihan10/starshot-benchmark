@@ -1,6 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
+import type { ReactNode } from "react";
 import LogoMark from "@/components/LogoMark";
 import Button from "@/components/ui/Button";
 
@@ -62,6 +63,25 @@ const GLOW_WINDOW =
 // reader going looking. RIGHT is what the site DOES: the arena you are in, the board
 // it feeds, and the offer to build your own — three things in one direction of
 // travel, ending on the only solid button up here.
+// THE BAR RUNS INVERTED, and it does it by flipping the three colour roles rather
+// than by recolouring anything. Every control up here is already written in terms
+// of `ground`, `ink` and `mark`; swap what those RESOLVE to for the subtree and
+// each variant re-derives on its own — solid comes out black-on-white, ghost keeps
+// its hairline but in ink, quiet's labels darken. Recolouring the buttons one at a
+// time would have been the same change written five times, and the fifth would be
+// the one that got missed.
+//
+// `--color-surface` and `--color-accent` are literals in the theme rather than
+// built from the rgb triplets, so they have to be named here too: quiet's hover
+// ground and the active underline would otherwise stay tuned for a black bar.
+const ON_PAPER = {
+	"--ground-rgb": "var(--paper-rgb)",
+	"--ink-rgb": "var(--paper-ink-rgb)",
+	"--mark-rgb": "var(--paper-ink-rgb)",
+	"--surface-rgb": "var(--paper-surface-rgb)",
+	"--accent-rgb": "var(--accent-deep-rgb)",
+} as React.CSSProperties;
+
 const NAV_LEFT: { label: string; href?: string }[] = [
 	{ label: "About", href: "/about" },
 	{ label: "FAQ", href: "/faq" },
@@ -78,24 +98,20 @@ const NAV_LEFT: { label: string; href?: string }[] = [
 /**
  * The site's navbar.
  *
- * A FLEX ROW, and everything in it is a sibling: the lockup, About and FAQ on one
- * side; Arena, Leaderboard and the CTA on the other. `justify-between` pushes the
- * two groups to the window's edges and hands the entire remainder to the gap
- * between them, which is where the moon sits.
+ * THREE COLUMNS, AND THE MOON IS THE MIDDLE ONE — passed in rather than laid over.
+ * The two `1fr` tracks are equal, which is what keeps the disc centred on the
+ * WINDOW while the groups either side of it differ in width, and the caller sizes
+ * the middle track to the moon's own berth so the clearance is reserved rather
+ * than hoped for.
  *
- * THIS REPLACED A THREE-COLUMN GRID whose middle column was a hardcoded
- * `min(33vw, 470px)` — a number derived from measuring one 1440px window. That is
- * not a layout, it is a budget, and a budget has to be balanced by hand for every
- * width: at wider viewports the reservation was too small a share, at narrower ones
- * the side columns could not hold their contents and the CTA was pushed clean off
- * the screen. Flex distributes what is actually left over, at every size, for free.
+ * The groups are pinned with `col-start-1` and `col-start-3`. Auto-placement would
+ * put the right-hand group in the middle track on any page that renders the bar
+ * without a moon — About does — and it would collapse toward the lockup.
  *
- * The moon's clearance is no longer guaranteed by a reserved column — it is
- * whatever the two groups leave, which grows with the window. That is the honest
- * trade: the disc can crowd the nav on a narrow display, where the alternative was
- * a nav that broke on a wide one.
+ * VERTICAL PADDING SITS ON THE GROUPS, not on the header, so the middle track can
+ * stretch the bar's full height and the moon can hang to its very bottom edge.
  */
-export default function Navbar() {
+export default function Navbar({ moon }: { moon?: ReactNode }) {
 	const pathname = usePathname();
 
 	// EACH PAIR IS ITS OWN GROUP, so each gets its own cap-start and cap-end and
@@ -164,9 +180,12 @@ export default function Navbar() {
 		});
 
 	return (
-		<header className="relative z-20 flex items-center justify-between gap-lg px-lg pt-2xs pb-xs">
+		<header
+			style={ON_PAPER}
+			className="relative z-20 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] px-lg"
+		>
 			{/* --- the mark ---------------------------------------------------- */}
-			<div className="flex items-center gap-md">
+			<div className="col-start-1 flex items-center gap-md pt-2xs pb-xs">
 				<button
 					type="button"
 					// ONE SIZE FOR THE WHOLE LOCKUP. The byline runs at `--lockup` and the
@@ -265,6 +284,8 @@ export default function Navbar() {
 				</nav>
 			</div>
 
+			{moon}
+
 {/* --- the offer ------------------------------------------------------
 			    The one solid button up here, and the only one on the page outside the
 			    vote itself.
@@ -290,7 +311,7 @@ export default function Navbar() {
 			    that overlap is what the group shapes are cut for. The three controls
 			    read as one bar with slanted seams rather than as a pair that has
 			    drifted into a button. */}
-			<div className="flex items-center">
+			<div className="col-start-3 flex items-center justify-end pt-2xs pb-xs">
 
 				{/* STILL A PARALLELOGRAM, raked right — the silhouette reserved for the
 				    one thing being offered. It has neighbours now, but it is the only

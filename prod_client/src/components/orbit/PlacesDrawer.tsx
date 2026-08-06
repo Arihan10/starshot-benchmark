@@ -5,8 +5,6 @@ import type { RefObject } from "react";
 import type { OrbitEngine } from "@/lib/orbit/engine";
 import type { Chapter, OrbitState } from "@/lib/orbit/types";
 
-// Chapters (zones by their authored names) + free-text "take me to". Opened with
-// M while inside; there is no button for it any more, so the shell owns the key.
 export default function PlacesDrawer({
 	state,
 	engine,

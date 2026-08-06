@@ -9,24 +9,11 @@ import type {
 
 export type MinimapSlice = MinimapLevel & { url: string };
 
-// A zone name to print on the map, with the world centre of the zone it names.
 export type MapLabel = {
 	id: string;
 	label: string;
 	center: [number, number, number];
 };
-
-// --- the map's frame ---------------------------------------------------------
-//
-// The slice images are drawn by the capture worker from a basis it was handed: an
-// axis the camera stood on, and a direction that points down the page. To place a
-// capture point on one of those images the viewer has to reconstruct the same
-// frame — so this is the twin of `readBasis` in client/public/js/tourcapture.js
-// and has to agree with it. Both derive the third direction rather than carrying
-// it, which is what keeps them from being able to disagree about handedness.
-//
-// A slice with no basis is a plan view, which is what every tour captured before
-// the map could look any other way actually is.
 
 type Basis = { axis: number; sign: number; right: Axis3; down: Axis3 };
 type Axis3 = [number, number, number];
@@ -54,7 +41,7 @@ export function readBasis(b: MinimapBasis | undefined): Basis {
 	if (!from || !down) return PLAN_BASIS;
 	const axis = from[0] !== 0 ? 0 : from[1] !== 0 ? 1 : 2;
 	const dAxis = down[0] !== 0 ? 0 : down[1] !== 0 ? 1 : 2;
-	if (axis === dAxis) return PLAN_BASIS; // the two must name different axes
+	if (axis === dAxis) return PLAN_BASIS;
 	const forward: Axis3 = [-from[0], -from[1], -from[2]];
 	const up: Axis3 = [-down[0], -down[1], -down[2]];
 	const right: Axis3 = [
@@ -65,13 +52,11 @@ export function readBasis(b: MinimapBasis | undefined): Basis {
 	return { axis, sign: from[axis], right, down };
 }
 
-/** A signed unit axis, so the dot product is one multiply. */
 function along(v: Axis3, p: readonly [number, number, number]): number {
 	const i = v[0] !== 0 ? 0 : v[1] !== 0 ? 1 : 2;
 	return v[i] * p[i];
 }
 
-/** A world point in the map's own frame: across the page, then down it. */
 export function toMap(
 	basis: Basis,
 	p: readonly [number, number, number],
@@ -79,7 +64,6 @@ export function toMap(
 	return { u: along(basis.right, p), v: along(basis.down, p) };
 }
 
-/** The image's rectangle, accepting the u/v keys or an older tour's x/z ones. */
 function readBounds(b: MinimapBounds): {
 	u0: number;
 	u1: number;
@@ -97,15 +81,10 @@ function readBounds(b: MinimapBounds): {
 	};
 }
 
-/** Where a slice sits along the flattened axis (`coord`, or an older tour's `y`). */
 function sliceCoord(mm: MinimapLevel): number {
 	return typeof mm.coord === "number" ? mm.coord : mm.y;
 }
 
-// Nearest slice to a world position, measured along the axis the map flattens.
-// The slices are separated along that axis, so argmin reproduces the grouping the
-// capture used. Only a fallback now — the capture stamps each pano with its level
-// — but map labels have no level of their own and still resolve this way.
 export function levelForPosition(
 	minimaps: MinimapSlice[],
 	p: readonly [number, number, number],
@@ -123,22 +102,8 @@ export function levelForPosition(
 	return best;
 }
 
-// --- the moving window -------------------------------------------------------
-//
-// The map does NOT have to show the whole storey. On a house it does and should —
-// the plan fits, and seeing all of it at once is the point. On a 200 m level it
-// cannot: fitted to the panel, a metre is under half a pixel, capture points a
-// couple of metres apart land on top of each other, and the map becomes a strip
-// that says nothing about where you are.
-//
-// So past a certain size the map stops fitting and starts FOLLOWING: it shows a
-// window of the storey centred on where you stand, and slides as you move. The
-// window is measured in capture-spacings rather than metres, so it holds the same
-// number of reachable points whatever the scene is built at — which is the thing
-// that actually decides whether a map is readable.
 const WINDOW_STEPS = 15;
 
-/** Narrow `[lo, hi]` to `span` around `centre`, without leaving the original. */
 function windowAround(
 	lo: number,
 	hi: number,
@@ -152,11 +117,6 @@ function windowAround(
 	return [a, a + span];
 }
 
-// The minimap for whatever level the user is on right now — the matching slice
-// plus every same-level anchor placed onto it. Only while walking the interior
-// (or peeking); the overview already shows the whole dollhouse. Surfaces every
-// floor's slice + anchors so the chrome can browse other levels without moving
-// the camera; the live capture lights up on its level.
 export function buildMinimapState(args: {
 	minimaps: MinimapSlice[];
 	panos: PanoEntry[];
@@ -164,7 +124,6 @@ export function buildMinimapState(args: {
 	currentIndex: number;
 	mode: OrbitMode;
 	labels: MapLabel[];
-	/** The scene's measured capture spacing — the window's unit (see scale.ts). */
 	step: number;
 }): OrbitState["minimap"] {
 	const { minimaps, panos, panoLevel, currentIndex, mode, labels, step } = args;
@@ -179,13 +138,6 @@ export function buildMinimapState(args: {
 		const b = readBounds(mm.bounds);
 		const spanU = b.u1 - b.u0;
 		const spanV = b.v1 - b.v0;
-		// Scope the map to the storey. Every slice is rendered over the whole scene
-		// footprint, so an upper floor occupying one wing sat marooned in the middle
-		// of ground it has nothing to do with. Its described volume is its real
-		// extent, so clip the image to that and express everything below — aspect,
-		// anchors, labels — in the clipped frame. No volume (an older tour, or a
-		// scene whose floors were clustered rather than described) falls back to the
-		// full slice, unchanged.
 		let u0 = b.u0;
 		let u1 = b.u1;
 		let v0 = b.v0;
@@ -198,9 +150,6 @@ export function buildMinimapState(args: {
 				lo[1] + vol.dimensions[1],
 				lo[2] + vol.dimensions[2],
 			];
-			// A box's extent in the map frame is its two corners projected and
-			// ordered — the projection may flip an axis, so neither corner is
-			// reliably the smaller one.
 			const a = toMap(basis, lo);
 			const c = toMap(basis, hi);
 			const cu0 = Math.max(b.u0, Math.min(a.u, c.u));
@@ -215,9 +164,6 @@ export function buildMinimapState(args: {
 			}
 		}
 
-		// Then follow. The current storey centres on the capture you are standing
-		// at; the others centre on their own captures, so paging between floors on
-		// the rail doesn't change the zoom under you.
 		const members: number[] = [];
 		for (let i = 0; i < panos.length; i++) if (panoLevel[i] === idx) members.push(i);
 		let focus: { u: number; v: number } | null = null;
@@ -246,10 +192,6 @@ export function buildMinimapState(args: {
 			u1: spanU > 0 ? (u1 - b.u0) / spanU : 1,
 			v1: spanV > 0 ? (v1 - b.v0) / spanV : 1,
 		};
-		// Percentages of the WINDOW, deliberately unclamped: a point outside it is
-		// dropped rather than pinned to an edge. Clamping was harmless while the map
-		// always showed the whole storey; with a window it would pile every capture
-		// you have walked past into a heap along the border.
 		const pct = (n: number) => n * 100;
 		const inside = (l: number, t: number) =>
 			l >= -2 && l <= 102 && t >= -2 && t <= 102;
@@ -264,9 +206,6 @@ export function buildMinimapState(args: {
 		}[] = [];
 		for (const i of members) {
 			const m = toMap(basis, panos[i].position);
-			// Against the WINDOW's origin, not the slice's — the anchors, the labels
-			// and the image all have to be measured in the same frame or the
-			// you-are-here dot drifts off the room it is standing in.
 			const leftPct = w > 0 ? pct((m.u - u0) / w) : 50;
 			const topPct = d > 0 ? pct((m.v - v0) / d) : 50;
 			if (!inside(leftPct, topPct)) continue;
@@ -280,9 +219,6 @@ export function buildMinimapState(args: {
 			});
 		}
 
-		// Zone names land on whichever storey their centre is nearest, placed by the
-		// same world→image mapping as the anchors. Each carries the closest capture
-		// to that centre, so clicking the name travels there.
 		const placed: Array<{
 			id: string;
 			label: string;
@@ -312,9 +248,6 @@ export function buildMinimapState(args: {
 
 		return {
 			level: idx,
-			// The planner's name for this storey, so the floor control can say
-			// "Living & Pool Terrace" rather than "2" (see anchors.py). Null on tours
-			// captured before floors were named.
 			name: mm.name ?? null,
 			url: mm.url,
 			aspect: d > 0 ? w / d : 1,

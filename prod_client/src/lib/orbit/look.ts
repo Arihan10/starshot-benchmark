@@ -6,8 +6,6 @@ import {
 	Vector3,
 } from "three";
 
-// Interior look is a yaw/pitch rig: lon (azimuth) + lat (elevation). These are
-// pure helpers; the engine owns the live lon/lat and feeds them back in.
 const _ndc = new Vector2();
 
 export function forwardToLonLat(f: [number, number, number]): {
@@ -33,13 +31,8 @@ export function lookTargetFrom(pos: Vector3, lon: number, lat: number): Vector3 
 		);
 }
 
-// Pitch limit for the yaw/pitch rig — just shy of straight up/down, where a
-// lookAt with a +Y up vector degenerates. Exported so a camera flight can aim at
-// a pre-clamped pitch and land on exactly the pose the rig will then hold.
 export const MAX_PITCH = 1.55;
 
-// Clamp pitch and aim the camera; returns the clamped lat so the caller keeps
-// its stored value in range.
 export function applyLook(
 	camera: PerspectiveCamera,
 	lon: number,
@@ -50,8 +43,6 @@ export function applyLook(
 	return clamped;
 }
 
-// World-space ray direction through a screen pixel (normalized). The passed
-// raycaster is reused as scratch; the returned direction is its live ray.
 export function cursorRayDir(
 	camera: PerspectiveCamera,
 	canvas: HTMLCanvasElement,
@@ -69,14 +60,6 @@ export function cursorRayDir(
 	return ray.ray.direction;
 }
 
-// Turn the look so the grabbed world direction reprojects onto the current
-// cursor pixel — the point stays welded under the cursor as you drag. The eye
-// is fixed during a look-drag, so this is the exact inverse of the perspective
-// projection for the yaw/pitch rig: the pixel becomes a camera-space unit ray
-// (cX right, cY up, cF forward), then lon/lat are the angles that map grabDir
-// onto it. {forward, right, up} is orthonormal, so cF = 1/‖ray‖ falls straight
-// out; lon comes from grabDir's azimuth offset by the ray's horizontal angle,
-// and lat rotates grabDir's (horizontal, vertical) parts onto (cF, cY).
 export function pinLook(
 	camera: PerspectiveCamera,
 	canvas: HTMLCanvasElement,

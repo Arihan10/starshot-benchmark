@@ -1,7 +1,3 @@
-// Server-only Cloudflare D1 client. Talks to the D1 HTTP query endpoint with the
-// secret API token, so this module must never be imported into client code —
-// only the `/api/scenes` Route Handler uses it. The token stays server-side
-// because it is NOT prefixed with NEXT_PUBLIC_.
 const API_BASE = "https://api.cloudflare.com/client/v4";
 
 type D1Row = Record<string, unknown>;

@@ -36,46 +36,8 @@ import { angleDelta, type EdgeType, type NavNode } from "./navGraph";
 import type { PanoEntry } from "./panoTextures";
 import { DEFAULT_METRICS, type NavMetrics } from "./scale";
 
-// The auto-home ghost rests fainter than a live affordance, so it reads as a
-// preview of where a click would land rather than another button to press.
 const GHOST_OPACITY = 0.4;
 
-// A LEADER LINE from the cursor to the ghost used to be drawn here, because the
-// ghost stood on the destination anchor — somewhere off to one side, behind
-// geometry — and needed something tying it back to the pointer that summoned it.
-// The line went when the ghost did: the waypoint no longer sits on the anchor, so
-// there is nothing to lead the eye to. See `showGhost`.
-
-// --- suppressed STANDING affordances -----------------------------------------
-//
-// An edge type in this set renders no standing marker in buildNav(). It says
-// nothing about the on-demand waypoint the cursor grows while homing — whether to
-// draw that is the engine's call (updateCursorRing / destinationFloor).
-//
-// TO RE-ENABLE a type, delete its entry — nothing else needs touching. The
-// builders in markers.ts still handle all five types, so it comes straight back.
-//
-// WHY THESE ARE OFF:
-//   walk (blue) — a walk edge is BY DEFINITION a spot you can already SEE from
-//     where you stand, so its puck spends attention on what the view already told
-//     you. With navGraph's nearest-3 guarantee most nodes drew several at once and
-//     the floor filled with near-identical blue rings.
-//   portal (orange) — a STANDING marker for every destination behind a wall fills
-//     the room with rings for places you cannot see and are not asking about. The
-//     engine draws ONE on demand instead, where the cursor is pointing, so it
-//     answers "what happens if I click HERE".
-// That leaves phase (violet), and only on a sealed node with no other way out.
-//
-// NOTHING BECOMES UNREACHABLE. Suppressed destinations keep every other route in:
-// clicking the floor still auto-homes onto them (engine's clickAnywhere →
-// autoHomeTarget scores every pano and ignores edge type), the surface cursor
-// still tints by type while one is the homing target, and they stay in the exits
-// panel, the minimap and the sonar ping. This hides scene geometry only — the nav
-// graph, routing costs and traversal FX are all untouched.
-//   vertical (green) — still very much ON, just not from here: floor changes are
-//     drawn by the dedicated arrow layer below, which places them in your view on
-//     arrival instead of at the destination (a point on another storey, i.e. the
-//     one place you are guaranteed not to be looking).
 const HIDDEN_AFFORDANCES: ReadonlySet<EdgeType> = new Set<EdgeType>([
 	"walk",
 	"portal",
@@ -85,32 +47,22 @@ const HIDDEN_AFFORDANCES: ReadonlySet<EdgeType> = new Set<EdgeType>([
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const _ndc = new Vector2();
 
-// The interior navigation overlay. Renders the CURRENT node's typed affordances
-// (every type except those in HIDDEN_AFFORDANCES), fades them by gaze bearing,
-// drives the sonar reveal of every node, previews the auto-home destination, and
-// keeps the peek "you are here" pin. The engine flips
-// group visibility per mode and feeds in the live nav graph / camera each frame.
 export class MarkerLayer {
-	readonly navGroup = new Group(); // interior: the current node's typed affordances
-	readonly sonarGroup = new Group(); // interior: x-ray reveal of every node
-	readonly ghostGroup = new Group(); // interior: the auto-home destination preview
-	readonly arrowGroup = new Group(); // interior: the in-view floor-change arrows
+	readonly navGroup = new Group();
+	readonly sonarGroup = new Group();
+	readonly ghostGroup = new Group();
+	readonly arrowGroup = new Group();
 	readonly you: YouMarker = makeYouMarker();
 
-	// The scene's measured distances. Held per LAYER rather than in module state
-	// because the A/B workspace runs two engines side by side over two different
-	// scenes — one global would let the second scene's load silently resize the
-	// first's markers. Set in build(); the default is the fallback scale.
 	private metrics: NavMetrics = DEFAULT_METRICS;
 
 	private hovered: Object3D | null = null;
 	private hoveredArrowMarker: Object3D | null = null;
 	private readonly arrowRay = new Raycaster();
 	private lastArrowTick = 0;
-	private ghostType: EdgeType | null = null; // rebuild key: the ghost's current edge type
-	// The ghost's ring/chevron, held rather than read back off ghostGroup.children.
+	private ghostType: EdgeType | null = null;
 	private ghostMarker: Object3D | null = null;
-	private pulseUntil = 0; // dwell/never-trapped: briefly boost every affordance
+	private pulseUntil = 0;
 	private sonarStart = 0;
 	private sonarReach = 1;
 
@@ -124,19 +76,11 @@ export class MarkerLayer {
 		);
 	}
 
-	// Per-scene build: adopt the scene's measured scale and size the you-marker to
-	// the scene extent.
 	build(sceneMaxDim: number, metrics: NavMetrics) {
 		this.metrics = metrics;
 		this.sizeYouMarker(sceneMaxDim);
 	}
 
-	// --- typed interior affordances -----------------------------------------
-
-	// Rebuild the affordances for the node the user is standing on. Each rendered
-	// edge becomes one marker at the destination's floor, except the types listed in
-	// HIDDEN_AFFORDANCES — see that set for why they're off and how to restore them.
-	// In practice that leaves a trapped node's phase ring.
 	buildNav(node: NavNode | null, panos: PanoEntry[]) {
 		this.clearNav();
 		if (!node) return;
@@ -146,7 +90,7 @@ export class MarkerLayer {
 			floor.y -= this.metrics.floorDrop;
 			const marker = makeNavMarker(edge, floor, this.metrics);
 			marker.userData.bearing = edge.bearing;
-			marker.userData.pulse = edge.type === "phase"; // trapped ghost never stops pulsing
+			marker.userData.pulse = edge.type === "phase";
 			this.navGroup.add(marker);
 		}
 	}
@@ -157,12 +101,6 @@ export class MarkerLayer {
 		this.hovered = null;
 	}
 
-	// The auto-home waypoint: a translucent affordance marking what a click would
-	// do. `floorPos` is where to DRAW it, which the caller decides.
-	//
-	// Rebuilt only when the edge type changes (cheap); re-placed and screen-scaled
-	// every frame, so the ring holds its on-screen size as the distance to it
-	// changes under a moving cursor.
 	showGhost(
 		floorPos: Vector3,
 		edge: { to: number; type: EdgeType; dy: number },
@@ -180,8 +118,6 @@ export class MarkerLayer {
 		const marker = this.ghostMarker;
 		if (!marker) return;
 		marker.position.copy(floorPos);
-		// Lift a hair so a ghost never z-fights a coincident marker. Scale-derived:
-		// "a hair" is a fraction of the marker it is standing on, not 2 cm.
 		marker.position.y += this.metrics.ghostLift;
 		const d = camera.position.distanceTo(marker.position);
 		marker.scale.setScalar(
@@ -204,11 +140,6 @@ export class MarkerLayer {
 		this.ghostMarker = null;
 	}
 
-	// Gaze-contingent disclosure: affordances rest bright enough to FIND off-axis
-	// and go full as the look swings toward them; phase ghosts + a dwell/never-
-	// trapped pulse breathe. Each marker also gets a minimum on-screen size so a
-	// far (or another-floor) point never shrinks away — near ones keep world size,
-	// distant ones scale UP to stay visible + clickable.
 	updateNav(
 		camera: PerspectiveCamera,
 		cameraAzimuth: number,
@@ -238,8 +169,6 @@ export class MarkerLayer {
 		}
 	}
 
-	// Nearest affordance under the cursor (screen-space magnetism). Returns the
-	// marker group; its userData carries the edge target + type.
 	pickNav(
 		clientX: number,
 		clientY: number,
@@ -257,16 +186,10 @@ export class MarkerLayer {
 		return this.hovered;
 	}
 
-	// Briefly pulse every exit (idle-dwell nudge, or a trapped node on arrival).
 	pulseExits(now: number, ms = 1400) {
 		this.pulseUntil = now + ms;
 	}
 
-	// --- floor arrows --------------------------------------------------------
-
-	// Rebuild the pair of floor arrows for the node just arrived at. `pos` is
-	// already placed by the engine, on your arrival heading — see refreshFloorArrows
-	// for why that, and not the destination, is where these live.
 	buildFloorArrows(items: Array<{ index: number; up: boolean; pos: Vector3 }>) {
 		this.clearFloorArrows();
 		for (const it of items) {
@@ -275,9 +198,6 @@ export class MarkerLayer {
 			marker.userData.to = it.index;
 			marker.userData.up = it.up;
 			marker.userData.baseY = it.pos.y;
-			// The up and down arrows drift out of step with each other — they are
-			// separate objects and reading as such costs nothing, whereas the two
-			// halves of ONE arrow must never do that.
 			marker.userData.phase = it.up ? 0 : Math.PI / 2;
 			this.arrowGroup.add(marker);
 		}
@@ -289,12 +209,8 @@ export class MarkerLayer {
 		this.hoveredArrowMarker = null;
 	}
 
-	// Drift each arrow as ONE rigid object. The chevrons inside it never move
-	// relative to each other — that was what made a single arrow read as two.
 	updateFloorArrows(now: number) {
 		if (!this.arrowGroup.visible) return;
-		// Clamped so a backgrounded tab returning after seconds eases rather than
-		// teleporting; seeded so the first frame is a sane step, not a jump.
 		const dt = this.lastArrowTick ? Math.min(100, now - this.lastArrowTick) : 16;
 		this.lastArrowTick = now;
 		const k = 1 - Math.exp(-dt / FLOOR_ARROW_GLOW_TAU);
@@ -303,16 +219,11 @@ export class MarkerLayer {
 			const phase = marker.userData.phase as number;
 			marker.position.y =
 				baseY + Math.sin(now * FLOOR_ARROW_RATE + phase) * this.metrics.arrowBob;
-			// Hover level EASES toward its target rather than jumping, so the glow
-			// arrives and leaves instead of switching. Exponential approach, driven by
-			// real elapsed time, so it looks the same at any frame rate.
 			const target = marker === this.hoveredArrowMarker ? 1 : 0;
 			const level =
 				((marker.userData.glow as number) ?? 0) +
 				(target - ((marker.userData.glow as number) ?? 0)) * k;
 			marker.userData.glow = level;
-			// One scalar drives the whole hover response, so the rim and the body
-			// swell together instead of beating against each other.
 			const glow =
 				level * (0.72 + 0.28 * Math.sin(now * FLOOR_ARROW_PULSE_RATE));
 			for (const part of marker.children) {
@@ -325,13 +236,6 @@ export class MarkerLayer {
 		}
 	}
 
-	// Picked by a REAL raycast first, then by screen magnetism as a fallback.
-	//
-	// Magnetism alone measured from the arrow's centre, so anywhere past its radius
-	// stopped counting as "on the arrow" even though the arrow was plainly under the
-	// cursor — and the proxy surface behind it took over instead. An arrow is drawn
-	// over everything, so if the ray meets its geometry you ARE pointing at it, and
-	// it wins. The magnetism stays underneath to keep near-misses forgiving.
 	pickFloorArrow(
 		clientX: number,
 		clientY: number,
@@ -363,10 +267,6 @@ export class MarkerLayer {
 		return this.hoveredArrowMarker;
 	}
 
-	// --- sonar reveal --------------------------------------------------------
-
-	// Build one x-ray dot per OTHER node, colored by its edge type from the current
-	// node (far when it has no direct edge). Sized/positioned each frame.
 	buildSonar(node: NavNode | null, panos: PanoEntry[], currentIndex: number) {
 		for (const d of this.sonarGroup.children) disposeMesh(d as Mesh);
 		this.sonarGroup.clear();
@@ -398,8 +298,6 @@ export class MarkerLayer {
 		return this.sonarGroup.visible;
 	}
 
-	// Expanding reveal front sweeps outward from the camera; dots light as it
-	// passes them, then everything fades. Returns false once finished.
 	updateSonar(now: number, camera: PerspectiveCamera, viewportHeight: number): boolean {
 		if (!this.sonarGroup.visible) return false;
 		const t = (now - this.sonarStart) / SONAR_DURATION;
@@ -431,7 +329,6 @@ export class MarkerLayer {
 		this.sonarGroup.visible = false;
 	}
 
-	// Screen placement of the nearest sonar dots, for the engine's HTML labels.
 	sonarLabelTargets(
 		camera: PerspectiveCamera,
 		canvas: HTMLCanvasElement,
@@ -459,8 +356,6 @@ export class MarkerLayer {
 		out.sort((a, b) => a.d - b.d);
 		return out.slice(0, max);
 	}
-
-	// --- peek "you are here" -------------------------------------------------
 
 	positionYouMarker(p: Vector3) {
 		const floorY = p.y - this.metrics.eyeHeight;
@@ -503,11 +398,6 @@ export class MarkerLayer {
 	}
 }
 
-// Set a uniform opacity across every material in an affordance group.
-// Set a uniform opacity across an affordance group, PRESERVING the depth split: the
-// copy drawn where the scene is in front of the marker carries `occludedFactor` and
-// keeps its share of whatever brightness it is given, so gaze fade and the dwell
-// pulse scale both passes together rather than flattening them into one.
 function setGroupOpacity(marker: Object3D, opacity: number) {
 	marker.traverse((o) => {
 		const m = (o as Mesh).material as Material | Material[] | undefined;

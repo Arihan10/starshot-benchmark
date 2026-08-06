@@ -1,15 +1,3 @@
-// GET /api/scenes — the published-scene catalog, newest first.
-//
-// Two sources, chosen by env:
-//   • default — Cloudflare D1 (lib/d1.ts). Runs server-side so the D1 token stays
-//     off the client.
-//   • NEXT_PUBLIC_LOCAL_API set — the local orchestrator's on-disk catalog
-//     (GET {LOCAL_API}/tour/scenes), fetched server-side. No Cloudflare at all;
-//     for running the walkthrough fully locally against captured cells.
-//
-// Route Handlers aren't cached by default; force-dynamic makes that explicit so
-// the list always reflects the current state (scenes appear as soon as the
-// backend publishes them).
 import { d1Query } from "@/lib/d1";
 import type { Scene } from "@/lib/scenes";
 
@@ -20,8 +8,6 @@ const LOCAL_API = process.env.NEXT_PUBLIC_LOCAL_API?.replace(/\/+$/, "");
 const str = (v: unknown): string => String(v ?? "");
 const nullable = (v: unknown): string | null => (v == null ? null : String(v));
 
-// Both sources return the same snake_case row shape (the local catalog mirrors
-// the D1 `scenes` columns), so one mapper covers both.
 function toScene(r: Record<string, unknown>): Scene {
 	return {
 		run: str(r.run),
@@ -31,8 +17,6 @@ function toScene(r: Record<string, unknown>): Scene {
 		tourKey: nullable(r.tour_key),
 		proxyKey: nullable(r.proxy_key),
 		panoPrefix: nullable(r.pano_prefix),
-		// Local-only for now: the D1 catalog has no splat column, so a cloud row
-		// leaves this undefined and `nullable` reads it as "no splat".
 		splatKey: nullable(r.splat_key),
 		panoCount: Number(r.pano_count ?? 0),
 		publishedAt: str(r.published_at),

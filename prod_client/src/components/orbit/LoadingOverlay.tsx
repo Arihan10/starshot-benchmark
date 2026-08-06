@@ -2,7 +2,6 @@
 
 import type { OrbitState } from "@/lib/orbit/types";
 
-/** The engine's own loading / failure notice, covering the canvas while it applies. */
 export default function LoadingOverlay({
 	overlay,
 }: {

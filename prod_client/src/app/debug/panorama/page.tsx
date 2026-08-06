@@ -12,7 +12,6 @@ export default function PanoramaPage() {
 			<ViewerHeader />
 
 			<div className="relative flex-1">
-				{/* Keyed by scene id so switching scenes resets to the first panorama. */}
 				<SceneGate>{(scene) => <PanoramaBrowser key={sceneId(scene)} scene={scene} />}</SceneGate>
 			</div>
 		</main>

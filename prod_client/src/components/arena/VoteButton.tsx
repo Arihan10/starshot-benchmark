@@ -1,19 +1,6 @@
 "use client";
 import Button from "@/components/ui/Button";
 
-/**
- * One half of the vote, as a segment of the bar floating over the scenes.
- *
- * THE ARROW POINTS AT THE SCENE IT VOTES FOR. The two buttons sit together in the
- * middle of the frame now rather than under their own panel, so left and right is
- * what tells them apart and the arrow says which side of the screen this choice is
- * about. (It used to point UP, from when the button lived under its own scene and
- * horizontal pointed at nothing.)
- *
- * Cream on black, and the loudest thing on the page: at the moment of choosing,
- * this IS the next step. Hovering inverts it and lifts it off the bar rather than
- * lighting it — a glow here would read as the treatment the winning SCENE gets.
- */
 export default function VoteButton({
 	label,
 	side,
@@ -21,7 +8,6 @@ export default function VoteButton({
 	disabled,
 }: {
 	label: string;
-	/** Which half of the screen this votes for; decides which way the arrow faces. */
 	side: "a" | "b";
 	onVote: () => void;
 	disabled?: boolean;
@@ -49,9 +35,6 @@ export default function VoteButton({
 
 	return (
 		<Button
-			// The side is the SHAPE: A raked left, B raked right, so the pair leans
-			// away from the SKIP between them and the three interlock into one bar.
-			// Colour is no longer part of it — see the sweep below.
 			variant="solid"
 			sweep
 			shape={side === "a" ? "start" : "end"}

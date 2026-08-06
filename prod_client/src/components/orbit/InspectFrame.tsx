@@ -3,11 +3,6 @@
 import type { ObjectInspect } from "@/lib/orbit/types";
 import { prettyLabel } from "./labels";
 
-// The dwell inspection: a frame and a caption around the rectangle the ENGINE is
-// drawing the orbiting object into (a scissored viewport of the main canvas, see
-// renderInspect). Deliberately has no background of its own — anything opaque here
-// would paint over the 3D underneath it. Pointer-transparent, so resting the cursor
-// to summon it never blocks the click that follows.
 export default function InspectFrame({ inspect }: { inspect: ObjectInspect }) {
 	return (
 		<div

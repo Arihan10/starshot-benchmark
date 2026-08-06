@@ -4,15 +4,6 @@ import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 import type { OrbitEngine } from "@/lib/orbit/engine";
 import type { OrbitState } from "@/lib/orbit/types";
 
-/**
- * The right-click menu for one addressed object.
- *
- * It owns its own dismissal. The outside-press and Escape listeners have to know
- * what "inside" means, and the only thing that knows that is the element itself —
- * hoisting the ref to the parent just to run the same two listeners there made
- * the shell carry a detail that belongs here. Mounting IS the open state, so the
- * listeners are bound exactly while the menu is up.
- */
 export default function ObjectMenu({
 	menu,
 	engine,
@@ -29,9 +20,6 @@ export default function ObjectMenu({
 		const onKeyDown = (e: KeyboardEvent) => {
 			if (e.key === "Escape") engine.current?.closeMenu();
 		};
-		// Capture phase: the canvas below stops propagation on its own pointer
-		// handlers, so a bubbling listener would never see the press that should
-		// dismiss this.
 		document.addEventListener("pointerdown", onPointerDown, true);
 		window.addEventListener("keydown", onKeyDown);
 		return () => {

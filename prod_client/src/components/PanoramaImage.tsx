@@ -32,9 +32,6 @@ function PanoramaScene({
 		let fullLoaded = false;
 		const loader = new TextureLoader();
 
-		// Assign the new background, then free the texture it replaced so VRAM
-		// doesn't grow as the user browses panoramas (placeholder -> full, and
-		// across pano changes).
 		const apply = (texture: Texture) => {
 			const previous = scene.background;
 			scene.background = asEquirect(texture);
@@ -43,8 +40,6 @@ function PanoramaScene({
 			}
 		};
 
-		// Low-res placeholder shows first — it's a real equirect background, so
-		// it pans in 360 immediately while the full image streams in.
 		loader.load(placeholderUrl, (lqip) => {
 			if (!active || fullLoaded) {
 				lqip.dispose();
@@ -53,7 +48,6 @@ function PanoramaScene({
 			apply(lqip);
 		});
 
-		// Full resolution sharpens in place at the same orientation.
 		loader.load(url, (full) => {
 			if (!active) {
 				full.dispose();
@@ -95,8 +89,7 @@ export default function PanoramaImage({
 					rotateSpeed={-0.3}
 				/>
 			</Canvas>
-			{/* Smooths the low-res preview's blockiness, then fades out once the
-			    full-resolution panorama has loaded. */}
+			{}
 			<div
 				aria-hidden
 				style={{

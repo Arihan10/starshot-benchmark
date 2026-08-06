@@ -5,8 +5,6 @@ import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import ScenePicker from "./ScenePicker";
 
-// Local (no-Cloudflare) testing mode reads scenes + assets straight off the
-// orchestrator; surface that in the header so it's obvious which source is live.
 const LOCAL_API = process.env.NEXT_PUBLIC_LOCAL_API;
 
 export default function ViewerHeader() {

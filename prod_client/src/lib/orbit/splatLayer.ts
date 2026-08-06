@@ -1,33 +1,8 @@
 import type { PerspectiveCamera } from "three";
 
-// The Gaussian-splat layer: a PlayCanvas canvas sitting UNDERNEATH the three.js
-// one, rendering the cell's SOG-encoded trained splat as the scene's appearance.
-//
-// WHY A SECOND CANVAS. PlayCanvas' gsplat renderer needs its own GraphicsDevice,
-// and a WebGL context cannot be shared across engines — so the splat cannot be a
-// three.js object no matter how much tidier that would be. Two stacked canvases
-// is the only shape available, and it turns out to be a good one: three.js keeps
-// owning everything it is already good at (markers, cursor, outlines, the pano
-// projection) and simply renders over a transparent background, with the splat
-// showing through wherever nothing was drawn.
-//
-// FRAME LOCKSTEP IS THE WHOLE TRICK. PlayCanvas would happily run its own
-// requestAnimationFrame loop, but then the two layers would present on
-// independent schedules: the splat would show the camera pose from one frame
-// while the cursor drawn over it showed the pose from another, and during any
-// movement the overlay would visibly shear against the scene it is supposed to be
-// glued to. So `autoRender` stays OFF for the life of the app and the engine
-// calls `render()` from inside its own tick, right after copying the camera
-// across. One camera, one frame, two canvases.
-//
-// COST WHEN UNUSED IS ZERO. The module is dynamically imported on first load, so
-// a cell with no splat never downloads the PlayCanvas engine at all, and the
-// canvas/context are never created. When the splat exists but is hidden (interior
-// walkthrough), `render()` simply isn't called — the context idles.
-
 export type SplatTransform = {
 	position: [number, number, number];
-	rotation: [number, number, number]; // Euler degrees, XYZ
+	rotation: [number, number, number];
 	scale: number;
 };
 
@@ -37,16 +12,10 @@ export const IDENTITY_TRANSFORM: SplatTransform = {
 	scale: 1,
 };
 
-// Pure black, matching the host's CSS backdrop so the splat's empty space and the
-// page agree. Four surfaces have to hold the same value for the seam to stay
-// invisible — this canvas, the three.js scene background and inspect clear
-// (engine.ts), and the viewer's own CSS (OrbitViewer / LoadingOverlay). Change one
-// and you change them all.
-const CLEAR = [0, 0, 0] as const;
+const CLEAR = [0, 0, 0, 0] as const;
 
 type Pc = typeof import("playcanvas");
 
-/** A splat that has been decoded and uploaded but is not on screen yet. */
 type Staged = {
 	entity: import("playcanvas").Entity;
 	asset: import("playcanvas").Asset;
@@ -59,34 +28,19 @@ export class SplatLayer {
 	private canvas: HTMLCanvasElement | null = null;
 	private camera: import("playcanvas").Entity | null = null;
 	private entity: import("playcanvas").Entity | null = null;
-	// Held alongside the entity so `clear` can unload exactly the asset it owns.
-	// It used to unload the registry wholesale (`app.assets.list()`), which is fine
-	// when a layer only ever holds one splat at a time — and wrong the moment one is
-	// being staged behind another, since the next scene's asset is in that list too.
 	private asset: import("playcanvas").Asset | null = null;
-	// The next splat, built and waiting. See `prepare`.
 	private staged: Staged | null = null;
 	private assetUrl: string | null = null;
 	private transform: SplatTransform = { ...IDENTITY_TRANSFORM };
 	private active = false;
-	// Invalidated on every prepare/clear so an in-flight import or asset fetch that
-	// lands after the scene changed is dropped instead of attaching to it.
 	private token = 0;
 
 	constructor(private readonly host: HTMLElement) {}
 
-	/** Whether a splat is loaded and can be shown. */
 	get ready(): boolean {
 		return !!this.entity;
 	}
 
-	/**
-	 * The layer's own canvas, for compositing a still of the panel.
-	 *
-	 * Readable ONLY inside the frame that drew it: the context is created without
-	 * `preserveDrawingBuffer`, so the backbuffer is undefined once the browser has
-	 * composited. See OrbitEngine.capture, which is why this is exposed at all.
-	 */
 	get canvasEl(): HTMLCanvasElement | null {
 		return this.canvas;
 	}
@@ -95,23 +49,7 @@ export class SplatLayer {
 		return this.assetUrl;
 	}
 
-	/**
-	 * Build `url` into a splat that is ready to show, WITHOUT touching the one
-	 * currently on screen.
-	 *
-	 * This is the expensive half — the fetch, the decode and the GPU upload — and
-	 * splitting it from `commit` is what lets a scene change happen with the
-	 * previous scene still rendering. Nothing here is visible: the entity is
-	 * parented but disabled, so it costs no draw call until it is committed.
-	 *
-	 * Resolves false when the load was superseded or failed — the caller carries
-	 * on without a splat rather than failing the scene, since the dollhouse and
-	 * the walkthrough are both perfectly usable on their own.
-	 */
 	async prepare(url: string): Promise<boolean> {
-		// A stage that never got committed belongs to a load that has been
-		// abandoned; it holds GPU memory, so it goes now rather than at the next
-		// commit.
 		this.discardStaged();
 		const token = ++this.token;
 		try {
@@ -133,42 +71,14 @@ export class SplatLayer {
 				asset.unload();
 				return false;
 			}
-			// A REGISTRY HIT IS NOT A LOAD.
-			//
-			// PlayCanvas keys assets by URL and hands the existing one back on a
-			// repeat request — INCLUDING one whose fetch failed earlier, and it calls
-			// back with no error when it does. So the second time a scene with a
-			// missing splat comes round, this resolves with an asset that has no
-			// resource, the entity built from it draws nothing, and `ready` goes true
-			// anyway. The engine then hides the dollhouse in favour of a splat that
-			// is not there and the panel is simply black — no overlay, because
-			// nothing reported a failure.
-			//
-			// That is the intermittent "one scene doesn't load at all": it needs the
-			// same broken URL to be asked for twice, so it misses the first time
-			// round and hits on the second. Checked rather than trusted, and evicted
-			// from the registry so a later round genuinely refetches instead of being
-			// handed the same corpse.
 			if (!asset.resource) {
 				app.assets.remove(asset);
 				asset.unload();
 				console.warn("[splat] no resource for", url);
 				return false;
 			}
-			// `app` EXPLICITLY. `new pc.Entity(name)` defaults its owning app to
-			// PlayCanvas' module-global "current application" — the last one
-			// constructed anywhere on the page — and `addComponent` resolves the
-			// component system off THAT app. With two viewers side by side the
-			// awaits above interleave: both apps exist by the time either asset
-			// finishes, so one splat ends up with a gsplat component belonging to
-			// the other viewer's app while sitting in this one's scene graph, and
-			// silently never draws. Naming the app removes the global from the
-			// path entirely. Same reason the camera below passes it.
 			const entity = new pc.Entity("splat", app);
 			entity.addComponent("gsplat", { asset });
-			// PARENTED BUT OFF. It has to be in the graph for the component system to
-			// have built its render resources, and it must not draw over the splat
-			// this one is replacing — which is still on screen at this point.
 			entity.enabled = false;
 			app.root.addChild(entity);
 			this.staged = { entity, asset, url };
@@ -179,13 +89,6 @@ export class SplatLayer {
 		}
 	}
 
-	/**
-	 * Put the prepared splat on screen, dropping whatever was there.
-	 *
-	 * Synchronous by construction — everything slow already happened in `prepare` —
-	 * so the old scene and the new one are never both absent. With nothing staged
-	 * this is just a clear, which is what a scene that ships no splat wants.
-	 */
 	commit() {
 		const next = this.staged;
 		this.staged = null;
@@ -199,7 +102,6 @@ export class SplatLayer {
 		this.resize();
 	}
 
-	/** Throw away a prepared splat that is never going to be shown. */
 	discardStaged() {
 		const s = this.staged;
 		this.staged = null;
@@ -208,13 +110,7 @@ export class SplatLayer {
 		s.asset.unload();
 	}
 
-	/** Drop the splat that is on screen, leaving anything staged alone. */
 	private dropActive() {
-		// Routed through setActive rather than reaching for the style directly, so
-		// exactly ONE place decides how this canvas is hidden. Two places disagreeing
-		// is not hypothetical: this used to hide it with `display: none` while
-		// setActive showed it again with `visibility`, which left the element
-		// undisplayed forever and the splat permanently invisible.
 		this.setActive(false);
 		if (this.entity) {
 			this.entity.destroy();
@@ -234,36 +130,25 @@ export class SplatLayer {
 			inset: "0",
 			width: "100%",
 			height: "100%",
-			// Under the three.js canvas (which the engine pins to z-index 1) but
-			// above the host's own background.
 			zIndex: "0",
-			// VISIBILITY, not display. PlayCanvas re-derives its backbuffer size from
-			// the canvas's clientWidth/clientHeight at the top of every render (see
-			// AppBase.render → updateCanvasSize under RESOLUTION_AUTO), and a
-			// `display: none` canvas reports 0×0 — which would hand the graphics
-			// device a zero-sized backbuffer. `visibility: hidden` keeps the element
-			// laid out, so those measurements stay honest whether it is on screen or
-			// not.
 			visibility: "hidden",
-			pointerEvents: "none", // input belongs to the three.js canvas above
+			pointerEvents: "none",
 		});
-		// Prepended so it can never sit above the overlays the engine appends.
 		this.host.insertBefore(canvas, this.host.firstChild);
 		this.canvas = canvas;
 
 		const app = new pc.Application(canvas, {
-			graphicsDeviceOptions: { antialias: false },
+			graphicsDeviceOptions: { antialias: false, alpha: true },
 		});
 		app.setCanvasFillMode(pc.FILLMODE_NONE);
 		app.setCanvasResolution(pc.RESOLUTION_AUTO);
 		app.graphicsDevice.maxPixelRatio = window.devicePixelRatio || 1;
 		app.start();
-		// See the lockstep note at the top: the engine drives render() itself.
 		app.autoRender = false;
 
 		const camera = new pc.Entity("splat-camera", app);
 		camera.addComponent("camera", {
-			clearColor: new pc.Color(CLEAR[0], CLEAR[1], CLEAR[2], 1),
+			clearColor: new pc.Color(...CLEAR),
 			fov: 75,
 			nearClip: 0.05,
 			farClip: 2000,
@@ -274,14 +159,6 @@ export class SplatLayer {
 		this.camera = camera;
 	}
 
-	/**
-	 * The splat's placement in world space. Trainers that renormalize the scene on
-	 * ingest (Postshot does) hand back a splat whose origin is nowhere near the
-	 * world the walkthrough lives in; this is where that gets corrected while the
-	 * numbers are still being found. Once a correction is confirmed it belongs
-	 * baked into the asset (tools/splat-to-web-sog.mjs --translate) so every
-	 * consumer gets it, and this returns to identity.
-	 */
 	setTransform(t: SplatTransform) {
 		this.transform = t;
 		this.applyTransform();
@@ -301,7 +178,6 @@ export class SplatLayer {
 		e.setLocalScale(this.transform.scale, this.transform.scale, this.transform.scale);
 	}
 
-	/** Show or hide the layer. Hidden costs nothing: `render` becomes a no-op. */
 	setActive(on: boolean) {
 		const next = on && !!this.entity;
 		if (next === this.active) return;
@@ -313,22 +189,12 @@ export class SplatLayer {
 		return this.active;
 	}
 
-	/**
-	 * Copy the three.js camera across and draw one frame. Called from the engine's
-	 * tick BEFORE it renders its own layer, so both present the same pose.
-	 * PlayCanvas and three.js share a convention here — right-handed, Y-up,
-	 * looking down local -Z — so the quaternion transfers without correction.
-	 */
 	render(cam: PerspectiveCamera) {
 		if (!this.active || !this.app || !this.camera) return;
-		// A render with no layout size would resize the backbuffer to 0×0 and throw
-		// the frame away — and the panel this lives in genuinely reaches zero size
-		// (the A/B workspace collapses one side outright). Skipping is free; the next
-		// frame with real dimensions picks straight back up.
 		if (!this.canvas?.clientWidth || !this.canvas.clientHeight) return;
 		const c = this.camera.camera;
 		if (c) {
-			c.fov = cam.fov; // three's fov is vertical; so is PlayCanvas' default
+			c.fov = cam.fov;
 			c.nearClip = cam.near;
 			c.farClip = cam.far;
 		}
@@ -339,15 +205,6 @@ export class SplatLayer {
 			cam.quaternion.z,
 			cam.quaternion.w,
 		);
-		// `render()` is marked @ignore in PlayCanvas' typings — internal, not part of
-		// the supported surface — so the version is pinned exactly and this degrades
-		// rather than throws if a future one drops it. It is used anyway because it
-		// is the only way to draw SYNCHRONOUSLY, here, with the camera we just set.
-		// The public alternative (`renderNextFrame = true`) defers to PlayCanvas'
-		// own requestAnimationFrame callback, which may run either side of ours —
-		// and a splat drawn from last frame's pose with this frame's cursor on top
-		// shears visibly the moment anything moves, which is the one artefact this
-		// whole layer exists to avoid.
 		const app = this.app as { render?: () => void; renderNextFrame?: boolean };
 		if (typeof app.render === "function") app.render();
 		else app.renderNextFrame = true;
@@ -360,13 +217,6 @@ export class SplatLayer {
 		if (w > 0 && h > 0) this.app.resizeCanvas(w, h);
 	}
 
-	/**
-	 * Drop the current splat, keeping the app alive for the next scene.
-	 *
-	 * Deliberately leaves a STAGED splat untouched: the engine clears the old scene
-	 * and commits the new one back to back, so this runs between a prepare and its
-	 * commit and must not take the thing it is about to show.
-	 */
 	clear() {
 		this.token++;
 		this.dropActive();
@@ -380,9 +230,8 @@ export class SplatLayer {
 		this.camera = null;
 		if (app) {
 			try {
-				app.destroy(); // tears down entities, assets and the GL context
+				app.destroy();
 			} catch {
-				/* destroying a partially-built app can throw; nothing left to save */
 			}
 		}
 		this.canvas?.remove();

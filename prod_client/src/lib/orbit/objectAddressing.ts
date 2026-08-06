@@ -11,10 +11,6 @@ import type { OrbitState } from "./types";
 
 const _ndc = new Vector2();
 
-// The addressable objects of a loaded root. The exporter/loader can wrap the
-// real objects under a single node, so unwrap single unnamed non-mesh wrappers,
-// then take that container's mesh-bearing children. Fall back to "every mesh"
-// when the structure is flat or collapses to one node.
 export function collectObjects(root: Object3D): Object3D[] {
 	let container = root;
 	while (
@@ -42,18 +38,10 @@ export function collectObjects(root: Object3D): Object3D[] {
 	return objs;
 }
 
-// Per-object addressing for a loaded root (lite + proxy): hover (cyan outline),
-// hide, right-click outline (orange), and pinned connectors (orange outline +
-// translucent fill), plus the right-click menu state. The three OutlinePasses
-// live here and are handed to the engine's composer; the engine owns emit() and
-// decides which root is addressable (passed into pick/open).
 export class ObjectAddressing {
 	private readonly picker = new Raycaster();
 	private readonly hiddenObjects = new Set<Object3D>();
 	private readonly outlinedObjects = new Set<Object3D>();
-	// Objects pinned to the orange outline regardless of hover / right-click —
-	// populated by pinConnectors, dropped only by reset(). These (cross-zone
-	// connectors) are the only highlight that also gets a translucent fill (fillPass).
 	private readonly pinnedOutlines = new Set<Object3D>();
 	private hoveredObj: Object3D | null = null;
 	private menuTarget: Object3D | null = null;
@@ -61,7 +49,6 @@ export class ObjectAddressing {
 
 	readonly selectPass: OutlinePass;
 	readonly hoverPass: OutlinePass;
-	// Pinned connectors: the same orange outline as selectPass, plus an interior fill.
 	readonly fillPass: OutlinePass;
 
 	constructor(
@@ -82,11 +69,6 @@ export class ObjectAddressing {
 		});
 	}
 
-	// Permanently orange-outline + fill the proxy objects named by `ids` (the
-	// manifest's cross-zone connectors), matched case-insensitively against each
-	// object's label. These highlights ignore the hover toggle and survive
-	// clearOutlines / the right-click menu — only reset() drops them. Call after
-	// register() so objLabel is populated.
 	pinConnectors(root: Object3D, ids: string[]) {
 		const want = new Set(ids.map((s) => s.trim().toLowerCase()));
 		if (want.size === 0) return;
@@ -119,9 +101,6 @@ export class ObjectAddressing {
 		return true;
 	}
 
-	// Nearest visible addressable object under a screen point within `root`.
-	// Raycaster doesn't skip invisible objects, so skip hidden ones explicitly —
-	// otherwise a hidden object would still shadow the geometry behind it.
 	pickAt(
 		clientX: number,
 		clientY: number,
@@ -141,11 +120,6 @@ export class ObjectAddressing {
 		return null;
 	}
 
-	// Feed the live hover / selection sets to the three outline passes (run every
-	// frame from tick). Pinned connectors go to the orange fill pass; other
-	// right-click outlines to the plain orange pass; the hovered object to the cyan
-	// pass. A pinned/outlined object never also hover-outlines, and hidden objects
-	// are dropped; an empty list is a no-op pass.
 	updateOutlines() {
 		const filled: Object3D[] = [];
 		for (const o of this.pinnedOutlines) if (o.visible) filled.push(o);
@@ -164,9 +138,6 @@ export class ObjectAddressing {
 				: [];
 	}
 
-	// Right-click an object → per-object menu (hide / outline). Right-clicking
-	// empty space still surfaces the recovery actions (you can't re-pick a hidden
-	// object), but only if there's something to recover.
 	openMenu(clientX: number, clientY: number, root: Object3D | null) {
 		const obj = this.pickAt(clientX, clientY, root);
 		if (
@@ -217,8 +188,6 @@ export class ObjectAddressing {
 		this.closeMenu();
 	}
 
-	// Drop all per-object state when the scene is torn down; the nodes themselves
-	// are disposed with their roots.
 	reset() {
 		this.hiddenObjects.clear();
 		this.outlinedObjects.clear();
@@ -232,7 +201,7 @@ export class ObjectAddressing {
 		obj.visible = !hidden;
 		if (hidden) {
 			this.hiddenObjects.add(obj);
-			if (obj === this.hoveredObj) this.hoveredObj = null; // can't hover what's gone
+			if (obj === this.hoveredObj) this.hoveredObj = null;
 		} else {
 			this.hiddenObjects.delete(obj);
 		}
@@ -253,10 +222,6 @@ export class ObjectAddressing {
 	}
 }
 
-// Build an OutlinePass tuned to a colour. hiddenEdgeColor is black so the
-// occluded part of a silhouette adds nothing (the overlay blends additively) —
-// the outline shows only where the object is actually visible, reading as an
-// in-place highlight rather than an x-ray.
 function makeOutlinePass(
 	scene: Scene,
 	camera: PerspectiveCamera,
@@ -270,10 +235,6 @@ function makeOutlinePass(
 	pass.hiddenEdgeColor.set(0x000000);
 	pass.edgeStrength = edgeStrength;
 	pass.edgeThickness = edgeThickness;
-	// Patch the stock overlay shader (no vendoring) to also tint the visible
-	// silhouette: in the mask r=0 inside the object and g=0 where it's unoccluded,
-	// so (1-r)(1-g) is the visible interior, scaled by fillStrength (0 = no fill,
-	// leaving a plain outline pass byte-for-byte unchanged).
 	const overlay = pass.overlayMaterial;
 	overlay.uniforms.fillColor = { value: pass.visibleEdgeColor };
 	overlay.uniforms.fillStrength = { value: fillStrength };

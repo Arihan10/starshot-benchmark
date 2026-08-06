@@ -3,9 +3,6 @@
 import { useScene } from "@/components/SceneProvider";
 import { sceneId, type Scene } from "@/lib/scenes";
 
-// Scene selector for the header. Scenes are grouped by run (a benchmark run
-// holds many slot/model cells), so the dropdown scales as more runs and cells
-// are published.
 export default function ScenePicker() {
 	const { scenes, selected, status, select } = useScene();
 

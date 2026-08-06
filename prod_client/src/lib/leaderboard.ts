@@ -1,30 +1,10 @@
-/**
- * Standings for the leaderboard.
- *
- * #TODO: PLACEHOLDER DATA. These are made-up ratings for real model names, so the
- * screen can be built and laid out against something the right shape. Twenty-two of
- * them, which is more than any window fits — the point of the length is that "show
- * more" is a real state to look at rather than a button that never appears. When the
- * server owns votes this becomes a fetch — which is why the page that renders it is
- * a server component and this module exports a plain array rather than a hook:
- * swapping the source should not reach into the UI.
- *
- * ELO ORDER AND NOTHING ELSE, for now. A scene filter, a search and a three-way
- * sort all lived in this module and are gone: the first thing this page has to do
- * is be a ranking, and every control above the table is a reader deciding something
- * before being shown anything. They come back when the data behind them is real —
- * scene splits especially, which needs per-scene ratings the server does not yet
- * produce. `rank` is the row's own and survives whatever ordering arrives later.
- */
+// #TODO: placeholder data — replace with a server fetch when votes are real.
 export type Standing = {
 	rank: number;
 	name: string;
-	/** Who makes it. Set beside the name at a lower rank, never in place of it. */
 	lab: string;
 	elo: number;
-	/** Points moved in the last seven days; negative is a fall. */
 	delta: number;
-	/** Share of head-to-heads won, 0–100. */
 	winRate: number;
 	votes: number;
 };
@@ -53,7 +33,3 @@ export const STANDINGS: Standing[] = [
 	{ rank: 21, name: "Step-3", lab: "Stepfun", elo: 1042, delta: -4, winRate: 22.1, votes: 1795 },
 	{ rank: 22, name: "Jamba 2 Large", lab: "Ai21", elo: 1024, delta: 6, winRate: 20.5, votes: 1533 },
 ];
-
-// `MIN_ROWS` lived here, for a table that measured how many rows fitted the window
-// and hid the rest behind a "show more". The board scrolls inside its own box now,
-// so every row is always reachable and there is no floor to enforce.
