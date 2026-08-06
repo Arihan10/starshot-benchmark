@@ -16,6 +16,7 @@ import { buildStep } from "@/components/arena/buildSequence";
 import Composer from "@/components/arena/Composer";
 import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
 import Masthead, { ROLL_ORIGIN, Title } from "@/components/site/Masthead";
+import { useLeaving } from "@/components/site/PageTransition";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
 type Side = "a" | "b";
@@ -23,8 +24,14 @@ type Vote = Side | "skip";
 
 const ROLL_OUT_MS = 420;
 
+// SHORTER THAN THE NAVIGATION HOLD, so the arena has finished leaving by the time
+// the route swaps. Anything longer is cut off mid-fade, which reads as a dropped
+// frame rather than an exit. The masthead runs its own on the way out.
+const LEAVE_MS = 200;
+
 export default function Page() {
     const [vote, setVote] = useState<Vote | null>(null);
+    const leaving = useLeaving();
 
     const [{ shown, target }, setRound] = useState({ shown: 0, target: 0 });
     const round = LOCAL_ROUNDS[shown % LOCAL_ROUNDS.length];
@@ -190,9 +197,10 @@ export default function Page() {
                 className="relative min-h-0 flex-1"
                 style={{
                     marginTop: toured !== null ? `${-seam.head}px` : 0,
-                    transitionProperty: "margin",
-                    transitionDuration: `${SOLO_TRANSITION_MS}ms`,
-                    transitionTimingFunction: SOLO_EASING,
+                    opacity: leaving ? 0 : 1,
+                    transitionProperty: "margin, opacity",
+                    transitionDuration: `${SOLO_TRANSITION_MS}ms, ${LEAVE_MS}ms`,
+                    transitionTimingFunction: `${SOLO_EASING}, ease-out`,
                 }}
             >
 
@@ -261,6 +269,7 @@ export default function Page() {
                 className={`pointer-events-none absolute inset-x-0 bottom-md z-30 flex flex-col items-center gap-0 px-lg transition-opacity duration-500 ${
                     toured !== null ? "opacity-0" : "opacity-100"
                 }`}
+                style={leaving ? { opacity: 0, transitionDuration: `${LEAVE_MS}ms` } : undefined}
             >
                 <div className="pointer-events-auto relative">
                     <span

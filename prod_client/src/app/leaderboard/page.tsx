@@ -54,7 +54,15 @@ export default function LeaderboardPage() {
 
 				<LeaderboardStage rows={STANDINGS} top={top} foot={FOOT} />
 
-			<div className="absolute inset-x-0 bottom-0 z-40">
+			{/* Arrives last, and from under the foot of the page, so the one control
+			    that leaves the route is the final thing to settle. */}
+			<div
+				className="lift-in absolute inset-x-0 bottom-0 z-40"
+				style={{
+					["--lift-delay" as string]: "420ms",
+					["--lift-from" as string]: "100%",
+				}}
+			>
 				<ExitBar />
 			</div>
 		</div>

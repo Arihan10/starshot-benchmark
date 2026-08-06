@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Fade from "@/components/site/Fade";
 import Masthead, { Title } from "@/components/site/Masthead";
 import PageShell from "@/components/site/PageShell";
 import VoxelSky from "@/components/site/VoxelSky";
@@ -76,7 +77,10 @@ export default function FaqPage() {
 					</Masthead>
 				}
 				footer={
-					<div className="flex items-center justify-center gap-md border-t border-mark-8 bg-ground px-lg py-md">
+					<div
+						className="lift-in flex items-center justify-center gap-md border-t border-mark-8 bg-ground px-lg py-md"
+						style={{ ["--lift-delay" as string]: "320ms" }}
+					>
 						<span className="font-label text-2xs text-ink-40">
 							Still wondering?
 						</span>
@@ -86,26 +90,31 @@ export default function FaqPage() {
 					</div>
 				}
 			>
-				<dl className="relative z-10 flex flex-col">
-					{FAQS.map((item) => (
-						<div
-							key={item.q}
-							className="border-t border-mark-8 py-lg first:border-t-0 first:pt-0"
-						>
-							<dt className="font-sans text-base font-extrabold tracking-[-0.01em] text-ink text-balance">
-								{item.q}
-							</dt>
-							{item.a.map((para) => (
-								<dd
-									key={para}
-									className="mt-sm max-w-[62ch] font-sans text-sm leading-[1.65] text-ink-64 text-pretty"
-								>
-									{para}
-								</dd>
-							))}
-						</div>
-					))}
-				</dl>
+				{/* Leave-only: the questions arrive one at a time on their own, and a
+				    veil over the whole list would just fade the cascade in behind it. */}
+				<Fade enter={null}>
+					<dl className="relative z-10 flex flex-col">
+						{FAQS.map((item, i) => (
+							<div
+								key={item.q}
+								className="lift-in border-t border-mark-8 py-lg first:border-t-0 first:pt-0"
+								style={{ ["--lift-delay" as string]: `${140 + i * 55}ms` }}
+							>
+								<dt className="font-sans text-base font-extrabold tracking-[-0.01em] text-ink text-balance">
+									{item.q}
+								</dt>
+								{item.a.map((para) => (
+									<dd
+										key={para}
+										className="mt-sm max-w-[62ch] font-sans text-sm leading-[1.65] text-ink-64 text-pretty"
+									>
+										{para}
+									</dd>
+								))}
+							</div>
+						))}
+					</dl>
+				</Fade>
 			</PageShell>
 		</div>
 	);

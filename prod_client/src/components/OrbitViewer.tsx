@@ -197,7 +197,9 @@ export default function OrbitViewer({
 			{state.preview && <HoverCard preview={state.preview} />}
 			{state.inspect && <InspectFrame inspect={state.inspect} />}
 			{state.contextMenu && <ObjectMenu menu={state.contextMenu} engine={engineRef} />}
-			{overlay && <LoadingOverlay overlay={overlay} />}
+			{/* Always mounted: it owns its own exit, and unmounting it on the frame
+			    the scene commits is what made the cover vanish instead of lift. */}
+			<LoadingOverlay overlay={overlay} />
 			</div>
 		</div>
 	);

@@ -338,9 +338,21 @@ export default function StandingsTable({
 						</tr>
 					</thead>
 					<tbody ref={body}>
-						{visible.map((row) => (
+						{visible.map((row, i) => (
 							<tr
 								key={row.name}
+								// THE CASCADE RESTARTS PER PAGE, which is why the delay is taken
+								// modulo the page length rather than from the row's index in the
+								// list. Straight off the index, the first row revealed by SHOW
+								// MORE would wait out the whole page above it before appearing.
+								//
+								// Only ever on the way in: sorting and filtering keep these keys,
+								// so React reuses the rows and no animation re-runs on them.
+								style={{
+									["--lift-delay" as string]: `${(i % Math.max(1, fits)) * 24}ms`,
+									["--lift-dur" as string]: "360ms",
+									["--lift-from" as string]: "6px",
+								}}
 								// HOVER IS THE WHOLE INTERACTION, so it is reported from the
 								// row itself rather than from any one cell — the reader is
 								// pointing at a MODEL, and every part of the line is that
@@ -358,7 +370,7 @@ export default function StandingsTable({
 							// The spans carry the transition themselves: a transition on the
 							// row does not cascade, and without it the type would snap while
 							// the ground behind it faded.
-							className="group/row h-[clamp(56px,5.8vh,68px)] border-b border-mark-8 transition-colors duration-[160ms] hover:bg-paper hover:[--ink-rgb:var(--paper-ink-rgb)] hover:[--mark-rgb:var(--paper-ink-rgb)] [&_span]:transition-colors [&_span]:duration-[160ms]"
+							className="lift-in group/row h-[clamp(56px,5.8vh,68px)] border-b border-mark-8 transition-colors duration-[160ms] hover:bg-paper hover:[--ink-rgb:var(--paper-ink-rgb)] hover:[--mark-rgb:var(--paper-ink-rgb)] [&_span]:transition-colors [&_span]:duration-[160ms]"
 							>
 								{/* THE EDGE MARKER, and it is written as the TRIPLET rather than
 								    as `var(--color-mark)` — which is what it was, and it was

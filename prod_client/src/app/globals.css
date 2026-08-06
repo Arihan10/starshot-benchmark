@@ -160,6 +160,15 @@
   text-transform: uppercase;
 }
 
+/* THE ONE ARRIVAL EVERY PAGE USES. Rows, paragraphs and bars all enter on this
+   curve, so a page reads as a single movement rather than a set of separately
+   timed entrances. Distance and delay belong to the element; the curve and the
+   duration do not. */
+@utility lift-in {
+  animation: lift-in var(--lift-dur, 520ms) var(--ease-out-soft)
+    var(--lift-delay, 0ms) both;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -465,5 +474,49 @@ body {
   }
   to {
     scale: 1 1;
+  }
+}
+
+@keyframes lift-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--lift-from, 10px));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* TIERS GOING UP WHILE A SCENE LOADS — see LoadingOverlay. A wait that builds
+   something says what it is waiting for; a spinner says only that it is waiting.
+   The loop resets at zero width, where the retraction cannot be seen, so the
+   bars never appear to un-build. */
+@keyframes lay-in {
+  0% {
+    opacity: 0.2;
+    transform: scaleX(0);
+  }
+  36% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+  72% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scaleX(1);
+  }
+}
+
+/* Matched on the attribute rather than the class, because the arrival is also
+   used behind a variant — `[[data-arrived]_&]:lift-in` — and that compiles to a
+   class of its own that a plain `.lift-in` rule would never reach. */
+@media (prefers-reduced-motion: reduce) {
+  [class*="lift-in"],
+  [data-loader] * {
+    animation: none !important;
   }
 }

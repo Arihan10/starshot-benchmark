@@ -70,6 +70,10 @@ export default function AboutStage({ children }: { children: ReactNode }) {
 				const o = t <= 0 ? 1 : t >= 1 ? 0 : 1 - t * t * (3 - 2 * t);
 				screens[i].style.opacity = o.toFixed(3);
 				screens[i].style.pointerEvents = o < 0.05 ? "none" : "";
+				// Set once and never cleared: a screen's contents rise on the way in
+				// the first time it is reached, and scrolling back past it must not
+				// re-arm a cascade the reader has already watched.
+				if (o > 0.86) screens[i].dataset.arrived = "";
 			}
 
 			const busyL = BUSY_L[leg] + (BUSY_L[leg + 1] - BUSY_L[leg]) * u;

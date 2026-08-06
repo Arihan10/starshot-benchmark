@@ -21,6 +21,11 @@ const BODY =
 const COLUMN =
 	"flex max-h-full min-h-0 w-[min(620px,54vw)] flex-col gap-[clamp(10px,2.6vh,30px)] overflow-y-auto max-md:w-auto";
 
+// The first screen rises on mount; the rest cannot, because they are a scroll
+// away and would have played to nobody. AboutStage marks a screen the first time
+// it arrives and this waits for that mark. See data-arrived there.
+const ARRIVE = "[[data-arrived]_&]:lift-in";
+
 const STEPS = [
 	{
 		n: "01",
@@ -114,13 +119,19 @@ export default function AboutPage() {
 
 			<section className="relative flex h-dvh snap-start snap-always items-center justify-start overflow-hidden px-[clamp(26px,3vw,58px)] pt-[68px] pb-[40px]">
 				<div className={COLUMN}>
-					<p className={EYEBROW}>Who we are</p>
+					<p className={`${EYEBROW} ${ARRIVE}`}>Who we are</p>
 
-					<h2 className={`${HEADLINE} text-[clamp(32px,4vw,56px)]`}>
+					<h2
+						className={`${HEADLINE} ${ARRIVE} text-[clamp(32px,4vw,56px)]`}
+						style={{ ["--lift-delay" as string]: "80ms" }}
+					>
 						Starshot Labs builds foundation models for 3D.
 					</h2>
 
-					<div className={`${BODY} max-w-[540px] leading-[1.62]`}>
+					<div
+						className={`${BODY} ${ARRIVE} max-w-[540px] leading-[1.62]`}
+						style={{ ["--lift-delay" as string]: "160ms" }}
+					>
 						<p>
 							We are a research team working on generative 3D: models that turn
 							language into geometry, layout, and the relationships between
@@ -135,7 +146,10 @@ export default function AboutPage() {
 						</p>
 					</div>
 
-					<div className="flex flex-wrap items-center gap-[clamp(16px,2vw,28px)] pt-[clamp(2px,1vh,8px)]">
+					<div
+						className={`${ARRIVE} flex flex-wrap items-center gap-[clamp(16px,2vw,28px)] pt-[clamp(2px,1vh,8px)]`}
+						style={{ ["--lift-delay" as string]: "240ms" }}
+					>
 						{/* #TODO: no destination yet — link to Starshot's site when ready. */}
 						<Button variant="solid" sweep shape="standalone" href="/">
 							Starshot Labs
@@ -155,13 +169,21 @@ export default function AboutPage() {
 
 			<section className="relative flex h-dvh snap-start snap-always flex-col items-center overflow-hidden px-[clamp(26px,3vw,58px)] pt-[clamp(120px,18vh,200px)]">
 				<div className="flex w-[min(880px,100%)] flex-col items-center gap-[clamp(18px,3vh,34px)] text-center">
-					<p className={EYEBROW}>Get started</p>
+					<p className={`${EYEBROW} ${ARRIVE}`}>Get started</p>
 
-					<h2 className={`${HEADLINE} text-[clamp(34px,4.4vw,60px)]`}>
+					<h2
+						className={`${HEADLINE} ${ARRIVE} text-[clamp(34px,4.4vw,60px)]`}
+						style={{ ["--lift-delay" as string]: "80ms" }}
+					>
 						Two ways in.
 					</h2>
 
-					<div className="grid w-full grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-[clamp(12px,1.4vw,20px)] pt-[clamp(6px,1.5vh,18px)]">
+					{/* The reveal sits on the grid, not on the two cards: they lean up on
+					    hover, and a filled animation would hold their transform for good. */}
+					<div
+						className={`${ARRIVE} grid w-full grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-[clamp(12px,1.4vw,20px)] pt-[clamp(6px,1.5vh,18px)]`}
+						style={{ ["--lift-delay" as string]: "170ms" }}
+					>
 						<Link
 							href="/"
 							className="flex flex-col items-start gap-[9px] bg-mark px-[clamp(22px,2.4vw,32px)] py-[clamp(22px,3vh,32px)] text-left transition-transform duration-settle ease-out-soft hover:-translate-y-[3px]"
