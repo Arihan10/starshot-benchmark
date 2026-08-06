@@ -130,10 +130,31 @@ const LOG_BUILDERS = {
         `LLM JSON decode${e.final ? " (final attempt)" : ""}: ${e.reason ?? ""}`,
     ],
     "llm.retry": (e) => ["warn", `LLM parse retry: ${e.reason ?? ""}`],
-    "llm.transport_retry": (e) => [
-        "warn",
-        `provider flap (attempt ${e.attempt ?? "?"}, backoff ${e.backoff_s ?? "?"}s): ${e.reason ?? ""}`,
-    ],
+    "llm.transport_retry": (e) => {
+        // Attribution the bare ReadTimeout never carried: which model/step/node,
+        // and how long the attempt ran vs its read cap (elapsed ≈ cap ⇒ the
+        // generation outran the timeout, not a transient drop). exc_type names
+        // the failure because httpx.ReadTimeout has an empty message. Older
+        // events (reason/attempt/backoff only) still render via the fallbacks.
+        const who = [e.model, e.step, e.node].filter(Boolean).join(" · ");
+        const timing =
+            e.elapsed_s != null
+                ? `${Math.round(e.elapsed_s)}s${e.timeout_s != null ? `/${e.timeout_s}s cap` : ""}, `
+                : "";
+        const head =
+            e.exc_type ?? (e.reason ? String(e.reason).split(":")[0] : "flap");
+        // Raw provider text minus the redundant "ExcType: " prefix; empty for timeouts.
+        let detail = String(e.reason ?? "");
+        const ci = detail.indexOf(": ");
+        if (ci !== -1) detail = detail.slice(ci + 2);
+        detail = detail.trim();
+        return [
+            "warn",
+            `provider flap: ${head}${who ? ` [${who}]` : ""} ` +
+                `(${timing}attempt ${e.attempt ?? "?"}, backoff ${e.backoff_s ?? "?"}s)` +
+                `${detail ? ` — ${detail}` : ""}`,
+        ];
+    },
     "llm.validation_retry": (e) => [
         "warn",
         `${e.step ?? "step"}: output ids mismatched (attempt ${e.attempt ?? "?"}): ${e.reason ?? ""}`,
@@ -157,6 +178,10 @@ const LOG_BUILDERS = {
     "generation.next.stuck": (e) => [
         "warn",
         `${e.zone}: completion loop stuck re-proposing ${e.id ?? "?"} — stopped`,
+    ],
+    "generation.next.capped": (e) => [
+        "info",
+        `${e.zone}: next-object cap reached (${e.rounds ?? "?"}/${e.cap ?? "?"} rounds) — stopped`,
     ],
     "generation.dedup_drop": (e) => [
         "warn",
@@ -230,6 +255,9 @@ export function createObsModel() {
                 parentId: null,
                 prompt: null,
                 plan: null,
+                // Zone atomicity from `divider.zone_plan` (true = leaf, false =
+                // decomposed). null until that step folds, or for non-zones.
+                atomic: null,
                 imagePrompt: null,
                 kind: "zone",
                 phase: null,
@@ -260,8 +288,6 @@ export function createObsModel() {
     // zones (not just objects) an emitted_by, so the emittance lineage can climb
     // region→region all the way to the root.
     function recordProvenance(event) {
-        const out = event.output;
-        if (!out || typeof out !== "object") return;
         const relation =
             event.step === "child_bbox_batch" ||
             event.step === "object_bbox_batch"
@@ -282,6 +308,16 @@ export function createObsModel() {
             arr.push({ relation, call: event });
             model.provenance.set(cid, arr);
         };
+        // Slim history/live events carry the ids precomputed as `emitted` (the
+        // server extracted them from `output` before stripping the heavy bytes).
+        // Full events (compare/branch replays, legacy logs) still carry `output`,
+        // so fall back to walking it.
+        if (Array.isArray(event.emitted)) {
+            for (const cid of event.emitted) tag(cid);
+            return;
+        }
+        const out = event.output;
+        if (!out || typeof out !== "object") return;
         const tagList = (list) => {
             if (Array.isArray(list)) for (const x of list) tag(x?.id);
         };
@@ -363,11 +399,11 @@ export function createObsModel() {
                 return true;
             }
             case "divider.zone_plan": {
-                if (
-                    typeof event.node === "string" &&
-                    typeof event.plan === "string"
-                ) {
-                    node(event.node).plan = event.plan;
+                if (typeof event.node === "string") {
+                    const n = node(event.node);
+                    if (typeof event.plan === "string") n.plan = event.plan;
+                    if (typeof event.is_atomic === "boolean")
+                        n.atomic = event.is_atomic;
                 }
                 return true;
             }
@@ -465,6 +501,38 @@ export function createObsModel() {
     }
 
     return { model, feed, reset, rewindTerminal, lastCallOf, lastError };
+}
+
+// The pipeline steps that ran on/for a node — what the 3D hover tooltip lists
+// beneath the node's base info. Two sources, both pure tree data (no logs):
+//   * the node's OWN attributed calls (`event.node === id`): a zone's plan /
+//     decompose / next_object / bbox-batch rounds, an object's image_prompt, …
+//   * its PROVENANCE calls — the decompose that NAMED it (`emitted_by`) and the
+//     bbox-batch that PLACED it (`placed_by`), which ran on its region but are
+//     what brought it into being.
+// Deduped by step name (a step run many times — object_bbox_batch, next_object —
+// collapses to one entry carrying its `count`), ordered by first execution, each
+// tagged with its provenance `relation` ("emitted_by"/"placed_by") when it has
+// one and its `flightMs` — the step's grouped flight time, summed across the
+// step's calls (null when none of them carry timing).
+export function nodeStepsOf(model, id) {
+    if (!model || !id) return [];
+    const byStep = new Map(); // step name -> { step, count, index, relation, flightMs }
+    const add = (call, relation) => {
+        const step = call.template ?? call.step ?? "?";
+        let e = byStep.get(step);
+        if (!e) {
+            e = { step, count: 0, index: call.index ?? 0, relation: relation ?? null, flightMs: null };
+            byStep.set(step, e);
+        }
+        e.count += 1;
+        if (typeof call.index === "number" && call.index < e.index) e.index = call.index;
+        if (relation && !e.relation) e.relation = relation;
+        if (typeof call.flight_ms === "number") e.flightMs = (e.flightMs ?? 0) + call.flight_ms;
+    };
+    for (const p of model.provenance?.get(id) ?? []) add(p.call, p.relation);
+    for (const c of model.nodes.get(id)?.calls ?? []) add(c, null);
+    return [...byStep.values()].sort((a, b) => a.index - b.index);
 }
 
 // The decomposition step recorded as a node's `emitted_by` provenance — the

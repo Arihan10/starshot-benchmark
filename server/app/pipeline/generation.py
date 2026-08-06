@@ -47,8 +47,8 @@ import trimesh
 from app.core import prompt_store, scene_context, schemas
 from app.core.slots import MODELS
 from app.core.types import BoundingBox, Node, ProxyShape
-from app.pipeline import committed
-from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
+from app.pipeline import committed, context_cull
+from app.services import hunyuan, hunyuan_tencent, llm, mesh_jobs, nano_banana, prefabs, symmetry, threed
 from app.utils import glass, glb_place, logging
 from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
 from app.utils.topology import uniquify_ids
@@ -129,12 +129,18 @@ _OPTIMIZE_FANOUT = asyncio.Semaphore(4)
 LIBRARY_MATCH_CONCURRENCY = 12
 _library_match_slot = asyncio.Semaphore(LIBRARY_MATCH_CONCURRENCY)
 
-# From-scratch generated build (Nano-Banana + a mesh backend), one per cell, laid
-# out beside the asset-library build under the cell dir:
-#   objects-generated/            raw meshes (intermediate)
-#   objects-generated-optimized/  served twin (KTX2/Meshopt)
-#   events.generated.jsonl        resumable log
-# The asset-library build (objects/ + events.jsonl) is separate and unaffected.
+# Versioned from-scratch generated builds (Nano-Banana + a mesh backend). A cell
+# can hold ANY number of independent generated versions of the SAME scene —
+# identical layout (ids / bboxes reconstructed from the library build), but freshly
+# generated (or re-derived) assets per object — laid out under the cell as:
+#   generated/<version>/objects-generated/            raw meshes (intermediate)
+#   generated/<version>/objects-generated-optimized/  served twin (KTX2/Meshopt)
+#   generated/<version>/events.generated.jsonl        per-version resumable log
+# Each version's own log + dirs make it fully isolated: resume / regen / prefab
+# lookups read the bound (per-version) log, so a fresh version builds from scratch
+# instead of reusing another version's meshes. The asset-library build (objects/ +
+# events.jsonl) is NOT versioned and is unaffected.
+GENERATED_DIR = "generated"
 GENERATED_RAW_SUBDIR = "objects-generated"
 GENERATED_OPT_SUBDIR = "objects-generated-optimized"
 # Presentation "lite" twin (server/scripts/build_lite_assets.py): near-lossless
@@ -146,65 +152,76 @@ GENERATED_LITE_SUBDIR = "objects-generated-lite"
 GENERATED_SPLAT_SUBDIR = "objects-generated-splat"
 GENERATED_EVENTS_NAME = "events.generated.jsonl"
 
-# Older builds nested each build under generated/<n>/. We no longer create those;
-# the helpers below only READ the latest one for backwards-compatible display.
-_LEGACY_GENERATED_DIR = "generated"
+
+def generated_version_root(runs_dir: Path, run_id: str) -> Path:
+    """The parent dir holding every generated version of one cell."""
+    return runs_dir / run_id / GENERATED_DIR
 
 
-def generated_dirs(runs_dir: Path, run_id: str) -> tuple[Path, Path]:
-    """(raw_dir, opt_dir) for a cell's single generated build."""
-    base = runs_dir / run_id
+def generated_dirs(runs_dir: Path, run_id: str, version: str) -> tuple[Path, Path]:
+    """(raw_dir, opt_dir) for one generated version of a cell."""
+    base = generated_version_root(runs_dir, run_id) / str(version)
     return base / GENERATED_RAW_SUBDIR, base / GENERATED_OPT_SUBDIR
 
 
-def generated_events_path(runs_dir: Path, run_id: str) -> Path:
-    """The cell's generated build resumable log (events.generated.jsonl)."""
-    return runs_dir / run_id / GENERATED_EVENTS_NAME
+def generated_events_path(runs_dir: Path, run_id: str, version: str) -> Path:
+    """The per-version resumable event log (events.generated.jsonl)."""
+    return generated_version_root(runs_dir, run_id) / str(version) / GENERATED_EVENTS_NAME
 
 
-def _latest_legacy_version(runs_dir: Path, run_id: str) -> str | None:
-    """Highest numeric generated/<n>/ build on disk, or None — backwards
-    compatibility for cells built under the old per-version layout."""
-    root = runs_dir / run_id / _LEGACY_GENERATED_DIR
+def list_generated_versions(runs_dir: Path, run_id: str) -> list[str]:
+    """Existing generated version ids for a cell, ascending numeric order."""
+    root = generated_version_root(runs_dir, run_id)
     if not root.is_dir():
-        return None
-    versions = sorted(
-        (p.name for p in root.iterdir() if p.is_dir() and p.name.isdigit()), key=int,
-    )
+        return []
+    versions = [p.name for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
+    return sorted(versions, key=int)
+
+
+def next_generated_version(runs_dir: Path, run_id: str) -> str:
+    """The id for a brand-new version: one past the highest existing, else 1."""
+    versions = list_generated_versions(runs_dir, run_id)
+    return str(int(versions[-1]) + 1) if versions else "1"
+
+
+def generated_lite_dir(runs_dir: Path, run_id: str, version: str) -> Path:
+    """The `objects-generated-lite/` presentation tier of one generated version,
+    sitting beside that version's raw + optimized dirs."""
+    return generated_version_root(runs_dir, run_id) / str(version) / GENERATED_LITE_SUBDIR
+
+
+def latest_generated_version(runs_dir: Path, run_id: str) -> str | None:
+    """The highest existing generated version id, or None when the cell has no
+    generated build yet."""
+    versions = list_generated_versions(runs_dir, run_id)
     return versions[-1] if versions else None
 
 
-def latest_generated_dirs(runs_dir: Path, run_id: str) -> tuple[Path, Path]:
-    """(raw_dir, opt_dir) to READ for display: the single build when present, else
-    the newest legacy generated/<n>/ build."""
-    raw, opt = generated_dirs(runs_dir, run_id)
-    if raw.is_dir() or opt.is_dir():
-        return raw, opt
-    version = _latest_legacy_version(runs_dir, run_id)
-    if version is not None:
-        base = runs_dir / run_id / _LEGACY_GENERATED_DIR / version
-        return base / GENERATED_RAW_SUBDIR, base / GENERATED_OPT_SUBDIR
-    return raw, opt
-
-
-def latest_generated_lite_dir(runs_dir: Path, run_id: str) -> Path:
-    """The `objects-generated-lite/` dir beside whichever generated build
-    latest_generated_dirs resolves (the single build, else the newest legacy
-    generated/<n>/ build)."""
-    raw, _ = latest_generated_dirs(runs_dir, run_id)
-    return raw.parent / GENERATED_LITE_SUBDIR
-
-
-def latest_generated_events_path(runs_dir: Path, run_id: str) -> Path:
-    """The events.generated.jsonl to READ for display: the single build's when
-    present, else the newest legacy generated/<n>/ build's."""
-    path = generated_events_path(runs_dir, run_id)
-    if path.exists():
-        return path
-    version = _latest_legacy_version(runs_dir, run_id)
-    if version is not None:
-        return runs_dir / run_id / _LEGACY_GENERATED_DIR / version / GENERATED_EVENTS_NAME
-    return path
+def migrate_legacy_generated(runs_dir: Path, run_id: str) -> None:
+    """Fold a pre-versioning generated build (objects-generated*/ +
+    events.generated.jsonl sitting directly in the cell dir) into generated/1/,
+    so a build made before versioning keeps rendering under the versioned layout
+    and stays resumable as version 1 — the backwards-compatibility path for the
+    non-versioned system. Idempotent: a no-op once a generated/ dir exists or
+    there is nothing legacy to move, and each item is only moved when its
+    destination is absent, so a racing second call can't nest it wrongly."""
+    root = generated_version_root(runs_dir, run_id)
+    if root.exists():
+        return
+    cell = runs_dir / run_id
+    legacy = [
+        cell / GENERATED_RAW_SUBDIR,
+        cell / GENERATED_OPT_SUBDIR,
+        cell / GENERATED_EVENTS_NAME,
+    ]
+    if not any(p.exists() for p in legacy):
+        return
+    dst = root / "1"
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in legacy:
+        target = dst / p.name
+        if p.exists() and not target.exists():
+            shutil.move(str(p), str(target))
 
 
 def artifacts_complete(
@@ -381,7 +398,7 @@ async def _decompose_objects(
         zone_id=zone.id,
         zone_prompt=zone.prompt,
         zone_plan=zone.plan,
-        nodes=all_nodes,
+        nodes=context_cull.for_context(all_nodes, zone.id),
         target_text=target_text,
     )
     out = await llm.call_llm(
@@ -439,7 +456,7 @@ async def _next_object_batch(
         zone_id=zone.id,
         zone_prompt=zone.prompt,
         zone_plan=zone.plan,
-        nodes=all_nodes,
+        nodes=context_cull.for_context(all_nodes, zone.id),
         target_text="This is the subregion you are deciding whether to add more objects to.",
     )
     decision = await llm.call_llm(
@@ -494,7 +511,7 @@ async def _resolve_object_bboxes_batch(
         zone_id=zone.id,
         zone_prompt=zone.prompt,
         zone_plan=zone.plan,
-        nodes=all_nodes,
+        nodes=context_cull.for_context(all_nodes, zone.id),
         target_text="This is the subregion whose objects you are to place.",
     )
     variables["TO_PLACE"] = scene_context.render_to_place_block(
@@ -1030,33 +1047,35 @@ _pending: dict[str, list[asyncio.Task[None]]] = {}
 # double-bill — this guard closes that window.
 _admitted_ids: dict[str, set[str]] = {}
 
-# Per-cell map of per-node asyncio.Locks. The from-scratch whole-scene generate
-# (`generate_assets`) and standalone per-asset regeneration (`regenerate_one` /
-# `propagate_reuses`) may run CONCURRENTLY on the same cell; this serializes them
-# whenever they would write the SAME node's files (raw / rescaled / optimized GLB
-# + reference image), so a node is never built by two writers at once. Distinct
-# nodes never contend, so the common case — regenerating already-built assets
-# while the scene build resumes the missing ones — stays fully parallel. A reuse's
-# read of its canonical's raw is lock-free and kept safe instead by atomic
-# (temp + replace) writes.
-_node_locks: dict[str, dict[str, asyncio.Lock]] = {}
+# Per-(cell, version) map of per-node asyncio.Locks. The from-scratch whole-scene
+# generate (`generate_assets`) and standalone per-asset regeneration
+# (`regenerate_one` / `propagate_reuses`) may run CONCURRENTLY on the same version;
+# this serializes them whenever they would write the SAME node's files (raw /
+# rescaled / optimized GLB + reference image), so a node is never built by two
+# writers at once. Distinct nodes — and distinct versions of the same node — never
+# contend, so the common case (regenerating already-built assets while the scene
+# build resumes the missing ones, or building two versions at once) stays fully
+# parallel. A reuse's read of its canonical's raw is lock-free and kept safe
+# instead by atomic (temp + replace) writes.
+_node_locks: dict[tuple[str, str], dict[str, asyncio.Lock]] = {}
 
 
-def node_lock(run_id: str, node_id: str) -> asyncio.Lock:
-    """The build lock for one (cell, node), created on first use. Shared by the
-    whole-scene generate and per-asset regeneration so the two serialize only when
-    they target the same node."""
-    per_cell = _node_locks.setdefault(run_id, {})
-    lock = per_cell.get(node_id)
+def node_lock(run_id: str, version: str, node_id: str) -> asyncio.Lock:
+    """The build lock for one (cell, version, node), created on first use. Shared
+    by the whole-scene generate and per-asset regeneration so the two serialize
+    only when they target the same node in the same version."""
+    per_version = _node_locks.setdefault((run_id, version), {})
+    lock = per_version.get(node_id)
     if lock is None:
         lock = asyncio.Lock()
-        per_cell[node_id] = lock
+        per_version[node_id] = lock
     return lock
 
 
 def clear_node_locks(run_id: str) -> None:
-    """Drop a cell's node locks (called on reset / teardown)."""
-    _node_locks.pop(run_id, None)
+    """Drop every version's node locks for a cell (called on reset / teardown)."""
+    for key in [k for k in _node_locks if k[0] == run_id]:
+        _node_locks.pop(key, None)
 
 
 async def _generate_one(
@@ -1202,19 +1221,10 @@ async def _rescale_reuse_from_raw(
         return
     try:
         rescaled = raw_dir / f"{node.id}.glb"
-        cut_plane: Literal["none", "xy", "xz"] = "none"
-        keep_positive: bool | None = None
-        applied = logging.find_event("symmetry.applied", id=source_id)
-        if applied is not None:
-            raw_cp = applied.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
-                cut_plane = raw_cp  # type: ignore[assignment]
-            # Carry the canonical's kept-half so a non-default direction (set via
-            # the symmetrize control) mirrors the reuse identically. Absent on
-            # older logs -> None -> the plane's default half.
-            raw_keep = applied.get("keep_positive")
-            if isinstance(raw_keep, bool):
-                keep_positive = raw_keep
+        # Replay the CANONICAL's mirror — plane AND kept half — so the reuse lands
+        # identically posed, including a non-default direction set via the
+        # symmetrize control.
+        cut_plane, keep_positive = symmetry.applied_state(source_id)
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, src_raw)
             scene = await symmetry.apply_symmetrize(
@@ -1234,7 +1244,13 @@ async def _rescale_reuse_from_raw(
         src_png = raw_dir / f"{source_id}.png"
         if src_png.exists():
             await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{node.id}.png")
-        await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+        if await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb"):
+            # Every other build path leaves a success marker in the log (a
+            # `<scope>.done`, a `model` event); a reuse landed silently, so one
+            # that failed once still read as failed after a later rebuild fixed
+            # it. Gated on the optimize, which logs its own `generate.optimize_error`
+            # first when it fails — so that failure stays the node's latest word.
+            logging.log("prefab.reuse_derived", id=node.id, source=source_id)
     except Exception as e:  # noqa: BLE001
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
 
@@ -1276,17 +1292,23 @@ async def _spawn_meshes(
     return out
 
 
-# One lock per cell (run_id) so the generate gate and a concurrent regen compute
-# the shared prefab grouping once instead of racing to re-sweep + double-log it.
-_scene_prefab_locks: dict[str, asyncio.Lock] = {}
+# One lock per (cell, version) so a version's generate gate and a concurrent regen
+# of that SAME version compute its prefab grouping once instead of racing to
+# re-sweep + double-log it. Distinct versions group independently (each owns its
+# log), so they never contend.
+_scene_prefab_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 
-async def ensure_scene_prefab_groups(*, nodes: list[Node], run_id: str) -> dict[str, str]:
-    """Compute the scene-wide prefab grouping over `nodes` ONCE and persist it as
-    `prefab.match` events in the BOUND (generated build) log, shared by the
-    whole-scene generate and standalone regen of generated assets. Prefab matching
-    is for the from-scratch generated build only — the asset library picks an asset
-    per object as it is generated and never groups.
+async def ensure_scene_prefab_groups(
+    *, nodes: list[Node], run_id: str, version: str,
+) -> dict[str, str]:
+    """Compute the prefab grouping over `nodes` ONCE for one generated `version`
+    and persist it as `prefab.match` events in the BOUND (that version's) log,
+    shared by the version's whole-scene generate and standalone regen of its
+    assets. Each version groups INDEPENDENTLY — the grouping is a per-version
+    artifact, so a link/unlink in one version never affects another. Prefab
+    matching is for the from-scratch generated build only — the asset library
+    picks an asset per object as it is generated and never groups.
 
     Seed-and-sweep: the first undecided node is a canonical "seed"; a flash-lite
     call names every remaining node that is the SAME object (each reuses the
@@ -1294,7 +1316,7 @@ async def ensure_scene_prefab_groups(*, nodes: list[Node], run_id: str) -> dict[
     — nodes already carrying a logged `prefab.match` are honored and never
     re-swept, so a later regen or a resume is free.
     Returns node_id -> reuse_id ("" = canonical)."""
-    lock = _scene_prefab_locks.setdefault(run_id, asyncio.Lock())
+    lock = _scene_prefab_locks.setdefault((run_id, version), asyncio.Lock())
     async with lock:
         decisions: dict[str, str] = {}
         for node in nodes:
@@ -1330,13 +1352,15 @@ async def generate_assets(
     decisions: dict[str, str],
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """From-scratch (Nano-Banana + a mesh backend) build of `nodes` for the
     client's "generate" gate, independent of `_USE_ASSET_LIBRARY` and the library
     build's `objects/`. The mesh backend is `GENERATE_SCENE_BACKEND` (default
     Trellis; `hunyuan-tencent` routes the whole scene through Tencent's Hunyuan 3D
-    3.1, one job at a time). Writes the cell's single generated build into two dirs
-    beside the library build:
+    3.1, one job at a time). Writes into ONE generated `version` of the cell — any
+    number coexist, each fully isolated by its own dirs + log. Two dirs under
+    `generated/<version>/`:
 
       * `objects-generated/`            raw Trellis meshes (intermediate)
       * `objects-generated-optimized/`  the served set — each raw mesh run
@@ -1351,14 +1375,13 @@ async def generate_assets(
     regenerates only the failed/interrupted assets and leaves finished ones
     untouched.
 
-    PREFAB REUSE: `decisions` (node_id -> reuse_id, "" = canonical) is the
-    SCENE-level prefab grouping computed once by `ensure_scene_prefab_groups` and
-    shared across every generated version + the library build. This gate only
-    APPLIES it: a reuse skips Nano-Banana + Trellis entirely (its mesh is the
-    canonical's raw Trellis output rescaled into its slot). The grouping is seeded
-    into this version's log — honoring any per-version promotion already on disk (a
-    reuse rebuilt standalone logs its own `prefab.match`) and never flipping a
-    pre-built asset — so regen + the reuse-images fork keep resolving groups here.
+    PREFAB REUSE: `decisions` (node_id -> reuse_id, "" = canonical) is this
+    version's prefab grouping computed once by `ensure_scene_prefab_groups`. This
+    gate only APPLIES it: a reuse skips Nano-Banana + Trellis entirely (its mesh is
+    the canonical's raw Trellis output rescaled into its slot). The grouping is
+    seeded into this version's log — honoring any per-version promotion already on
+    disk (a reuse rebuilt standalone logs its own `prefab.match`) and never flipping
+    a pre-built asset — so regen keeps resolving groups here.
 
     Every asset fans out at once into an uncapped queue; the Trellis in-flight cap
     (threed.GENERATE_CONCURRENCY — 100 live submits) plus threed's `_pace_submit`
@@ -1367,13 +1390,13 @@ async def generate_assets(
 
     Requires a bound SlotLog: `_generate_one`, `prefabs.match_duplicates`, and the
     nano_banana / threed services record their bookkeeping there. The caller
-    binds a dedicated log (events.generated.jsonl) so none of this lands in the
-    library build's event stream."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    binds this version's dedicated log (events.generated.jsonl) so none of this
+    lands in the library build's event stream."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     raw_dir.mkdir(parents=True, exist_ok=True)
     opt_dir.mkdir(parents=True, exist_ok=True)
     backend = _scene_backend()
-    logging.log("generate.backend", backend=backend)
+    logging.log("generate.backend", backend=backend, version=version)
 
     # Per-scene prefab state: the canonical asset ids (reuse targets) and a "raw on
     # disk" event per canonical so a reuse can wait for a source still in flight.
@@ -1409,7 +1432,7 @@ async def generate_assets(
         rescaled = raw_dir / f"{node.id}.glb"
         # Serialize against a concurrent per-asset regeneration of this same node
         # (both write its files); distinct nodes never contend.
-        async with node_lock(run_id, node.id):
+        async with node_lock(run_id, version, node.id):
             # A regeneration may have (re)built this node while we waited for the
             # lock — don't redo it, but still unblock any reuse of this canonical.
             # Gate on the FULL artifact set, not the optimized twin alone, so a
@@ -1437,20 +1460,29 @@ async def generate_assets(
     async def _reuse(node: Node, source_id: str) -> None:
         # Wait for the source's mesh to land, then rescale ITS raw Trellis output
         # into this node's slot — exactly as a fresh build would, so the reuse
-        # lands identically posed. No Nano-Banana, no Trellis.
-        await raw_ready[source_id].wait()
-        async with node_lock(run_id, node.id):
-            # Full-set gate (see `_fresh`): a reuse with a stale optimized twin but
-            # a missing unoptimized served mesh is re-derived, not skipped.
-            if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=True):
-                return
-            await _rescale_reuse_from_raw(
-                node,
-                src_raw=raw_dir / f"{source_id}.raw.glb",
-                raw_dir=raw_dir,
-                opt_dir=opt_dir,
-                source_id=source_id,
-            )
+        # lands identically posed. No Nano-Banana, no Trellis. Surfaces in the
+        # queue panel nested under its canonical (`canonical=source_id`): waiting
+        # while the canonical's mesh is still generating, processing during the
+        # rescale, then dropped.
+        slot = logging.current_slot_id()
+        mesh_jobs.mark_queued(slot, node.id, canonical=source_id)
+        try:
+            await raw_ready[source_id].wait()
+            async with node_lock(run_id, version, node.id):
+                # Full-set gate (see `_fresh`): a reuse with a stale optimized twin
+                # but a missing unoptimized served mesh is re-derived, not skipped.
+                if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=True):
+                    return
+                mesh_jobs.mark_processing(slot, node.id, canonical=source_id)
+                await _rescale_reuse_from_raw(
+                    node,
+                    src_raw=raw_dir / f"{source_id}.raw.glb",
+                    raw_dir=raw_dir,
+                    opt_dir=opt_dir,
+                    source_id=source_id,
+                )
+        finally:
+            mesh_jobs.unmark_queued(slot, node.id)
 
     # Apply the scene grouping. Seed this version's log with each decision so regen
     # / resolve_group / the reuse-images fork read the grouping from here, while
@@ -1501,7 +1533,7 @@ async def regenerate_one(
     subdir: str = "objects",
     optimize: bool = False,
     backend: str = DEFAULT_MESH_BACKEND,
-    generated: bool = False,
+    version: str | None = None,
     reuse_image: bool = False,
     regen_noun_phrase: bool = False,
     seed_prompt: str | None = None,
@@ -1515,7 +1547,7 @@ async def regenerate_one(
     backend + rescale. With
     `optimize=True` the freshly built mesh is run through the library optimizer
     into the sibling `objects-generated-optimized/` served twin (the from-scratch
-    generated pipeline — `subdir` is then `objects-generated`);
+    generated pipeline — `subdir` is then the version's `.../objects-generated`);
     the library path leaves it off.
 
     `reuse_image=True` keeps the node's existing reference image and rebuilds ONLY
@@ -1523,14 +1555,15 @@ async def regenerate_one(
     reuses it instead of calling Nano-Banana. Default False regenerates the image
     too ("regenerate from scratch").
 
-    With `generated=True` the rebuild runs under the (cell, node)'s build lock, so
-    a concurrent whole-scene generate can never write this node's files at the same
-    time. The library retry path passes generated=False (no concurrent gate).
+    When `version` is given (the generated path), the rebuild runs under that
+    (cell, version, node)'s build lock, so a concurrent whole-scene generate of the
+    same version can never write this node's files at the same time. The library
+    retry path passes version=None (its build has no concurrent gate).
 
     Awaitable core shared by the library single-mesh retry (`retry_node`, a
     detached + `_pending`-tracked wrapper) and standalone generated-asset
     regeneration (awaited directly under its own cell task)."""
-    if not generated:
+    if version is None:
         await _rebuild_one(
             node=node, runs_dir=runs_dir, run_id=run_id,
             subdir=subdir, optimize=optimize, backend=backend, reuse_image=reuse_image,
@@ -1538,7 +1571,7 @@ async def regenerate_one(
             scene_zone=scene_zone, scene_nodes=scene_nodes,
         )
         return
-    async with node_lock(run_id, node.id):
+    async with node_lock(run_id, version, node.id):
         await _rebuild_one(
             node=node, runs_dir=runs_dir, run_id=run_id,
             subdir=subdir, optimize=optimize, backend=backend, reuse_image=reuse_image,
@@ -1625,6 +1658,7 @@ async def propagate_reuses(
     reuses: list[Node],
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Re-derive every `reuses` node from `canonical_id`'s raw Trellis mesh —
     rescaling it into each reuse's own bbox/orientation and optimizing into the
@@ -1633,16 +1667,22 @@ async def propagate_reuses(
     every object that shares it within this generated `version`. Awaited under
     the caller's cell task, so a cancellation there tears the fan-out down via
     the gather."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{canonical_id}.raw.glb"
+    slot = logging.current_slot_id()
 
     async def _one(node: Node) -> None:
         # Lock per reuse so a concurrent whole-scene generate (or another regen)
-        # of the same node can't write its files at the same time.
-        async with node_lock(run_id, node.id):
-            await _rescale_reuse_from_raw(
-                node, src_raw=src_raw, raw_dir=raw_dir, opt_dir=opt_dir, source_id=canonical_id,
-            )
+        # of the same node can't write its files at the same time. Surfaces in the
+        # queue panel nested under its canonical while it re-derives.
+        mesh_jobs.mark_processing(slot, node.id, canonical=canonical_id)
+        try:
+            async with node_lock(run_id, version, node.id):
+                await _rescale_reuse_from_raw(
+                    node, src_raw=src_raw, raw_dir=raw_dir, opt_dir=opt_dir, source_id=canonical_id,
+                )
+        finally:
+            mesh_jobs.unmark_queued(slot, node.id)
 
     coros = [_one(node) for node in reuses]
     if coros:
@@ -1653,6 +1693,7 @@ async def clone_canonical_raw(
     *,
     runs_dir: Path,
     run_id: str,
+    version: str,
     source_id: str,
     dest_id: str,
 ) -> bool:
@@ -1664,9 +1705,9 @@ async def clone_canonical_raw(
     canonical regenerates fresh. Runs under `dest_id`'s node lock so it can't race
     a concurrent build/regen of that node. Returns whether the raw was copied (a
     missing source raw is logged and skipped)."""
-    raw_dir, _opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, _opt_dir = generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{source_id}.raw.glb"
-    async with node_lock(run_id, dest_id):
+    async with node_lock(run_id, version, dest_id):
         if not src_raw.exists():
             logging.log("prefab.reuse_missing", id=dest_id, source=source_id)
             return False
@@ -1678,7 +1719,7 @@ async def clone_canonical_raw(
 
 
 def recover_group_image(
-    runs_dir: Path, run_id: str, target_id: str, group_ids: list[str],
+    runs_dir: Path, run_id: str, version: str, target_id: str, group_ids: list[str],
 ) -> bool:
     """Best-effort restore of a node's reference image (the raw-dir `<id>.png` a
     from-image rebuild reads) when that copy is missing but the same image still
@@ -1690,7 +1731,7 @@ def recover_group_image(
     So if `<id>.png` is gone we restore it from the first of those that exists,
     letting a from-image rebuild proceed without re-generating. Returns True if the
     raw-dir image is present afterward (already there, or recovered), else False."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     target_png = raw_dir / f"{target_id}.png"
     if target_png.exists():
         return True
@@ -1711,6 +1752,7 @@ async def unsymmetrize_one(
     node: Node,
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Rebuild a generated object's served mesh from its OWN raw mesh with NO
     symmetry mirror — i.e. reveal the full, un-mirrored model the mirror was
@@ -1721,9 +1763,9 @@ async def unsymmetrize_one(
     A missing raw (e.g. a prefab reuse with no own raw) is logged and skipped —
     the caller un-symmetrizes the canonical and propagates instead. Runs under the
     node lock so it can't race a concurrent scene build or regen of the same node."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{node.id}.raw.glb"
-    async with node_lock(run_id, node.id):
+    async with node_lock(run_id, version, node.id):
         if not src_raw.exists():
             logging.log("symmetry.skip", id=node.id, reason="unsymmetrize: no raw mesh on disk")
             return
@@ -1754,10 +1796,11 @@ async def unsymmetrize_one(
 async def symmetrize_one(
     *,
     node: Node,
-    cut_plane: Literal["xy", "xz"],
+    cut_plane: Literal["xy", "xz", "yz"],
     keep_positive: bool,
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Mirror a generated object's served mesh across `cut_plane`, keeping the
     `keep_positive` half — the symmetrize counterpart to `unsymmetrize_one`. The
@@ -1771,9 +1814,9 @@ async def symmetrize_one(
     resume / regeneration / prefab-reuse replays the same mirror and direction. A
     missing raw (e.g. a prefab reuse with no own raw) is logged and skipped — the
     caller symmetrizes the canonical and propagates. Runs under the node lock."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{node.id}.raw.glb"
-    async with node_lock(run_id, node.id):
+    async with node_lock(run_id, version, node.id):
         if not src_raw.exists():
             logging.log("symmetry.skip", id=node.id, reason="symmetrize: no raw mesh on disk")
             return
@@ -1808,6 +1851,7 @@ async def reorient_one(
     degrees: int,
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Change a generated object's "front view" — which face points along +Z in
     the raw, pre-transform mesh — by rotating its RAW mesh 90° (a `degrees`
@@ -1826,26 +1870,16 @@ async def reorient_one(
     if degrees % 90 != 0:
         logging.log("mesh.error", id=node.id, message=f"reorient: degrees must be a multiple of 90, got {degrees}")
         return
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{node.id}.raw.glb"
     rescaled = raw_dir / f"{node.id}.glb"
-    async with node_lock(run_id, node.id):
+    async with node_lock(run_id, version, node.id):
         if not src_raw.exists():
             logging.log("mesh.reorient_skip", id=node.id, reason="no raw mesh on disk")
             return
         # Re-apply the object's CURRENT symmetry when re-deriving, so re-fronting
-        # composes with an existing mirror (read from the canonical's log, like
-        # `_rescale_reuse_from_raw`) instead of silently dropping it.
-        cut_plane: Literal["none", "xy", "xz"] = "none"
-        keep_positive: bool | None = None
-        applied = logging.find_event("symmetry.applied", id=node.id)
-        if applied is not None:
-            raw_cp = applied.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
-                cut_plane = raw_cp  # type: ignore[assignment]
-            raw_keep = applied.get("keep_positive")
-            if isinstance(raw_keep, bool):
-                keep_positive = raw_keep
+        # composes with an existing mirror instead of silently dropping it.
+        cut_plane, keep_positive = symmetry.applied_state(node.id)
         try:
             async with _MESH_IO:
                 raw_scene = await asyncio.to_thread(trimesh.load, src_raw)
@@ -1883,6 +1917,7 @@ async def glassify_one(
     node: Node,
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Force the window/glass transparency transform onto ONE generated object's
     served mesh, bypassing the pipeline's keyword + symmetry gates. The per-node
@@ -1903,9 +1938,9 @@ async def glassify_one(
     / reset rebuilds from raw and drops the transparency. Runs under the node lock
     so it can't race a scene build / regen of the same node. A missing served mesh,
     or one with no white texels / no base-color texture, is logged and skipped."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     rescaled = raw_dir / f"{node.id}.glb"
-    async with node_lock(run_id, node.id):
+    async with node_lock(run_id, version, node.id):
         if not rescaled.exists():
             logging.log("mesh.glass_skip", id=node.id, reason="no served mesh on disk")
             return
@@ -1938,6 +1973,7 @@ async def glassify_group(
     nodes: list[Node],
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Force the glass-transparency transform onto every node in a prefab group
     (the canonical + its reuses), each on its OWN served mesh via `glassify_one`.
@@ -1947,7 +1983,10 @@ async def glassify_group(
     the transparency). Instead each member is transformed directly — they share the
     canonical's geometry + texture, so the same white texels are cut on each. Runs
     members concurrently; each `glassify_one` takes its own node lock."""
-    coros = [glassify_one(node=n, runs_dir=runs_dir, run_id=run_id) for n in nodes]
+    coros = [
+        glassify_one(node=n, runs_dir=runs_dir, run_id=run_id, version=version)
+        for n in nodes
+    ]
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
 
@@ -1957,6 +1996,7 @@ async def reset_from_raw_one(
     node: Node,
     runs_dir: Path,
     run_id: str,
+    version: str,
 ) -> None:
     """Rebuild a generated object's served mesh from its pristine raw Trellis
     output, discarding any in-place served-mesh edit (notably a forced glass
@@ -1970,26 +2010,16 @@ async def reset_from_raw_one(
     the edit. A missing raw (e.g. a prefab reuse, which owns no raw) is logged and
     skipped — the caller resets the canonical and re-derives reuses via
     `propagate_reuses`. Runs under the node lock."""
-    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{node.id}.raw.glb"
     rescaled = raw_dir / f"{node.id}.glb"
-    async with node_lock(run_id, node.id):
+    async with node_lock(run_id, version, node.id):
         if not src_raw.exists():
             logging.log("mesh.reset_skip", id=node.id, reason="no raw mesh on disk")
             return
-        # Re-apply the object's CURRENT symmetry when re-deriving (read from the
-        # log, like reorient/_rescale_reuse_from_raw), so reset keeps the mirror
-        # instead of silently dropping it.
-        cut_plane: Literal["none", "xy", "xz"] = "none"
-        keep_positive: bool | None = None
-        applied = logging.find_event("symmetry.applied", id=node.id)
-        if applied is not None:
-            raw_cp = applied.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
-                cut_plane = raw_cp  # type: ignore[assignment]
-            raw_keep = applied.get("keep_positive")
-            if isinstance(raw_keep, bool):
-                keep_positive = raw_keep
+        # Re-apply the object's CURRENT symmetry when re-deriving, so reset keeps
+        # the mirror instead of silently dropping it.
+        cut_plane, keep_positive = symmetry.applied_state(node.id)
         try:
             async with _MESH_IO:
                 scene = await asyncio.to_thread(trimesh.load, src_raw)
@@ -2030,6 +2060,28 @@ def cancel_pending(run_id: str) -> None:
         t.cancel()
 
 
+def _next_object_cap() -> int | None:
+    """Optional ceiling on how many `next_object` ROUNDS an anchor zone runs —
+    each round being one `next_object` LLM call that proposes objects plus the
+    single `object_bbox_batch` that places them (the anchor_decompose pass that
+    precedes the loop is never counted).
+
+    Read live from `STARSHOT_NEXT_OBJECT_CAP` so it can change between runs
+    without a restart. Unset, non-numeric, or negative → UNCAPPED (loop until the
+    model itself says the zone is complete); `0` → run no rounds at all; `N` →
+    stop after N placing rounds. The cap is checked BEFORE issuing each call, so a
+    capped loop never spends an extra `next_object` call just to read the model's
+    stop signal — at the cap it moves straight to the next pipeline step."""
+    raw = os.environ.get("STARSHOT_NEXT_OBJECT_CAP", "").strip()
+    if not raw:
+        return None
+    try:
+        cap = int(raw)
+    except ValueError:
+        return None
+    return cap if cap >= 0 else None
+
+
 async def run(
     *,
     zone: Node,
@@ -2066,13 +2118,22 @@ async def run(
         return
 
     # Resume: replay the anchor completion loop's already-committed object
-    # decisions in order (re-resolving from the log, re-spawning only the
-    # meshes still missing), then stop if the loop had run to completion.
-    # Otherwise fall through and continue from the frontier with fresh
-    # `next_object` decisions.
-    for spec in committed.next_object_specs(zone.id):
+    # decisions, re-solving each ROUND's objects together in one
+    # `object_bbox_batch` exactly as they were placed live. Grouping by round
+    # reproduces that call's prompt so the placement replays from the LLM cache
+    # instead of re-billing each object in its own single-object call, and keeps
+    # intra-round parent/relationship resolution intact. Then stop if the loop
+    # had run to completion; otherwise fall through to fresh `next_object`
+    # rounds.
+    #
+    # Optional next_object round cap (see `_next_object_cap`). Rounds already
+    # committed — replayed just below on resume — count toward it, so a resumed
+    # capped run can't overshoot the ceiling a prior process already reached.
+    cap = _next_object_cap()
+    rounds = 0
+    for group in committed.next_object_rounds(zone.id):
         replayed = await _resolve_and_generate(
-            specs=[spec],
+            specs=group,
             zone=zone,
             all_nodes=all_nodes,
             scenario="anchor",
@@ -2080,6 +2141,7 @@ async def run(
             run_id=run_id,
         )
         all_nodes.extend(replayed)
+        rounds += 1
     if committed.next_done(zone.id):
         return
 
@@ -2093,11 +2155,28 @@ async def run(
     # loop; a round that proposes only already-attempted ids means no progress
     # is possible — stop.
     #
-    # The model proposes a LIST of objects per round. Each accepted object is
-    # committed as its own `generation.next` event so resume replays them one
-    # at a time regardless of how they were proposed.
+    # The model proposes a LIST of objects per round; each accepted object is
+    # committed as its own `generation.next` event. Those per-round blocks are
+    # written contiguously, so a resume regroups them (see
+    # `committed.next_object_rounds`) and re-solves each round in one
+    # `object_bbox_batch` rather than one call per object.
     attempted: set[str] = set()
     while True:
+        # Cap reached: stop WITHOUT issuing another `next_object` call — the
+        # requirement is that a cap of N places objects across N rounds and then
+        # moves on, never spending an extra call just to fetch the model's stop
+        # signal. Recorded as a third terminal exit alongside `.done`/`.stuck` so
+        # resume/rewind/fork treat the zone as complete (see `committed.next_done`)
+        # rather than re-entering the loop.
+        if cap is not None and rounds >= cap:
+            logging.log_once(
+                "generation.next.capped",
+                match_fields=("zone",),
+                zone=zone.id,
+                cap=cap,
+                rounds=rounds,
+            )
+            return
         done, objects = await _next_object_batch(
             zone=zone,
             all_nodes=all_nodes,
@@ -2136,3 +2215,4 @@ async def run(
             run_id=run_id,
         )
         all_nodes.extend(new_nodes)
+        rounds += 1

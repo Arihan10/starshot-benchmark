@@ -67,8 +67,15 @@ from app.services import llm, prefabs, refcapture, threed
 from app.services import proxy as proxy_svc
 from app.services import publish as publish_svc
 from app.services import symmetry as sym_svc
+from app.utils import boardcache, cellsummary, flightlog, runclock
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
+from app.utils.cellsummary import (
+    cap_override_value as _cap_override_value,
+    cell_spend as _cell_spend,
+    last_step as _last_step,
+    usage_summary as _usage_summary,
+)
 
 # The repo root (this file is server/app/api/routes.py). It holds both the
 # top-level `splat/` package and `starshot_paths`, outside the server's `app`
@@ -225,11 +232,17 @@ RUN_META_NAME = "run.json"
 # Keyed by (run_name, slot_id, model_alias). Each cell is an independent
 # pipeline. Lazy-populated: only runs the user has activated are loaded.
 RunKey = tuple[str, str, str]
-# The from-scratch generated build of a cell keys its task tables on
-# (run, slot, model) — one build per cell, separate from the library build.
-GenKey = tuple[str, str, str]
+# The from-scratch generated build keys its task tables on
+# (run, slot, model, gen_version) — one build PER VERSION of a cell, separate from
+# the library build. A cell can hold many independent generated versions; each
+# builds / regenerates concurrently under its own key, log, and dirs.
+GenKey = tuple[str, str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
+# Per-cell background "graceful pause" drainers (see /pause-soft): each waits for
+# the cell's in-flight LLM calls to finish + commit, then cancels the idle task
+# and stamps run.paused. Aborted by any hard cancel / relaunch (see _cancel_task).
+_soft_pause_tasks: dict[RunKey, asyncio.Task[None]] = {}
 _retry_tasks: set[asyncio.Task[None]] = set()
 # In-flight "generate from-scratch assets" task per (cell, version). Drives the
 # client's generate gate (a version can't re-trigger until its current build
@@ -275,12 +288,13 @@ _branch_hydration_errors: dict[str, str] = {}
 _splat_stage1_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage1_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
-# --- lite-asset build jobs (background, one per CELL) -------------------------
-# A cell's generated raw build -> objects-generated-lite/ via build_lite_assets.py.
+# --- lite-asset build jobs (background, one per generated VERSION) ------------
+# One version's raw build -> its objects-generated-lite/ via build_lite_assets.py.
 # The task streams the driver's "[i/N]" progress into the job dict the status
-# endpoint serves.
-_lite_build_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
-_lite_build_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+# endpoint serves. Keyed by (run, slot, model, version) so two versions of the
+# same cell build independently.
+_lite_build_jobs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+_lite_build_tasks: dict[tuple[str, str, str, str], asyncio.Task[None]] = {}
 
 # --- Stage 2 free-space voxelization jobs (background, one per CELL) ----------
 # The shared spatial foundation (Option A, runs first): the cell's splat tier
@@ -487,9 +501,16 @@ _COST_BACKFILL_INTERVAL_S = 20
 
 
 def _all_cost_logs() -> list[SlotLog]:
-    """Snapshot of every in-memory cell + branch log to sweep (the sweep awaits,
-    and these registries can change under it)."""
-    return [*_slot_logs.values(), *(b.log for b in _branches.values())]
+    """Snapshot of the cell + branch logs to sweep for unpriced OpenRouter costs.
+    Only logs whose events are already LOADED are included: an unloaded cell
+    would be force-parsed just to be scanned (defeating lazy hydration), and its
+    costs settled before it went idle — a reactivation reloads it, so a later
+    sweep catches anything genuinely left. (The sweep awaits, and these
+    registries can change under it, so this is a snapshot.)"""
+    return [
+        sl for sl in (*_slot_logs.values(), *(b.log for b in _branches.values()))
+        if sl.loaded
+    ]
 
 
 async def _cost_backfill_loop() -> None:
@@ -503,6 +524,34 @@ async def _cost_backfill_loop() -> None:
         except Exception:
             pass  # best-effort observability — never let the sweep die
         await asyncio.sleep(_COST_BACKFILL_INTERVAL_S)
+
+
+# Cap enforcement is polled separately from the (network-bound) cost sweep above,
+# and much more often, because the sweep's per-cost hook only fires when an
+# OpenRouter cost SETTLES. A cell spending purely on token-priced compat models
+# (kimi-k3 / qwen / longcat — priced inline at call time, no OpenRouter
+# generation to settle) would otherwise never trip the cap. This loop closes
+# that gap cheaply (in-memory events only, no network).
+_CAP_ENFORCE_INTERVAL_S = 5
+
+
+async def _cap_enforce_loop() -> None:
+    """Re-check every LIVE cell's settled spend against its cap and pause any that
+    has crossed it — the same soft tripwire `_enforce_cap_for_log` applies on cost
+    settle, just polled so token-priced spend enforces too. Only touches cells
+    with a live task (few, and always loaded), so it's cheap."""
+    while True:
+        try:
+            if SPEND_CAP_USD > 0:
+                for key, task in list(_tasks.items()):
+                    if not _live(task):
+                        continue
+                    sl = _slot_logs.get(key)
+                    if sl is not None:
+                        await _enforce_cap_for_log(sl)
+        except Exception:
+            pass  # a cap-check fault must never kill the loop
+        await asyncio.sleep(_CAP_ENFORCE_INTERVAL_S)
 
 
 async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
@@ -533,6 +582,66 @@ async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
         spend=_cell_spend(events),
         cap=_effective_cap(events),
     )
+
+
+# --- run clock ----------------------------------------------------------------
+# A cell's runtime is MEASURED here, not derived from its log: the span from its
+# first event to `run.done` also contains every pause, gate park, and
+# crash-to-resume gap, and the log can't even identify those (a resume truncates
+# the trailing `run.paused`, a crash leaves nothing, and a multi-minute silence is
+# just as likely to be one long call as a stopped pipeline). So a heartbeat is
+# appended for each cell that is actually executing, and `runclock.read` folds
+# them back — see `app/utils/runclock.py` for why the GAPS are what make it
+# accurate.
+
+
+async def _clock_loop() -> None:
+    """Heartbeat every executing cell, once per `runclock.TICK_S`. "Executing" is
+    exactly what `derive_status` reports as `running` — a live task not parked at
+    a step gate — so the clock advances precisely while the dashboard shows the
+    cell running, and stops for a pause, a cap trip, a parked gate, or a killed
+    process without any of them having to notify it."""
+    while True:
+        try:
+            for key, task in list(_tasks.items()):
+                if _live(task) and not _gate_awaiting(_cell_gates.get(key)):
+                    runclock.tick(_run_id(*key))
+        except Exception:
+            pass  # a clock fault must never kill the loop
+        await asyncio.sleep(runclock.TICK_S)
+
+
+# Idle-unload sweep: how often it runs, and how long a cell must go untouched (no
+# API access) before its in-memory events are dropped. Slim-in-memory already caps
+# a loaded cell at ~2% of its log; this is the secondary reclaim that returns even
+# that to disk once a cell has no open stream, no running work, and hasn't been
+# viewed for a while — so an idle server (all tabs closed) settles back near zero.
+_IDLE_UNLOAD_INTERVAL_S = 60
+_IDLE_UNLOAD_AFTER_S = 300
+
+
+async def _idle_unload_loop() -> None:
+    """Unload the event buffer of cells that are loaded but idle: no SSE subscriber,
+    no live pipeline task / step gate / draining soft-pause, and untouched for
+    `_IDLE_UNLOAD_AFTER_S`. `hydrate_from_disk` resets the SlotLog to lazy and the
+    next access re-parses from disk, so this is purely a memory reclaim. Branch logs
+    (short-lived, not in `_slot_logs`) are left alone."""
+    while True:
+        await asyncio.sleep(_IDLE_UNLOAD_INTERVAL_S)
+        try:
+            now = time.monotonic()
+            for key, sl in list(_slot_logs.items()):
+                if not sl.loaded or sl.subscribers:
+                    continue
+                if _live(_tasks.get(key)) or _live(_soft_pause_tasks.get(key)):
+                    continue
+                if _cell_gates.get(key) is not None:
+                    continue
+                if now - sl._touched < _IDLE_UNLOAD_AFTER_S:
+                    continue
+                sl.hydrate_from_disk()
+        except Exception:
+            pass  # a sweep fault must never kill the loop
 
 
 _cell_gates: dict[RunKey, "CellGate"] = {}
@@ -688,17 +797,6 @@ def _gate_awaiting(gate: "CellGate | None") -> bool:
     """True when a step gate is parked before its next call — surfaced as
     paused/awaiting (the awaited step is the gate's `pending`)."""
     return gate is not None and gate.pending is not None
-
-
-def _cell_status(key: RunKey, slot_log: SlotLog) -> str:
-    """Live status of a source cell — its event log refined by its live
-    gate (awaiting), task (running), and settled spend vs. its cap (capped)."""
-    return rlog.derive_status(
-        slot_log.state["events"],
-        awaiting=_gate_awaiting(_cell_gates.get(key)),
-        live=_live(_tasks.get(key)),
-        capped=_cap_reached(slot_log.state["events"]),
-    )
 
 
 def _branch_status(br: "Branch") -> str:
@@ -909,6 +1007,19 @@ class AbTestRequest(BaseModel):
     include_overall_bbox: bool = False
 
 
+class SeedStartRequest(BaseModel):
+    """Start the target cell (the path `slot_id`/`model_alias` on `run`) seeded
+    with ANOTHER cell's ROOT zone plan + overall bounding box. The source cell
+    (`source_slot`, `source_model`) on the same run is copied through its root
+    `divider.zone_plan` and root `bbox` and no further; the target then replays
+    that fixed plan + canvas verbatim and re-derives everything inside it under
+    the TARGET scene's own prompt + model. Source and target may differ in slot
+    and/or model. The source cell is left untouched."""
+
+    source_slot: str
+    source_model: str
+
+
 class CopySlotRequest(BaseModel):
     """Copy an entire slot folder (all its model cells + meshes) from
     `source_run` into the destination run (the path `run`), OVERWRITING the
@@ -1021,11 +1132,28 @@ def _branch_run_id(run: str, branch_id: str) -> str:
     return f"{run}/{BRANCHES_SUBDIR}/{branch_id}"
 
 
-def _gen_slot_id(run: str, slot_id: str, model_alias: str) -> str:
-    """SlotLog id for a cell's generated build — used as the bound log's slot_id
-    and the Trellis queue key, so the generated build never collides with the
-    library build on either."""
-    return f"{_run_id(run, slot_id, model_alias)}::generated"
+def _gen_slot_id(run: str, slot_id: str, model_alias: str, version: str) -> str:
+    """SlotLog id for one generated VERSION of a cell — used as the bound log's
+    slot_id and the Trellis queue key, so the generated build never collides with
+    the library build, and each version's queue / SSE stream is isolated from the
+    others."""
+    return f"{_run_id(run, slot_id, model_alias)}::generated::v{version}"
+
+
+def _resolve_gen_version(
+    run_id: str, version: str | None = None, *, new: bool = False,
+) -> str:
+    """The generated version a request targets, after folding any pre-versioning
+    build into generated/1/ (the non-versioned back-compat path — idempotent, so
+    it's safe to call on every touch). `new` mints the next version; an explicit
+    `version` is honored; otherwise the latest existing, or "1" when the cell has
+    no generated build yet."""
+    generation.migrate_legacy_generated(RUNS_DIR, run_id)
+    if new:
+        return generation.next_generated_version(RUNS_DIR, run_id)
+    if version:
+        return str(version)
+    return generation.latest_generated_version(RUNS_DIR, run_id) or "1"
 
 
 # Parsed symmetry state per generated-events log, cached on the file's
@@ -1039,8 +1167,9 @@ _gen_symmetry_cache: dict[
 def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
     """Map node id -> {'plane': current symmetry plane, 'was': prior mirror plane}.
 
-    'plane' is 'xy'/'xz' when the served mesh is mirrored across that plane, else
-    'none'. 'was' separates the two un-mirrored cases the client must tell apart:
+    'plane' is the plane the served mesh is mirrored across (see
+    `symmetry.CUT_PLANES`), else 'none'. 'was' separates the two un-mirrored
+    cases the client must tell apart:
     a node un-symmetrized after being mirrored ('plane'='none', 'was'= its old
     plane) vs one that was never symmetrized ('plane'='none', 'was'=None).
 
@@ -1074,7 +1203,7 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
     def _set_plane(nid: str, cut_plane: str, idx: int) -> None:
         entry = applied.setdefault(nid, {"plane": "none", "was": None})
         entry["plane"] = cut_plane
-        if cut_plane in ("xy", "xz"):
+        if cut_plane in sym_svc.MIRROR_PLANES:
             entry["was"] = cut_plane
         applied_idx[nid] = idx
 
@@ -1093,7 +1222,7 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
                 continue
             if kind == "symmetry.applied":
                 cut_plane = event.get("cut_plane")
-                if cut_plane in ("none", "xy", "xz"):
+                if cut_plane in sym_svc.CUT_PLANES:
                     _set_plane(node_id, cut_plane, idx)
             elif kind == "symmetry.decision" and "applied" in event:
                 # Legacy combined event: older builds recorded the plane AND whether
@@ -1104,7 +1233,9 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
                 cut_plane = event.get("cut_plane")
                 _set_plane(
                     node_id,
-                    cut_plane if (event.get("applied") and cut_plane in ("xy", "xz")) else "none",
+                    cut_plane
+                    if (event.get("applied") and cut_plane in sym_svc.MIRROR_PLANES)
+                    else "none",
                     idx,
                 )
             elif kind == "prefab.match":
@@ -1206,6 +1337,234 @@ def _generated_image_prompts(events_path: Path) -> dict[str, str]:
                 prompts[node_id] = prompt
     _gen_image_prompt_cache[events_path] = (sig, prompts)
     return prompts
+
+
+# Backend scopes whose `<scope>.submit` / `.done` / `.abandoned` events the failure
+# fold tracks. Explicit, so an unrelated `<something>.submit` (Nano-Banana's, say)
+# can never be mistaken for a mesh job that owes us a result.
+_MESH_SCOPES = frozenset({"trellis", "hunyuan", "hunyuan_tencent"})
+
+# Events that mean "this node now has a good served mesh", clearing any earlier
+# failure. Needed because a regenerate is non-destructive and appends: without
+# them, an object that failed once would read as failed forever.
+_GEN_RECOVERY_KINDS = frozenset({
+    "model",
+    "prefab.reuse_derived",
+    "symmetry.symmetrized",
+    "symmetry.unsymmetrized",
+    "mesh.reorient",
+    "mesh.reset",
+})
+
+_gen_failure_cache: dict[Path, tuple[tuple[int, int], dict[str, dict[str, object]]]] = {}
+
+
+def _generated_failures(events_path: Path) -> dict[str, dict[str, object]]:
+    """Map node id -> why its last build attempt did not deliver a mesh, folded
+    from one generated version's log. Nodes whose latest word is a success are
+    absent, so this is the CURRENT failure set rather than a history.
+
+    Every way a generated object can come up empty is folded here, because each
+    used to be silent in its own way:
+
+      * `mesh.error`             — the build raised (backend failure, a bad GLB,
+                                   Nano-Banana, disk full).
+      * `prefab.reuse_missing`   — the object shares a mesh with a canonical that
+                                   never produced one, so it is collateral damage
+                                   from a different object's failure.
+      * `generate.optimize_error`— the mesh built fine and the optimizer dropped
+                                   it, so nothing reaches the served view.
+      * `<scope>.abandoned`      — the job ended with no `<scope>.done` (see
+                                   `mesh_jobs.log_abandoned`), which is how a
+                                   cancelled task now announces itself.
+      * a `<scope>.submit` with no terminal event at all — the process died
+                                   mid-job. The `.abandoned` event covers this
+                                   going forward; the fold still infers it so
+                                   logs written before that event existed, and
+                                   hard kills, are not silently clean.
+
+    Latest event per node wins, so a resubmit clears a prior failure (the retry
+    gets to speak for itself) and a failure after a success supersedes it.
+    Cached on the file's (mtime_ns, size) like the sibling folds, since the gate
+    status polls this every ~1.5s while a build runs."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _gen_failure_cache.get(events_path)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+
+    failed: dict[str, dict[str, object]] = {}
+    # Node -> the backend job we saw submitted and have not yet seen accounted
+    # for. Any terminal event clears it; what survives the fold is a job whose
+    # process exited before it could log one.
+    open_submit: dict[str, dict[str, object]] = {}
+
+    with events_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = str(event.get("kind") or "")
+            scope, _, verb = kind.partition(".")
+            if scope in _MESH_SCOPES and verb in ("submit", "done", "abandoned"):
+                # Backend lifecycle events key the node by `job_id`; `task_id` is
+                # the backend's own id for the run.
+                node_id = event.get("job_id")
+                if not isinstance(node_id, str):
+                    continue
+                if verb == "submit":
+                    open_submit[node_id] = {
+                        "backend": scope,
+                        "taskId": event.get("task_id"),
+                        "at": event.get("ts"),
+                    }
+                    failed.pop(node_id, None)
+                    continue
+                open_submit.pop(node_id, None)
+                if verb == "done":
+                    failed.pop(node_id, None)
+                else:
+                    failed[node_id] = {
+                        "kind": "abandoned",
+                        "message": str(
+                            event.get("reason") or "ended without returning a result",
+                        ),
+                        "backend": scope,
+                        "taskId": event.get("task_id"),
+                        "at": event.get("ts"),
+                    }
+                continue
+
+            node_id = event.get("id")
+            if not isinstance(node_id, str):
+                continue
+            if kind == "mesh.error":
+                open_submit.pop(node_id, None)
+                failed[node_id] = {
+                    "kind": "mesh",
+                    "message": str(event.get("message") or "mesh build failed"),
+                    "at": event.get("ts"),
+                }
+            elif kind == "prefab.reuse_missing":
+                source = str(event.get("source") or "")
+                failed[node_id] = {
+                    "kind": "reuse",
+                    "message": (
+                        f"shares a mesh with {source}, which never produced one"
+                        if source
+                        else "shares a mesh with an object that never produced one"
+                    ),
+                    "source": source,
+                    "at": event.get("ts"),
+                }
+            elif kind == "generate.optimize_error":
+                failed[node_id] = {
+                    "kind": "optimize",
+                    "message": str(event.get("message") or "asset optimizer failed"),
+                    "at": event.get("ts"),
+                }
+            elif kind in _GEN_RECOVERY_KINDS:
+                failed.pop(node_id, None)
+
+    for node_id, info in open_submit.items():
+        if node_id in failed:
+            continue
+        failed[node_id] = {
+            "kind": "stuck",
+            "message": (
+                f"submitted to {info['backend']} but the build ended before the "
+                "job reported a result"
+            ),
+            **info,
+        }
+    _gen_failure_cache[events_path] = (sig, failed)
+    return failed
+
+
+def _mtime(path: Path) -> float | None:
+    """Epoch-seconds mtime, or None when the file isn't there. Same clock as an
+    event's `ts`, so a caller can ask whether a file predates a logged event."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _generated_failure_rows(
+    events_path: Path,
+    canonical_of: dict[str, str],
+    opt_dir: Path,
+    busy: set[str],
+    *,
+    include_unbuilt: bool,
+) -> list[dict[str, object]]:
+    """`_generated_failures` shaped for the client: newest first, nodes currently
+    rebuilding dropped (their previous failure is being answered right now), and
+    each row tagged with its prefab `canonical` so the panel can group a whole
+    group's collateral damage under the one object that actually failed.
+
+    A failure is dropped when the served mesh on disk is NEWER than the failure —
+    the object was rebuilt afterwards, so the log's last word about it is stale.
+    Mesh mtime is used rather than a success event in the log because the reuse
+    path historically landed a mesh without logging anything at all, which would
+    otherwise leave hundreds of long-since-rebuilt objects reading as failed.
+    (`prefab.reuse_derived` closes that gap for new builds; this keeps the fold
+    honest on every log written before it existed.)
+
+    What survives is either an object with no served mesh, or one whose mesh
+    PREDATES the failure — flagged `stale`, meaning the viewport is still showing
+    the previous asset. That second case is the one that was impossible to notice:
+    a regenerate is non-destructive, so a failed one looks exactly like a
+    successful one on screen.
+
+    `include_unbuilt` adds the objects that were queued (they have a
+    `prefab.match`) but produced neither a mesh nor a single log line. Only passed
+    when nothing is running, since mid-build those are simply not started yet."""
+    logged = _generated_failures(events_path)
+    rows: list[dict[str, object]] = []
+    for node_id, info in logged.items():
+        if node_id in busy:
+            continue
+        at = info.get("at")
+        served_at = _mtime(opt_dir / f"{node_id}.glb")
+        if served_at is not None and (
+            not isinstance(at, (int, float)) or served_at > at
+        ):
+            continue
+        rows.append({
+            **info,
+            "id": node_id,
+            "canonical": canonical_of.get(node_id, node_id),
+            "stale": served_at is not None,
+        })
+    if include_unbuilt:
+        for node_id, canonical in canonical_of.items():
+            if node_id in busy or node_id in logged:
+                continue
+            if (opt_dir / f"{node_id}.glb").exists():
+                continue
+            rows.append({
+                "id": node_id,
+                "kind": "unbuilt",
+                "message": "queued for this build but never started",
+                "canonical": canonical,
+                "at": None,
+                "stale": False,
+            })
+
+    def _recency(row: dict[str, object]) -> tuple[float, str]:
+        at = row.get("at")
+        return (-(at if isinstance(at, (int, float)) else 0.0), str(row["id"]))
+
+    rows.sort(key=_recency)
+    return rows
 
 
 def _ensure_run_hydrated(run: str) -> None:
@@ -1334,6 +1693,24 @@ def _resolve_run(run: str | None) -> str:
     return resolved
 
 
+def _parse_flight_filters(raw: str | None) -> dict[str, list[str]]:
+    """The api-log's facet filters arrive as a JSON object `{facet: [values]}`.
+    Malformed input is treated as no filter rather than erroring the page."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k): [str(x) for x in v]
+        for k, v in data.items()
+        if isinstance(v, list) and v
+    }
+
+
 def _run_meta(run: str) -> dict[str, object]:
     """The run's `run.json` (prompt version name, created_at), or {} for runs
     that predate the file-based prompt versioning."""
@@ -1373,15 +1750,19 @@ def _require_step_event(
     events = slot_log.state["events"]
     if not (0 <= event_index < len(events)):
         raise HTTPException(status_code=400, detail="event_index out of range")
-    event = events[event_index]
-    if event.get("kind") != "cache.llm":
+    slim = events[event_index]
+    if slim.get("kind") != "cache.llm":
         raise HTTPException(status_code=400, detail="event is not an LLM call")
-    if event.get("template") != step:
+    if slim.get("template") != step:
         raise HTTPException(
             status_code=400,
-            detail=f"event is a {event.get('template') or event.get('step')!r} call, not {step!r}",
+            detail=f"event is a {slim.get('template') or slim.get('step')!r} call, not {step!r}",
         )
-    if not isinstance(event.get("variables"), dict):
+    # The in-memory event is slim (prompt/variables bytes offloaded); read the FULL
+    # event from disk — the prompt lab re-run needs its logged `variables` (and the
+    # callers return its system/user/output/reasoning).
+    event = slot_log.read_event_full(event_index)
+    if event is None or not isinstance(event.get("variables"), dict):
         raise HTTPException(
             status_code=409,
             detail="event predates variable logging — re-run the cell to make it testable",
@@ -1874,14 +2255,16 @@ def _placed_count(mesh_dir: Path) -> int:
 _GEN_VARIANTS = ("raw", "lite", "optimized")
 
 
-def _generated_variant_dir(rid: str, variant: str) -> Path:
-    """The generated build dir for a variant: raw (objects-generated), lite
-    (objects-generated-lite), or optimized (objects-generated-optimized)."""
-    raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
+def _generated_variant_dir(rid: str, variant: str, version: str) -> Path:
+    """The dir holding one generated VERSION's assets at one quality VARIANT:
+    raw (objects-generated), lite (objects-generated-lite), or optimized
+    (objects-generated-optimized). Version and variant are orthogonal — every
+    version carries the same three tiers."""
+    raw_dir, opt_dir = generation.generated_dirs(RUNS_DIR, rid, version)
     if variant == "raw":
         return raw_dir
     if variant == "lite":
-        return raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+        return generation.generated_lite_dir(RUNS_DIR, rid, version)
     return opt_dir
 
 
@@ -1925,8 +2308,9 @@ def _generated_asset_dir(run: str, slot: str, model: str) -> Path | None:
     """The generated build's directly-consumable set: the lite KTX2 build when
     present, else the optimized twin, else the raw vanilla build."""
     rid = _run_id(run, slot, model)
-    raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
-    lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+    version = _resolve_gen_version(rid)
+    raw_dir, opt_dir = generation.generated_dirs(RUNS_DIR, rid, version)
+    lite_dir = generation.generated_lite_dir(RUNS_DIR, rid, version)
     for d in (lite_dir, opt_dir, raw_dir):
         if _placed_count(d) > 0:
             return d
@@ -1983,14 +2367,14 @@ def _splat_source_state(run: str, slot: str, model: str) -> dict[str, Any]:
 
 
 async def _run_lite_build(
-    run: str, slot: str, model: str, src_dir: Path, out_dir: Path,
+    run: str, slot: str, model: str, version: str, src_dir: Path, out_dir: Path,
 ) -> None:
-    """Background: build the cell's lite tier (src_dir -> out_dir) via
-    build_lite_assets.py, streaming its "[i/N]" progress into the job dict."""
+    """Background: build one generated version's lite tier (src_dir -> out_dir)
+    via build_lite_assets.py, streaming its "[i/N]" progress into the job dict."""
     import re
     import sys
 
-    key = (run, slot, model)
+    key = (run, slot, model, version)
     job = _lite_build_jobs[key]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -4296,6 +4680,9 @@ async def _run_publish(run: str, slot: str, model: str) -> None:
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # Move uvicorn's per-request access/error logging off the event loop so a
+        # stalled stdout (closed/hidden terminal) can't freeze request handling.
+        rlog.install_nonblocking_stdlib_logging()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         global _current_run
         # Pick a lightweight default for legacy callers, but never hydrate a run
@@ -4324,6 +4711,14 @@ def create_app() -> FastAPI:
         # restart resumes streaming + auto-pulls results instead of orphaning the
         # live GPU containers. Backgrounded so startup never blocks on Modal.
         reattach_task = asyncio.create_task(_reattach_all_modal_jobs())
+        # Poll live cells against their spend cap independently of the cost sweep,
+        # so token-priced (compat) spend enforces the cap too.
+        cap_task = asyncio.create_task(_cap_enforce_loop())
+        # Return idle cells' in-memory event buffers to disk (see _idle_unload_loop).
+        idle_task = asyncio.create_task(_idle_unload_loop())
+        # Heartbeat the executing cells so each one's runtime is durable even if
+        # this process is killed mid-run (see _clock_loop).
+        clock_task = asyncio.create_task(_clock_loop())
         try:
             yield
         finally:
@@ -4332,8 +4727,17 @@ def create_app() -> FastAPI:
             reattach_task.cancel()
             for task in _splat_modal_tasks.values():
                 task.cancel()
+            cap_task.cancel()
+            idle_task.cancel()
+            clock_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cost_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cap_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await idle_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await clock_task
             for slot_log in _slot_logs.values():
                 slot_log.close()
             for run_name, slot_id, model_alias in list(_slot_logs.keys()):
@@ -4710,7 +5114,7 @@ def create_app() -> FastAPI:
             for e in slot_log.state["events"]:
                 if e.get("kind") != "cache.llm" or e.get("template") != step:
                     continue
-                if not isinstance(e.get("variables"), dict):
+                if not e.get("has_variables"):  # slim marker (variables live on disk)
                     continue
                 output = json.dumps(e.get("output"), ensure_ascii=False)
                 items.append(
@@ -4790,6 +5194,10 @@ def create_app() -> FastAPI:
         if match is None:
             where = f"{step} @ {node}" if node else step
             raise HTTPException(status_code=404, detail=f"the branch has not re-run {where} yet")
+        # system/user/reasoning are offloaded from the slim in-memory event — read
+        # the full event from disk by index for them (light fields stay from `match`).
+        idx = match.get("index")
+        full = (br.log.read_event_full(idx) if isinstance(idx, int) else None) or match
         return {
             "branch": branch_id,
             "slot": br.slot,
@@ -4798,10 +5206,10 @@ def create_app() -> FastAPI:
             "index": match.get("index"),
             "node": match.get("node"),
             "model_id": match.get("model"),
-            "system": match.get("system"),
-            "user": match.get("user"),
-            "output": match.get("output"),
-            "reasoning": match.get("reasoning"),
+            "system": full.get("system"),
+            "user": full.get("user"),
+            "output": full.get("output"),
+            "reasoning": full.get("reasoning"),
             "tokens_in": match.get("tokens_in"),
             "tokens_out": match.get("tokens_out"),
         }
@@ -4809,11 +5217,14 @@ def create_app() -> FastAPI:
     @app.get("/slots")
     async def list_slots(run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
+        # One read of the run's board cache for the whole poll (not one SQLite
+        # open per cell), freshness-checked per cell in `_cell_summary`.
+        cache_rows = boardcache.load_all(_run_dir(run))
         return {
             "run": run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
-            "slots": [_slot_summary(s, run) for s in SLOTS],
+            "slots": [_slot_summary(s, run, cache_rows) for s in SLOTS],
         }
 
     @app.get("/runs/{run}/splat/cells")
@@ -6081,6 +6492,77 @@ def create_app() -> FastAPI:
             "entries": threed.queue_snapshot(),
         }
 
+    @app.get("/flights")
+    async def flights(  # pyright: ignore[reportUnusedFunction]
+        run: str | None = None, cursor: str | None = None, limit: int = 100, filters: str | None = None,
+    ) -> dict[str, object]:
+        """One keyset page (newest first, 100 by default) of a run's first-party
+        LLM request ledger (`app.utils.flightlog`), unified across the run's
+        per-scene SQLite DBs via ATTACH. Metadata only — prompt bytes are fetched
+        lazily via `/flights/detail`."""
+        limit = max(1, min(limit, 200))
+        return await asyncio.to_thread(
+            flightlog.page, _resolve_run(run), cursor=cursor, limit=limit,
+            filters=_parse_flight_filters(filters),
+        )
+
+    @app.get("/flights/detail")
+    async def flight_detail(scene: str, id: int) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The exact system/user prompt + model output for ONE request row, read
+        straight from its scene DB (never from `events.jsonl`)."""
+        data = await asyncio.to_thread(flightlog.detail, scene, id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="no prompt captured for this request")
+        return data
+
+    @app.get("/flights/facets")
+    async def flight_facets(run: str | None = None, filters: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Per-attribute distinct values + counts (for the filter dropdowns) and
+        the total matching count, computed server-side across the run's scenes."""
+        return await asyncio.to_thread(
+            flightlog.facets, _resolve_run(run), filters=_parse_flight_filters(filters),
+        )
+
+    @app.get("/flights/histogram")
+    async def flight_histogram(run: str | None = None, filters: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Bucketed request counts over the run's time span — the activity chart
+        above the log table, filter-aware."""
+        return await asyncio.to_thread(
+            flightlog.histogram, _resolve_run(run), filters=_parse_flight_filters(filters),
+        )
+
+    @app.get("/flights/locate")
+    async def flight_locate(  # pyright: ignore[reportUnusedFunction]
+        scene: str, generation_id: str | None = None, t_request: float | None = None,
+    ) -> dict[str, object]:
+        """Resolve ONE flight row from a scene's `cache.llm` event (by
+        generation_id or t_request) — the scene→log jump. `scene` is the row's
+        `slot` (`<run>/<slot>/<model>`)."""
+        row = await asyncio.to_thread(
+            flightlog.locate, scene, generation_id=generation_id, t_request=t_request,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="no matching flight for this call")
+        return row
+
+    @app.get("/flights/stream")
+    async def flights_stream(run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """Live SSE tail of new request rows for `run`, filtered by scene prefix.
+        History comes from `/flights`; this only streams rows as they land."""
+        prefix = _resolve_run(run) + "/"
+        q = flightlog.subscribe()
+
+        async def gen() -> AsyncIterator[str]:
+            try:
+                while True:
+                    row = await q.get()
+                    if str(row.get("slot") or "").startswith(prefix):
+                        yield f"data: {json.dumps(row)}\n\n"
+            finally:
+                flightlog.unsubscribe(q)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
     @app.post("/generations/stop")
     async def stop_all_generations() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Preemptively terminate every in-flight generation — process-wide,
@@ -6166,6 +6648,28 @@ def create_app() -> FastAPI:
             media_type="text/event-stream",
         )
 
+    @app.get("/slots/{slot_id}/{model_alias}/events-history")
+    async def slot_events_history(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """The full history backfill for the observability tree, SLIMMED and
+        streamed as NDJSON: every event with `cache.llm` prompt/output/reasoning/
+        variables bytes stripped (see `_slim_event`). This is what lets a multi-GB
+        log's tree load — the client never materializes the raw file as one string
+        — with the heavy bytes fetched per-call via `/event-bytes` on expand."""
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return StreamingResponse(
+            _slim_ndjson(list(slot_log.state["events"])),
+            media_type="application/x-ndjson",
+        )
+
+    @app.get("/slots/{slot_id}/{model_alias}/event-bytes")
+    async def slot_event_bytes(slot_id: str, model_alias: str, index: int, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The heavy bytes for ONE event, fetched on demand when a tree call row is
+        expanded (the slim history/live streams omit them)."""
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return _event_bytes(slot_log, index)
+
     @app.get("/slots/{slot_id}/{model_alias}/scene")
     async def slot_scene(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         # CQRS read model: fold the event log into the minimal renderable scene
@@ -6184,7 +6688,7 @@ def create_app() -> FastAPI:
         return _scene_projection(events)
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True, variant: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True, variant: str | None = None, version: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
@@ -6198,11 +6702,13 @@ def create_app() -> FastAPI:
         # committed BEFORE that event — paired with /scene?until_index for the
         # compare view's "previous" pane (the original's meshes at the fork).
         #
-        # `mode=generated` streams the cell's from-scratch generated build instead
-        # of the library `objects/` — the OPTIMIZED twin (decimated + KTX2 +
-        # Meshopt) by default, the raw bbox-fitted Trellis mesh when `optimized=0`
-        # (the client's side-by-side comparison). _mesh_bundle skips the
-        # `<id>.raw.glb` intermediates, so either dir streams the finished set.
+        # `mode=generated` streams one generated `version` of the cell instead of
+        # the library `objects/` — the OPTIMIZED twin (decimated + KTX2 + Meshopt)
+        # by default, the raw bbox-fitted Trellis mesh when `optimized=0` (the
+        # client's side-by-side comparison). `version` selects which build (the
+        # latest when omitted; a pre-versioning build is folded into v1 first).
+        # _mesh_bundle skips the `<id>.raw.glb` intermediates, so either dir streams
+        # the finished set.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         # `variant=splat` streams the cell's SELECTED splat asset set UNfiltered
@@ -6228,7 +6734,10 @@ def create_app() -> FastAPI:
             events = events[:until_index]
         if mode == "generated":
             rid = _run_id(run, slot_id, model_alias)
-            objects_dir = _generated_variant_dir(rid, _resolve_gen_variant(variant, optimized))
+            gen_version = _resolve_gen_version(rid, version)
+            objects_dir = _generated_variant_dir(
+                rid, _resolve_gen_variant(variant, optimized), gen_version
+            )
         else:
             objects_dir = _objects_dir(cell_dir)
         return StreamingResponse(
@@ -6340,6 +6849,42 @@ def create_app() -> FastAPI:
         slot_log.log("run.paused")
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
+    @app.post("/slots/{slot_id}/{model_alias}/pause-soft")
+    async def slot_pause_soft(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Graceful pause: stop issuing NEW LLM calls but let every in-flight call
+        RETURN and commit first, then pause — unlike /pause, which cancels the task
+        (and its in-flight request) immediately. Returns right away with status
+        "pausing"; a background drainer waits for the in-flight calls to finish,
+        then cancels the now-idle task and stamps run.paused. Because the in-flight
+        calls commit, resume replays them instead of re-running (or re-billing) them.
+        A hard /pause, /reset, or /resume overrides a pending soft pause."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        key = (run, slot_id, model_alias)
+        if not _live(_tasks.get(key)):
+            raise HTTPException(status_code=400, detail="slot is not running")
+        existing = _soft_pause_tasks.get(key)
+        if existing is not None and not existing.done():
+            return {"run": run, "slot_id": slot.id, "model": model_alias, "status": "pausing"}
+        llm.request_soft_pause(slot_log.slot_id)
+
+        async def _drain_then_pause() -> None:
+            try:
+                await llm.await_drain(slot_log.slot_id)
+                # The pipeline may have finished on its own while draining; only
+                # convert to a pause if it's still live.
+                if _live(_tasks.get(key)):
+                    await _cancel_task(run, slot_id, model_alias)
+                    slot_log.log("run.paused")
+            finally:
+                llm.clear_soft_pause(slot_log.slot_id)
+                _soft_pause_tasks.pop(key, None)
+
+        _soft_pause_tasks[key] = asyncio.create_task(_drain_then_pause())
+        return {"run": run, "slot_id": slot.id, "model": model_alias, "status": "pausing"}
+
     @app.post("/slots/{slot_id}/{model_alias}/cap-override")
     async def slot_cap_override(  # pyright: ignore[reportUnusedFunction]
         slot_id: str, model_alias: str, req: CapOverrideRequest, run: str | None = None,
@@ -6351,32 +6896,61 @@ def create_app() -> FastAPI:
         its settled spend, RESUME it (a plain /resume stays refused while capped);
         if it's live and the new ceiling is already breached, stop it the way the
         backfill enforcer would. 400 when the cap system is off, 409 on a cell that
-        hasn't started (nothing to cap) or is complete."""
+        hasn't started (nothing to cap) or is complete.
+
+        Never force-loads the event log: a cell's log can be multiple GB (Kimi at
+        max reasoning), and materializing it here is what used to OOM mid-parse and
+        then leave the cell's state permanently broken (`KeyError: 'events'`). A
+        cell whose events aren't already in memory is read via the bounded
+        streaming reader (off the event loop) and its override is appended straight
+        to disk. Auto-resume — which reloads the whole log — is therefore only done
+        for an already-loaded cell; an unloaded multi-GB cell has its cap set and
+        stays paused for an explicit resume."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         if SPEND_CAP_USD <= 0:
             raise HTTPException(status_code=400, detail="spend cap is disabled")
-        events = slot_log.state["events"]
+        # Loaded cells read/append in memory (kept in sync). An unloaded cell
+        # streams slim events in bounded memory off the loop — the same reader the
+        # board summary uses — and never materializes its (possibly multi-GB) log.
+        loaded = slot_log.loaded
+        if loaded:
+            events = slot_log.state["events"]
+        else:
+            events = await asyncio.to_thread(
+                lambda: list(cellsummary.iter_events(slot_log.events_path))
+            )
         if not any(e.get("kind") == "run.start" for e in events):
             raise HTTPException(status_code=409, detail="cell hasn't started")
         if any(e.get("kind") == "run.done" for e in events):
             raise HTTPException(status_code=409, detail="run is complete")
         new_cap = max(0.0, float(req.cap))
+        spend = _cell_spend(events)
         was_capped = _cap_reached(events)
-        slot_log.log("run.cap_override", cap=new_cap, spend=_cell_spend(events))
+        if loaded:
+            slot_log.log("run.cap_override", cap=new_cap, spend=spend)
+        else:
+            slot_log.append_unloaded("run.cap_override", len(events), cap=new_cap, spend=spend)
         key: RunKey = (run, slot_id, model_alias)
         resumed = False
-        if _cap_reached(events) and _live(_tasks.get(key)):
-            # Lowered below what's already been spent while still running — stop
-            # it now rather than waiting on the next settled cost to trip it.
+        # The override event carries no cost, so settled spend is unchanged and the
+        # new capped state is a direct comparison against the new ceiling — no
+        # re-fold of the (possibly huge) log needed.
+        now_capped = new_cap > 0 and spend >= new_cap
+        if now_capped and _live(_tasks.get(key)):
+            # Lowered below what's already been spent while still running — stop it
+            # now rather than waiting on the next settled cost to trip it. A live
+            # cell's events are in memory, so log() is safe here.
             await _cancel_task(*key)
-            slot_log.log("run.cap_reached", spend=_cell_spend(events), cap=new_cap)
-        elif was_capped and not _cap_reached(events) and not _live(_tasks.get(key)):
+            slot_log.log("run.cap_reached", spend=spend, cap=new_cap)
+        elif was_capped and not now_capped and not _live(_tasks.get(key)) and loaded:
             # The cap was the only thing holding it and the new ceiling clears
             # spend. A stepped cell gets a one-call budget so it advances like a
-            # /step relaunch rather than running free.
+            # /step relaunch rather than running free. Only auto-resumed when the
+            # log is already loaded — resuming reloads the whole log, which a
+            # multi-GB unloaded cell can't afford.
             if key in _stepped_cells:
                 _gate_intents[key] = {"budget": 1}
             await _start_cell(run, slot_id, model_alias)
@@ -6431,24 +7005,33 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
         run: str | None = None,
+        version: str | None = None,
+        new: bool = False,
     ) -> dict[str, object]:
         """The generate gate: build from-scratch (Nano-Banana + a mesh backend)
-        assets for this cell's single generated build (`objects-generated/`),
-        reusing the library build's layout — every object's existing
-        bbox/orientation — so the client's "generated" view is an apples-to-apples
-        swap of matched assets for freshly generated ones.
+        assets for ONE generated `version` of this cell
+        (`generated/<version>/objects-generated/`), reusing the library build's
+        layout — every object's existing bbox/orientation — so the client's
+        "generated" view is an apples-to-apples swap of matched assets for freshly
+        generated ones.
 
-        Resumes in place: meshes already on disk are skipped and bookkeeping lands
-        in events.generated.jsonl. Only one build per cell at a time; re-pressing
-        while it's in flight returns 409 (the gate). The library build (objects/ +
-        events.jsonl) is never touched."""
+        Version selection: `new=true` mints the next version (V1, V2, V3 …) and
+        builds it fresh; an explicit `version` builds/resumes that one; omitting
+        both builds/resumes the latest (a pre-versioning build is folded into V1
+        first). Each version is fully isolated (own dirs + `events.generated.jsonl`).
+
+        Resumes in place: meshes already on disk for the version are skipped and
+        bookkeeping lands in that version's log. Only one build per version at a
+        time; re-pressing while it's in flight returns 409 (the gate). The library
+        build (objects/ + events.jsonl) is never touched."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
         run_id = _run_id(run, slot.id, model_alias)
-        generation.generated_dirs(RUNS_DIR, run_id)[0].mkdir(parents=True, exist_ok=True)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(run_id, version, new=new)
+        generation.generated_dirs(RUNS_DIR, run_id, gen_version)[0].mkdir(parents=True, exist_ok=True)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         in_flight = _generate_tasks.get(key)
         if in_flight is not None and not in_flight.done():
             raise HTTPException(status_code=409, detail="generation already running")
@@ -6466,12 +7049,12 @@ def create_app() -> FastAPI:
                 detail="no scene to generate from; build the library scene first",
             )
 
-        # Dedicated generated-build log for resumable bookkeeping (nano_banana /
-        # threed require a bound SlotLog). Kept apart from the library log so the
-        # asset toggle stays a pure folder switch and the library stream is untouched.
+        # Dedicated per-version log for resumable bookkeeping (nano_banana / threed
+        # require a bound SlotLog). Kept apart from the library log so the asset
+        # toggle stays a pure folder switch and the library stream is untouched.
         gen_log = SlotLog(
-            _gen_slot_id(run, slot.id, model_alias),
-            generation.generated_events_path(RUNS_DIR, run_id),
+            _gen_slot_id(run, slot.id, model_alias, gen_version),
+            generation.generated_events_path(RUNS_DIR, run_id, gen_version),
         )
         gen_log.hydrate_from_disk()
 
@@ -6479,11 +7062,14 @@ def create_app() -> FastAPI:
             prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
             rlog.bind(gen_log)
             try:
-                # Prefab grouping lives in the generated build's log; the library
-                # build never groups (it matches an asset per object as built).
-                decisions = await generation.ensure_scene_prefab_groups(nodes=nodes, run_id=run_id)
+                # Prefab grouping lives in this version's log; the library build
+                # never groups (it matches an asset per object as built).
+                decisions = await generation.ensure_scene_prefab_groups(
+                    nodes=nodes, run_id=run_id, version=gen_version,
+                )
                 await generation.generate_assets(
                     nodes=nodes, decisions=decisions, runs_dir=RUNS_DIR, run_id=run_id,
+                    version=gen_version,
                 )
             finally:
                 gen_log.close()
@@ -6493,6 +7079,8 @@ def create_app() -> FastAPI:
             "run": run,
             "slot_id": slot.id,
             "model": model_alias,
+            "version": gen_version,
+            "versions": generation.list_generated_versions(RUNS_DIR, run_id),
             "nodes": len(nodes),
         }
 
@@ -6503,15 +7091,29 @@ def create_app() -> FastAPI:
         run: str | None = None,
         optimized: bool = True,
         variant: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
-        """Gate state for the client: whether a build/regen is in flight for this
-        cell's generated build and the ids of its finished GLBs. Polled while the
-        "generated" view is active so the client can enable/disable the gate and
-        attach freshly-built meshes one by one as they land."""
+        """Gate state for the client: whether a build/regen is in flight for one
+        generated `version` of this cell and the ids of its finished GLBs. Polled
+        while the "generated" view is active so the client can enable/disable the
+        gate and attach freshly-built meshes one by one as they land. `version`
+        selects which build to report (the latest when omitted; a pre-versioning
+        build is folded into V1 first). The response also carries the full
+        `versions` list + resolved `version` so the client's version selector can
+        populate without a second call.
+
+        `failures` is the per-object account of what did NOT come back (see
+        `_generated_failure_rows`). It is derived from the version's own log, so it
+        survives a restart and is just as accurate when the panel is opened long
+        after the build finished — the generated build writes to its own
+        `events.generated.jsonl`, which no SSE stream carries, so this response is
+        the only way any of it reaches the client."""
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
         rid = _run_id(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(rid, version)
+        versions = generation.list_generated_versions(RUNS_DIR, rid)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         gen_task = _generate_tasks.get(key)
         regen_task = _regen_tasks.get(key)
         regen_queue = _regen_queues.get(key)
@@ -6527,18 +7129,18 @@ def create_app() -> FastAPI:
         # `sym`/`symWas` — the asset's current symmetry plane (none/xy/xz) and, if
         # since un-symmetrized, the plane it used to be mirrored across — so the
         # detail panel tells mirrored / un-symmetrized / never-symmetrized apart.
-        gen_events_path = generation.latest_generated_events_path(RUNS_DIR, rid)
+        gen_events_path = generation.generated_events_path(RUNS_DIR, rid, gen_version)
         sym_map = _generated_symmetry(gen_events_path)
         # node id -> its prefab canonical, so each mesh carries its group. The
         # client buckets meshes by `canonical` to show group membership and offer
         # link / unlink on a single object.
         canonical_of = _generated_prefab(gen_events_path)
         image_prompts = _generated_image_prompts(gen_events_path)
-        raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
-        lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
-        gen_dir = {"raw": raw_dir, "lite": lite_dir, "optimized": opt_dir}[
-            _resolve_gen_variant(variant, optimized)
-        ]
+        raw_dir, opt_dir = generation.generated_dirs(RUNS_DIR, rid, gen_version)
+        lite_dir = generation.generated_lite_dir(RUNS_DIR, rid, gen_version)
+        gen_dir = _generated_variant_dir(
+            rid, _resolve_gen_variant(variant, optimized), gen_version
+        )
 
         def _variant(path: Path) -> tuple[str, int] | None:
             """(url, mtime) for a generated GLB, or None when it isn't on disk."""
@@ -6607,38 +7209,56 @@ def create_app() -> FastAPI:
         # backend) or still queued in this cell's regen worker (not yet dequeued).
         # The client disables per-object actions on these ids so the user can't
         # double-enqueue a node that's already in flight.
-        gen_slot_id = _gen_slot_id(run, slot_id, model_alias)
+        gen_slot_id = _gen_slot_id(run, slot_id, model_alias, gen_version)
         busy: set[str] = threed.inflight_ids(gen_slot_id)
         if regen_queue is not None:
             for job in list(regen_queue._queue):  # type: ignore[attr-defined]
                 busy.add(job.node_id)
+        # A regenerate propagates across a prefab group, so a member is effectively
+        # rebuilding whenever its canonical is. Expanded here — rather than left to
+        # the client, which expands `busy` separately for its own button state — so
+        # a group being fixed right now doesn't flash its old failures.
+        rebuilding = set(busy)
+        for mesh_id, canonical_id in canonical_of.items():
+            if canonical_id in busy:
+                rebuilding.add(mesh_id)
         return {
             "running": running,
             "count": len(ids),
             "ids": ids,
             "meshes": meshes,
             "busy": sorted(busy),
+            "failures": _generated_failure_rows(
+                gen_events_path, canonical_of, opt_dir, rebuilding,
+                include_unbuilt=not running,
+            ),
+            "version": gen_version,
+            "versions": versions,
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/build-lite")
     async def slot_build_lite(  # pyright: ignore[reportUnusedFunction]
         slot_id: str, model_alias: str, run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
-        """Build (or resume) this cell's LITE presentation tier —
-        objects-generated/ -> objects-generated-lite/ via build_lite_assets.py — as a
-        background job. Idempotent while running (returns the live job). Poll the GET."""
+        """Build (or resume) one generated VERSION's LITE presentation tier —
+        that version's objects-generated/ -> objects-generated-lite/ via
+        build_lite_assets.py — as a background job. `version` selects the build
+        (the latest when omitted). Idempotent while running (returns the live
+        job). Poll the GET."""
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
         rid = _run_id(run, slot_id, model_alias)
-        raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
-        out_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+        gen_version = _resolve_gen_version(rid, version)
+        raw_dir, _ = generation.generated_dirs(RUNS_DIR, rid, gen_version)
+        out_dir = generation.generated_lite_dir(RUNS_DIR, rid, gen_version)
         total = _placed_count(raw_dir)
         if total == 0:
             raise HTTPException(
                 status_code=404,
                 detail="no generated build to build lite from — run ⚡ generate first",
             )
-        key = (run, slot_id, model_alias)
+        key = (run, slot_id, model_alias, gen_version)
         existing = _lite_build_jobs.get(key)
         if existing is not None and existing.get("running"):
             return dict(existing)
@@ -6646,6 +7266,7 @@ def create_app() -> FastAPI:
             "run": run,
             "slot": slot_id,
             "model": model_alias,
+            "version": gen_version,
             "running": True,
             "ok": None,
             "done": 0,
@@ -6657,23 +7278,25 @@ def create_app() -> FastAPI:
         }
         _lite_build_jobs[key] = job
         _lite_build_tasks[key] = asyncio.create_task(
-            _run_lite_build(run, slot_id, model_alias, raw_dir, out_dir)
+            _run_lite_build(run, slot_id, model_alias, gen_version, raw_dir, out_dir)
         )
         return dict(job)
 
     @app.get("/slots/{slot_id}/{model_alias}/build-lite")
     async def slot_build_lite_status(  # pyright: ignore[reportUnusedFunction]
         slot_id: str, model_alias: str, run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
-        """Live lite-build state for a cell: the running job, else a disk summary."""
+        """Live lite-build state for one generated version: the running job, else
+        a disk summary."""
         run = _resolve_run(run)
-        key = (run, slot_id, model_alias)
-        job = _lite_build_jobs.get(key)
+        rid = _run_id(run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(rid, version)
+        job = _lite_build_jobs.get((run, slot_id, model_alias, gen_version))
         if job is not None:
             return dict(job)
-        rid = _run_id(run, slot_id, model_alias)
-        raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
-        lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+        raw_dir, _ = generation.generated_dirs(RUNS_DIR, rid, gen_version)
+        lite_dir = generation.generated_lite_dir(RUNS_DIR, rid, gen_version)
         return {
             "running": False,
             "ok": None,
@@ -6689,6 +7312,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         propagate: bool = False,
         backend: str = "trellis",
         reuse_image: bool = False,
@@ -6717,7 +7341,8 @@ def create_app() -> FastAPI:
         if backend not in generation.MESH_BACKENDS:
             raise HTTPException(status_code=400, detail=f"unknown backend: {backend}")
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         # A whole-scene generate of this version may be in flight — that's allowed
         # now. The regen and the scene build serialize per-node via
         # generation.node_lock (see _regen_worker), so they never write the same
@@ -6734,7 +7359,7 @@ def create_app() -> FastAPI:
         # Regenerating the noun phrase means a fresh image distilled from it, so a
         # reuse-image request can't also apply — the new phrase needs a new image.
         reuse_image = reuse_image and not regen_noun_phrase
-        gen_slot_id = _gen_slot_id(run, slot.id, model_alias)
+        gen_slot_id = _gen_slot_id(run, slot.id, model_alias, gen_version)
         queue = _regen_queues.setdefault(key, asyncio.Queue())
         queue.put_nowait(RegenJob(
             node_id=node_id, op="regenerate", propagate=propagate,
@@ -6748,7 +7373,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -6767,6 +7392,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         propagate: bool = True,
     ) -> dict[str, object]:
         """Reveal a GENERATED asset's full, un-mirrored mesh: reprocess its existing
@@ -6782,7 +7408,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -6797,7 +7424,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -6816,28 +7443,34 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         plane: str = "xy",
         keep_positive: bool = True,
         propagate: bool = True,
     ) -> dict[str, object]:
         """Mirror a GENERATED asset across `plane` ('xy' = front/back along Z, 'xz' =
-        top/bottom along Y), keeping the `keep_positive` half — the symmetrize
-        counterpart to /unsymmetrize. The plane + direction are supplied by the
-        caller, so NO symmetry LLM decision is made and NO symmetry log is consulted
-        to pick them. Reprocesses the existing raw mesh (no Nano-Banana, no mesh
-        backend) on the SAME per-version worker as regenerate/unsymmetrize, so it
-        enqueues, drains concurrently, and serializes per-node via
-        `generation.node_lock`. With `propagate=true` (the client default) the prefab
-        CANONICAL behind `node_id` is mirrored and every object reusing it is
-        re-derived to match. Pins the node's symmetry decision so later resumes /
-        regenerations keep the mirror."""
-        if plane not in ("xy", "xz"):
-            raise HTTPException(status_code=400, detail=f"plane must be 'xy' or 'xz', got: {plane}")
+        top/bottom along Y, 'yz' = left/right along X), keeping the `keep_positive`
+        half — the symmetrize counterpart to /unsymmetrize. The plane + direction are
+        supplied by the caller, so NO symmetry LLM decision is made and NO symmetry
+        log is consulted to pick them; 'yz' is reachable only this way, since the
+        automatic gate never picks it (see `app.services.symmetry`). Reprocesses the
+        existing raw mesh (no Nano-Banana, no mesh backend) on the SAME per-version
+        worker as regenerate/unsymmetrize, so it enqueues, drains concurrently, and
+        serializes per-node via `generation.node_lock`. With `propagate=true` (the
+        client default) the prefab CANONICAL behind `node_id` is mirrored and every
+        object reusing it is re-derived to match. Pins the node's symmetry decision
+        so later resumes / regenerations keep the mirror."""
+        if plane not in sym_svc.MIRROR_PLANES:
+            allowed = ", ".join(f"'{p}'" for p in sorted(sym_svc.MIRROR_PLANES))
+            raise HTTPException(
+                status_code=400, detail=f"plane must be one of {allowed}; got: {plane}",
+            )
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -6854,7 +7487,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -6875,6 +7508,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         axis: str = "y",
         degrees: int = 90,
         propagate: bool = True,
@@ -6898,7 +7532,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -6914,7 +7549,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -6935,6 +7570,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
         """Force the window/glass transparency transform onto a generated object,
         bypassing the pipeline's keyword + symmetry gates. Bakes per-texel
@@ -6951,7 +7587,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -6965,7 +7602,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -6983,6 +7620,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
         """Rebuild a GENERATED object's served mesh from its pristine raw Trellis
         output, dropping any in-place served edit (notably a forced glassify) while
@@ -6998,7 +7636,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -7012,7 +7651,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -7031,6 +7670,7 @@ def create_app() -> FastAPI:
         node_id: str,
         target: str,
         run: str | None = None,
+        version: str | None = None,
         group: bool = False,
     ) -> dict[str, object]:
         """Link a GENERATED asset INTO another object's prefab group, so it shares
@@ -7038,9 +7678,10 @@ def create_app() -> FastAPI:
         destination group (we resolve it to that group's canonical); `node_id`
         becomes a reuse of it and its mesh is re-derived from the canonical's raw
         (rescaled into `node_id`'s own bbox/orientation) — no Nano-Banana, no mesh
-        backend, so it's effectively instant. If `node_id` was itself a prefab
-        canonical with reuses, those reuses move into the destination group too, so
-        the flat prefab star is preserved. With `group=true` the ENTIRE source group
+        backend, so it's effectively instant. SOLO by default: only `node_id`
+        moves — if it was its group's canonical with reuses, the group is first
+        handed off to a surviving reuse (like unlink) so its siblings stay put and
+        the flat prefab star stays valid. With `group=true` the ENTIRE source group
         (canonical + every reuse) moves into the destination, even when `node_id` is
         a reuse — its old canonical and siblings come along. Runs on the SAME
         per-version worker as regenerate/symmetrize, serialized per group via the
@@ -7050,7 +7691,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -7065,7 +7707,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -7085,6 +7727,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
         """Split a GENERATED asset OUT of its prefab group into a STANDALONE asset
         with its OWN raw mesh — the inverse of `link` — WITHOUT rebuilding it. A
@@ -7100,7 +7743,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -7111,7 +7755,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -7165,6 +7809,81 @@ def create_app() -> FastAPI:
             slot_log.state["prompt"] = slot.prompt
             slot_log.state["model"] = MODELS[model_alias]
         return {"run": run, "slot_id": slot.id, "model": model_alias}
+
+    @app.post("/slots/{slot_id}/{model_alias}/seed-start")
+    async def slot_seed_start(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        req: SeedStartRequest,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Start the target cell seeded with ANOTHER cell's committed ROOT zone
+        plan + overall bounding box. The source cell (`source_slot`,
+        `source_model`) on the same run is copied through its root
+        `divider.zone_plan` and root `bbox`; the target is wiped (as reset does),
+        given that prefix, and started — so the resumable divider replays the
+        fixed plan + canvas verbatim and re-derives everything inside it under
+        the TARGET scene's own prompt + model. Source and target may differ in
+        slot and/or model (holding the plan fixed while varying the model is the
+        core benchmark comparison). The source cell is untouched."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        _require_run_prompts(run)
+        _require_slot(req.source_slot)
+        _require_model(req.source_model)
+        if (req.source_slot, req.source_model) == (slot_id, model_alias):
+            raise HTTPException(status_code=400, detail="source and target are the same cell")
+        src_log = _require_slot_log(run, req.source_slot, req.source_model)
+        cut = _root_plan_cut(src_log.state["events"], through_overall_bbox=True)
+        if cut is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"source cell {req.source_slot}/{req.source_model} has no committed "
+                    "root zone plan + overall bounding box to seed from"
+                ),
+            )
+        # Re-stamp the copied prefix's run.start to the TARGET cell's prompt +
+        # model: the re-run then issues the target model's calls under the target
+        # scene's prompt, while the committed root plan + bbox — looked up by node
+        # id, so prompt/model-independent — still replay verbatim. Everything else
+        # in the prefix is kept as-is; a true contiguous prefix resumes cleanly.
+        seed = [dict(e) for e in src_log.state["events"][:cut]]
+        for e in seed:
+            if e.get("kind") == "run.start":
+                e["prompt"] = slot.prompt
+                e["model"] = MODELS[model_alias]
+                break
+        # Wipe the target cell exactly as reset does before writing the seed, so
+        # no live task / generation / branch races the dir we replace.
+        key: RunKey = (run, slot.id, model_alias)
+        await _discard_branches_of_cell(run, slot.id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_cell_generation(run, slot.id, model_alias)
+        _set_stepped(key, False)
+        _gate_intents.pop(key, None)
+        slot_dir = _slot_dir(run, slot.id, model_alias)
+        shutil.rmtree(slot_dir, ignore_errors=True)
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        old_log = _slot_logs.get(key)
+        if old_log is not None:
+            old_log.close()
+        with (slot_dir / "events.jsonl").open("w", encoding="utf-8") as f:
+            for e in seed:
+                f.write(json.dumps(e) + "\n")
+        slot_log = SlotLog(_run_id(run, slot.id, model_alias), slot_dir / "events.jsonl")
+        slot_log.hydrate_from_disk()
+        _slot_logs[key] = slot_log
+        await _start_cell(run, slot.id, model_alias)
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "source_slot": req.source_slot,
+            "source_model": req.source_model,
+            "seed_events": cut,
+        }
 
     @app.post("/slots/{slot_id}/{model_alias}/delete-object/{node_id}")
     async def slot_delete_object(  # pyright: ignore[reportUnusedFunction]
@@ -7300,6 +8019,21 @@ def create_app() -> FastAPI:
                 if isinstance(e.get("index"), int) and e["index"] > since
             ]
         return StreamingResponse(_sse(blog, q, snapshot), media_type="text/event-stream")
+
+    @app.get("/branches/{branch_id}/events-history")
+    async def branch_events_history(branch_id: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """Slim NDJSON history backfill for a branch's observability tree (see
+        `slot_events_history`)."""
+        blog = _require_branch(branch_id).log
+        return StreamingResponse(
+            _slim_ndjson(list(blog.state["events"])),
+            media_type="application/x-ndjson",
+        )
+
+    @app.get("/branches/{branch_id}/event-bytes")
+    async def branch_event_bytes(branch_id: str, index: int) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The heavy bytes for ONE branch event, fetched on demand on expand."""
+        return _event_bytes(_require_branch(branch_id).log, index)
 
     @app.get("/branches/{branch_id}/meshes")
     async def branch_meshes(branch_id: str, since_index: int | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
@@ -7646,7 +8380,7 @@ def create_app() -> FastAPI:
             cut_step: str | None = None
             for i, e in enumerate(events):
                 if (e.get("kind") == "cache.llm" and e.get("template") in steps
-                        and isinstance(e.get("variables"), dict)):
+                        and e.get("has_variables")):  # slim marker (variables on disk)
                     cut = i
                     cut_step = str(e.get("template"))
                     break
@@ -8034,88 +8768,15 @@ def create_app() -> FastAPI:
     return app
 
 
-def _last_step(events: list[dict[str, object]]) -> dict[str, object] | None:
-    """The most recent pipeline-location marker — what the board cards show
-    as "where is this cell right now"."""
-    for e in reversed(events):
-        if e.get("kind") == "step":
-            return {"node": e.get("node"), "phase": e.get("phase")}
-    return None
-
-
-def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, float]]:
-    """Per-model token, request, USD-cost, and unresolved-lookup totals from a
-    cell's `cache.llm` events, so the UI cost tracker can show the run's
-    authoritative spend and how much of it is still settling. Returns
-    `{ model_id: {"in": tokens_in, "out": tokens_out, "req": n, "cost": usd,
-    "pending": n} }`.
-
-    `cost` is OpenRouter's own settled `total_cost`, which lands a beat after the
-    call (its /generation stats lag the completion) as a separate `llm.cost`
-    event keyed by `generation_id` — written by the backfill sweep. We index
-    those, then attribute each to its `cache.llm` call's model — so the cost
-    lands on the right model, and a cost whose call was since dropped (a rewind
-    that raced the lookup) is ignored. `pending` counts calls carrying a
-    `generation_id` that the sweep hasn't priced yet; it drains to 0 once every
-    call is resolved (the run's spend has caught up). A call with no
-    `generation_id` (a legacy log) is neither priced nor pending — it just
-    counts as a request, matching the tracker's old request-only degradation."""
-    cost_by_gen: dict[str, float] = {}
-    for e in events:
-        if e.get("kind") != "llm.cost":
-            continue
-        gid, c = e.get("generation_id"), e.get("cost")
-        if isinstance(gid, str) and isinstance(c, (int, float)):
-            cost_by_gen[gid] = float(c)
-    usage: dict[str, dict[str, float]] = {}
-    for e in events:
-        if e.get("kind") != "cache.llm":
-            continue
-        model = str(e.get("model") or "?")
-        u = usage.setdefault(model, {"in": 0, "out": 0, "req": 0, "cost": 0.0, "pending": 0})
-        ti, to = e.get("tokens_in"), e.get("tokens_out")
-        u["in"] += int(ti) if isinstance(ti, (int, float)) else 0
-        u["out"] += int(to) if isinstance(to, (int, float)) else 0
-        u["req"] += 1
-        gid = e.get("generation_id")
-        if isinstance(gid, str):
-            if gid in cost_by_gen:
-                u["cost"] += cost_by_gen[gid]
-            else:
-                u["pending"] += 1
-    return usage
-
-
 # --- per-cell spend cap -------------------------------------------------------
-# A cell's authoritative spend is the sum of its settled `llm.cost` events (the
-# backfill prices each `cache.llm` against OpenRouter's own total). The ceiling
-# is the value carried by the cell's latest `run.cap_override` event, or
-# SPEND_CAP_USD when it has none — so setting a new cap is just appending an
-# override the reader picks up, and a rewind past it falls back to the prior one.
-# Everything is derived from the durable log, so it survives restarts. A ceiling
-# of 0 (or less) means uncapped.
-
-
-def _cell_spend(events: list[dict[str, object]]) -> float:
-    total = 0.0
-    for e in events:
-        if e.get("kind") == "llm.cost":
-            c = e.get("cost")
-            if isinstance(c, (int, float)):
-                total += float(c)
-    return total
-
-
-def _cap_override_value(events: list[dict[str, object]]) -> float | None:
-    """The ceiling set by the cell's most recent `run.cap_override`, or None if
-    it was never overridden — the last one wins."""
-    value = None
-    for e in events:
-        if e.get("kind") == "run.cap_override":
-            c = e.get("cap")
-            if isinstance(c, (int, float)):
-                value = float(c)
-    return value
+# A cell's authoritative spend is the sum of its calls' settled costs
+# (`cellsummary.cell_spend`, imported as `_cell_spend`). The ceiling is the value
+# carried by the cell's latest `run.cap_override` event, or SPEND_CAP_USD when it
+# has none — so setting a new cap is just appending an override the reader picks
+# up, and a rewind past it falls back to the prior one. Everything is derived
+# from the durable log, so it survives restarts. A ceiling of 0 (or less) means
+# uncapped. `_cell_spend` / `_cap_override_value` live in `cellsummary` (shared
+# with the board-summary cache); the SPEND_CAP_USD default is applied here.
 
 
 def _effective_cap(events: list[dict[str, object]]) -> float:
@@ -8134,22 +8795,87 @@ def _cap_reached(events: list[dict[str, object]]) -> bool:
     return cap > 0 and _cell_spend(events) >= cap
 
 
-def _cap_summary(events: list[dict[str, object]]) -> dict[str, object] | None:
-    """The cost tracker's per-cell cap panel: settled `spend` and the current
-    `limit` ceiling (0 = uncapped). None only when the cap system is off
-    (SPEND_CAP_USD ≤ 0), so there is no cap to show or set."""
+def _cell_summary(
+    run: str,
+    slot_id: str,
+    model_alias: str,
+    slot_log: SlotLog | None,
+    cache_rows: dict[str, tuple[tuple[int, float], dict[str, object]]],
+) -> dict[str, object]:
+    """A cell's board summary (event count, last step, per-model usage, spend,
+    status markers) sourced so activating a run needn't re-parse a huge log:
+
+      * no slot_log / no events.jsonl → the trivial empty summary;
+      * a cached row fresh for the log's (size, mtime) → it, verbatim;
+      * otherwise fold the events (loading them if needed — a cache miss or an
+        active cell whose log has grown) and refresh the cache.
+
+    `cache_rows` is the run's whole `board.db` preloaded once for the poll."""
+    if slot_log is None:
+        return cellsummary.summarize([])
+    sig = boardcache.file_sig(slot_log.events_path)
+    if sig is None:
+        return cellsummary.summarize([])  # untouched cell — no log on disk yet
+    scene = f"{slot_id}/{model_alias}"
+    cached = cache_rows.get(scene)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    # Fold from the in-memory list when it's already loaded, else via the bounded
+    # streaming reader — so a cache miss on a multi-GB log (Kimi at max reasoning)
+    # is summarized without ever materializing it, which would OOM the poll. This
+    # is the same reader the board-cache pre-warm uses, and it yields the identical
+    # summary (it keeps every field the folds read).
+    events = (
+        slot_log.state["events"]
+        if slot_log.loaded
+        else list(cellsummary.iter_events(slot_log.events_path))
+    )
+    summary = cellsummary.summarize(events)
+    boardcache.put(_run_dir(run), scene, sig, summary)
+    return summary
+
+
+def _status_from_summary(key: RunKey, summary: dict[str, object]) -> str:
+    """A cell's live status from its cached summary + runtime overlay — the
+    cache-backed equivalent of `derive_status(events, ...)`, so the board needn't
+    hold the events to know a cell is done/capped/paused/running."""
+    spend = float(summary.get("spend") or 0.0)
+    override = summary.get("cap_override")
+    cap = override if isinstance(override, (int, float)) else SPEND_CAP_USD
+    return rlog.derive_status_fields(
+        has_done=bool(summary.get("has_done")),
+        last_is_error=bool(summary.get("last_is_error")),
+        has_events=int(summary.get("events_count") or 0) > 0,
+        awaiting=_gate_awaiting(_cell_gates.get(key)),
+        live=_live(_tasks.get(key)),
+        capped=cap > 0 and spend >= cap,
+    )
+
+
+def _cap_summary_from(summary: dict[str, object]) -> dict[str, object] | None:
+    """The cost tracker's cap panel from a cached summary (settled `spend` +
+    `limit` ceiling). None when the cap system is off (SPEND_CAP_USD ≤ 0)."""
     if SPEND_CAP_USD <= 0:
         return None
-    return {"spend": _cell_spend(events), "limit": _effective_cap(events)}
+    spend = float(summary.get("spend") or 0.0)
+    override = summary.get("cap_override")
+    limit = override if isinstance(override, (int, float)) else SPEND_CAP_USD
+    return {"spend": spend, "limit": limit}
 
 
-def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
+def _slot_summary(
+    slot: Slot,
+    run: str,
+    cache_rows: dict[str, tuple[tuple[int, float], dict[str, object]]],
+) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
         key: RunKey = (run, slot.id, alias)
         slot_log = _slot_logs.get(key)
-        state = slot_log.state if slot_log is not None else {"events": []}
-        events = state.get("events", [])
+        # Board summary from board.db when the cell's events aren't loaded, so
+        # activating a run doesn't parse every (multi-GB) log; a miss falls back
+        # to a one-time parse that then repopulates the cache.
+        summary = _cell_summary(run, slot.id, alias, slot_log, cache_rows)
         # Every TOP-LEVEL simulation forked from this cell (fan-out children are
         # excluded — they live transiently inside the compare view). A cell can
         # now carry several at once (different zones / parallel sims).
@@ -8159,10 +8885,10 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
         ]
         cgate = _cell_gates.get(key)
         runs[alias] = {
-            "status": _cell_status(key, slot_log) if slot_log is not None else "idle",
-            "events_count": len(events),
-            "last_kind": events[-1]["kind"] if events else None,
-            "last_step": _last_step(events),
+            "status": _status_from_summary(key, summary) if slot_log is not None else "idle",
+            "events_count": summary["events_count"],
+            "last_kind": summary["last_kind"],
+            "last_step": summary["last_step"],
             "stepped": (run, slot.id, alias) in _stepped_cells,
             "pending": cgate.pending if cgate is not None else None,
             "current": cgate.current if cgate is not None else None,
@@ -8170,10 +8896,18 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             "branches": branches,
             # Per-model token/request totals for the cost tracker (the run's
             # actual spend = source cells; branch simulations aren't counted).
-            "usage": _usage_summary(events),
+            "usage": summary["usage"],
             # Per-cell spend cap panel: settled spend, current ceiling, whether
             # it's tripped, and the override count. None when the cap is off.
-            "cap": _cap_summary(events),
+            "cap": _cap_summary_from(summary),
+            # Measured execution time (see _clock_loop): `active_s` excludes
+            # pauses, parked gates, and crash gaps, and `spans` counts how many
+            # stretches of execution the cell took. Skipped for a cell that never
+            # ran — there's no heartbeat log to fold.
+            "timing": (
+                runclock.read(_run_id(run, slot.id, alias))
+                if summary["events_count"] else None
+            ),
         }
     return {
         "id": slot.id,
@@ -8190,7 +8924,7 @@ def _maybe_launch(slot: Slot, model_alias: str, slot_log: SlotLog) -> None:
     by `derive_status`, so a cell killed mid-run reads as paused (no live task)
     and a completed/errored cell reads done/error straight from its log — no
     boot-time fix-up."""
-    if not slot_log.state["events"]:
+    if slot_log.is_empty:
         slot_log.state["prompt"] = slot.prompt
     slot_log.state["model"] = MODELS[model_alias]
 
@@ -8247,11 +8981,11 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     orientation: Orientation = int(orientation_raw) if isinstance(orientation_raw, (int, float, str)) else 0  # type: ignore[assignment]
     raw_prompt = image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
     raw_str = str(raw_prompt) if raw_prompt is not None else ""
-    cut_plane: Literal["none", "xy", "xz"] = "none"
+    cut_plane: sym_svc.CutPlane = "none"
     for event in events:
         if event.get("id") == node_id and event.get("kind") == "symmetry.decision":
             raw_cp = event.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
+            if raw_cp in sym_svc.CUT_PLANES:
                 cut_plane = raw_cp  # type: ignore[assignment]
             break
     encapsulating = bbox_event.get("node_kind") == "frame"
@@ -8524,12 +9258,25 @@ def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
             status_code=404,
             detail=f"no run for run={run} slot={slot_id} model={model_alias}",
         )
+    # Mark active use so the idle-unload sweep leaves a cell the user is currently
+    # viewing/operating on loaded (it only reclaims cells idle for a while).
+    log._touched = time.monotonic()
     return log
 
 
 async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
-    _cell_gates.pop((run, slot_id, model_alias), None)
-    task = _tasks.pop((run, slot_id, model_alias), None)
+    key = (run, slot_id, model_alias)
+    # Abort a pending graceful (soft) pause drainer so a hard pause / reset /
+    # relaunch overrides it — UNLESS we ARE that drainer (it calls _cancel_task to
+    # perform the pause once in-flight calls have drained; cancelling itself would
+    # abort mid-teardown). Clearing the llm flag lets a relaunch issue calls again.
+    sp = _soft_pause_tasks.get(key)
+    if sp is not None and sp is not asyncio.current_task():
+        _soft_pause_tasks.pop(key, None)
+        sp.cancel()
+    llm.clear_soft_pause(_run_id(run, slot_id, model_alias))
+    _cell_gates.pop(key, None)
+    task = _tasks.pop(key, None)
     if task is None or task.done():
         return
     task.cancel()
@@ -8820,24 +9567,38 @@ async def _fork_branch(
     # Prefix = source events BEFORE the fork. Dropping that call (and everything
     # after) means `committed.*` replays the prefix and the pipeline re-reaches
     # it with the (snapshot + overrides) templates.
-    branch_events = [dict(e) for e in src_events[:event_index]]
-    # A CHILD fork copies the PARENT branch's log; repoint the parent's object
-    # URLs at the child's own dir (the parent's committed meshes are hardlinked
-    # into it just above), so the child — and any sim KEPT from it — stays
-    # self-referential after the parent is discarded. Inductively, a child only
-    # ever carries its-own-dir + source-cell URLs (source points at the live
-    # cell and needs no rewrite), so a later commit/save needs just one rewrite.
-    if parent is not None:
+    bevents = bdir / "events.jsonl"
+    if parent is None:
+        # SOURCE fork: byte-copy the committed prefix straight from the source log
+        # so the branch keeps the FULL heavy bytes (writing the slim in-memory copy
+        # would drop system/user/variables/reasoning). Chunked, so even a large
+        # prefix never materializes in memory. A source fork needs no URL rewrite.
+        cut = (src_log._offsets[event_index]
+               if event_index < len(src_log._offsets) else src_log._byte_len)
+        with src_log.events_path.open("rb") as fin, bevents.open("wb") as fout:
+            remaining = cut
+            while remaining > 0:
+                chunk = fin.read(min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                fout.write(chunk)
+                remaining -= len(chunk)
+    else:
+        # CHILD fork (branch-of-branch): repoint the parent branch's object URLs at
+        # this child's dir (its committed meshes were hardlinked in above) so the
+        # child stays self-referential after the parent is discarded, then write the
+        # prefix. The copied cache.llm rows are slim — fine: the branch replays via
+        # `replay_key` + `output`, both kept in the slim event.
+        branch_events = [dict(e) for e in src_events[:event_index]]
         seg = f"/{BRANCHES_SUBDIR}/{parent}/objects/"
         dest_seg = f"/{BRANCHES_SUBDIR}/{bid}/objects/"
         for e in branch_events:
             url = e.get("url")
             if isinstance(url, str) and seg in url:
                 e["url"] = url.replace(seg, dest_seg)
-    bevents = bdir / "events.jsonl"
-    with bevents.open("w", encoding="utf-8") as f:
-        for e in branch_events:
-            f.write(json.dumps(e) + "\n")
+        with bevents.open("w", encoding="utf-8") as f:
+            for e in branch_events:
+                f.write(json.dumps(e) + "\n")
 
     blog = SlotLog(_branch_run_id(run, bid), bevents)
     blog.hydrate_from_disk()
@@ -8848,6 +9609,11 @@ async def _fork_branch(
         blog.log(
             "cache.llm",
             key=cache_hash_for_seed(event, seed),
+            # Model-independent replay key (matches llm.py's cache.llm writes) so the
+            # seed replays across a model swap without system/user resident.
+            replay_key=cache.hash_llm_replay_key(
+                system=seed.system, user=seed.user, schema_name=str(event.get("schema") or ""),
+            ),
             node=event.get("node"),
             step=event.get("step"),
             template=step,
@@ -9119,6 +9885,68 @@ def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
     return {"nodes": list(nodes.values()), "last_index": last_index}
 
 
+# The heavy `cache.llm` fields: the exact prompt/output/reasoning bytes plus the
+# resolved template variables. They dwarf everything else in a log (a deep zone's
+# object_bbox_batch prompt alone runs to megabytes), so the observability tree is
+# served WITHOUT them — the client folds the slim stream into the node tree and
+# fetches these per-call, on demand, via `/event-bytes` when a row is expanded.
+# This is a serve-time projection ONLY; the on-disk `events.jsonl` is untouched.
+_CACHE_LLM_HEAVY = ("system", "user", "output", "reasoning", "variables")
+
+
+def _emitted_ids(output: object) -> list[str]:
+    """The node ids a finished decompose / bbox-batch call named or placed, pulled
+    from its structured `output` — the one thing the obs tree needs the output FOR
+    (provenance: the "via {step}" pill, emitted_by / placed_by lineage). Mirrors
+    the client's `recordProvenance` walk so the slim stream carries the ids without
+    the bytes."""
+    if not isinstance(output, dict):
+        return []
+    ids: list[str] = []
+    for key in ("subregions", "children", "objects", "assignments"):
+        seq = output.get(key)
+        if isinstance(seq, list):
+            for item in seq:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    ids.append(item["id"])
+    obj = output.get("object")
+    if isinstance(obj, dict) and isinstance(obj.get("id"), str):
+        ids.append(obj["id"])
+    return ids
+
+
+def _slim_event(event: dict[str, object]) -> dict[str, object]:
+    """A `cache.llm` event with its heavy prompt/output/reasoning/variables bytes
+    stripped and replaced by a compact `emitted` id list; every other kind passes
+    through unchanged. Returns a NEW dict for `cache.llm` — the in-memory event is
+    left intact, since the LLM cache reads `cache.llm.output` and resume reads
+    event fields off these same objects, so mutating them would corrupt both."""
+    if event.get("kind") != "cache.llm":
+        return event
+    slim = {k: v for k, v in event.items() if k not in _CACHE_LLM_HEAVY}
+    slim["emitted"] = _emitted_ids(event.get("output"))
+    return slim
+
+
+def _event_bytes(slot_log: SlotLog, index: int) -> dict[str, object]:
+    """The heavy bytes for ONE event (system/user/output/reasoning/variables +
+    schema), fetched on demand when a call row is expanded. Read FROM DISK by byte
+    offset — the in-memory buffer keeps only the slim event (the heavy prompt /
+    variables / reasoning bytes are offloaded; see `logging._HEAVY_OFFLOAD`)."""
+    e = slot_log.read_event_full(index)
+    if e is None:
+        raise HTTPException(status_code=404, detail=f"no event at index {index}")
+    return {k: e.get(k) for k in ("system", "user", "output", "reasoning", "variables", "schema")}
+
+
+async def _slim_ndjson(events: list[dict[str, object]]) -> AsyncIterator[str]:
+    """Stream `events` as slim NDJSON (one JSON object per line). Neither the
+    server nor the client ever builds the whole log as a single string, so a
+    multi-gigabyte scene's tree loads without hitting the ~512 MB JS string cap."""
+    for e in events:
+        yield json.dumps(_slim_event(e)) + "\n"
+
+
 async def _sse(
     slot_log: SlotLog,
     q: asyncio.Queue[dict[str, object]],
@@ -9132,12 +9960,16 @@ async def _sse(
     # standalone mesh retry) gets the historical timeline and then waits
     # on the live queue for the retry's new events, instead of being
     # disconnected the instant the past `run.done` replays.
+    # Events are slimmed the same way the history backfill is (`_slim_event`):
+    # cache.llm prompt/output bytes are stripped and fetched per-call on expand,
+    # so the obs model's memory stays bounded even across a long live run. Scene
+    # dispatch is unaffected (it reads bbox/model/divider events, never cache.llm).
     try:
         for event in snapshot:
-            yield f"data: {json.dumps(event)}\n\n"
+            yield f"data: {json.dumps(_slim_event(event))}\n\n"
         while True:
             event = await q.get()
-            yield f"data: {json.dumps(event)}\n\n"
+            yield f"data: {json.dumps(_slim_event(event))}\n\n"
             if event["kind"] in {"run.done", "run.error", "run.paused", "run.cap_reached"}:
                 return
     finally:
@@ -9151,9 +9983,9 @@ async def _sse(
 _REGEN_POLL_INTERVAL_S = 0.25
 
 
-async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
-    """Drain the cell's generated-build regeneration queue CONCURRENTLY. The worker
-    owns the generated-events log for the whole drain; `SlotLog.log()` is
+async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) -> None:
+    """Drain ONE generated `version`'s regeneration queue CONCURRENTLY. The worker
+    owns that version's generated-events log for the whole drain; `SlotLog.log()` is
     synchronous, so concurrent items append through it atomically (unique indices,
     no torn lines). Items run in parallel ACROSS prefab groups but are serialized
     WITHIN a group by a per-canonical lock — so two regens that resolve to the same
@@ -9164,15 +9996,15 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
     empty and nothing is in flight; the next enqueue restarts it. Cancellation
     (reset / stop / teardown) cancels in-flight builds and clears any still-queued
     rows from the shared Trellis queue panel."""
-    key: GenKey = (run, slot_id, model_alias)
+    key: GenKey = (run, slot_id, model_alias, version)
     queue = _regen_queues.get(key)
     if queue is None:
         return
     lib_log = _slot_logs.get((run, slot_id, model_alias))
     run_id = _run_id(run, slot_id, model_alias)
-    gen_slot_id = _gen_slot_id(run, slot_id, model_alias)
-    raw_subdir = generation.GENERATED_RAW_SUBDIR
-    gen_log = SlotLog(gen_slot_id, generation.generated_events_path(RUNS_DIR, run_id))
+    gen_slot_id = _gen_slot_id(run, slot_id, model_alias, version)
+    raw_subdir = f"{generation.GENERATED_DIR}/{version}/{generation.GENERATED_RAW_SUBDIR}"
+    gen_log = SlotLog(gen_slot_id, generation.generated_events_path(RUNS_DIR, run_id, version))
     gen_log.hydrate_from_disk()
     rlog.bind(gen_log)
     llm.set_model(MODELS[model_alias])
@@ -9187,13 +10019,41 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
         for e in reversed(gen_log.state["events"]):
             if e.get("kind") == "symmetry.applied" and e.get("id") == src_id:
                 cp = e.get("cut_plane")
-                if cp in ("none", "xy", "xz"):
+                if cp in sym_svc.CUT_PLANES:
                     extra = (
                         {"keep_positive": e["keep_positive"]}
                         if isinstance(e.get("keep_positive"), bool) else {}
                     )
                     gen_log.log("symmetry.applied", id=dst_id, cut_plane=cp, **extra)
                 break
+
+    async def _handoff_canonical(node_id: str, reuse_ids: list[str]) -> None:
+        """Hand `node_id`'s canonical role off to one of its reuses so the
+        ORIGINAL group survives intact when `node_id` leaves it — a solo unlink OR
+        a solo link into another group. The first reuse clones `node_id`'s raw (+
+        its symmetry) and is promoted to canonical; the rest repoint to it. Their
+        served meshes already derive from that same raw, so none rebuild. A no-op
+        when there are no reuses to promote (a lone canonical is already
+        standalone)."""
+        assert lib_log is not None
+        if not reuse_ids:
+            return
+        new_canon = reuse_ids[0]
+        await generation.clone_canonical_raw(
+            runs_dir=RUNS_DIR, run_id=run_id, version=version, source_id=node_id, dest_id=new_canon,
+        )
+        _carry_symmetry(node_id, new_canon)
+        new_node = _reconstruct_node(lib_log, new_canon)
+        gen_log.log(
+            "prefab.match", id=new_canon, reuse_id="",
+            description=new_node.prompt if new_node else "",
+        )
+        for rid in reuse_ids[1:]:
+            rnode = _reconstruct_node(lib_log, rid)
+            gen_log.log(
+                "prefab.match", id=rid, reuse_id=new_canon,
+                description=rnode.prompt if rnode else "",
+            )
 
     async def _do_unlink(node_id: str, node: Node) -> None:
         """Pull `node_id` out of its prefab group into a STANDALONE asset with its
@@ -9209,38 +10069,24 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
         canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
         if canonical_id != node_id:
             await generation.clone_canonical_raw(
-                runs_dir=RUNS_DIR, run_id=run_id, source_id=canonical_id, dest_id=node_id,
+                runs_dir=RUNS_DIR, run_id=run_id, version=version, source_id=canonical_id, dest_id=node_id,
             )
             _carry_symmetry(canonical_id, node_id)
             gen_log.log("prefab.match", id=node_id, reuse_id="", description=node.prompt)
             return
-        if not reuse_ids:
-            return
-        new_canon = reuse_ids[0]
-        await generation.clone_canonical_raw(
-            runs_dir=RUNS_DIR, run_id=run_id, source_id=node_id, dest_id=new_canon,
-        )
-        _carry_symmetry(node_id, new_canon)
-        new_node = _reconstruct_node(lib_log, new_canon)
-        gen_log.log(
-            "prefab.match", id=new_canon, reuse_id="",
-            description=new_node.prompt if new_node else "",
-        )
-        for rid in reuse_ids[1:]:
-            rnode = _reconstruct_node(lib_log, rid)
-            gen_log.log(
-                "prefab.match", id=rid, reuse_id=new_canon,
-                description=rnode.prompt if rnode else "",
-            )
+        # A canonical WITH reuses hands the group off to one of them; a lone
+        # canonical is already standalone (the helper no-ops).
+        await _handoff_canonical(node_id, reuse_ids)
 
     async def _do_link(node_id: str, target_id: str, *, link_group: bool = False) -> None:
         """Link `node_id` INTO the prefab group of `target_id` (any group member;
         resolved to that group's canonical), re-deriving its mesh from the
-        canonical's raw. If `node_id` was itself a canonical with reuses, those
-        reuses come along so the flat prefab star is preserved. With
-        `link_group=True` the entire SOURCE group (canonical + every reuse) moves
-        into the destination — even when `node_id` is a reuse, its old canonical
-        and siblings come along too."""
+        canonical's raw. SOLO by default: ONLY `node_id` moves — if it is its
+        group's canonical with reuses, the original group is first handed off to a
+        surviving reuse (like unlink) so its siblings stay put and the flat prefab
+        star stays valid. With `link_group=True` the entire SOURCE group (canonical
+        + every reuse) moves into the destination — even when `node_id` is a reuse,
+        its old canonical and siblings come along too."""
         assert lib_log is not None
         dest_canonical, _ = prefabs.resolve_group(gen_log.state["events"], target_id)
         async with canon_locks.setdefault(dest_canonical, asyncio.Lock()):
@@ -9256,9 +10102,14 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 return
             if link_group:
                 mover_ids = [own_canonical, *own_reuses]
-            elif own_canonical == node_id:
-                mover_ids = [node_id, *own_reuses]
             else:
+                # Solo link: ONLY node_id moves. If it is its group's canonical
+                # with reuses, hand the ORIGINAL group off to a surviving reuse
+                # first (like unlink) so the siblings we're NOT moving stay intact
+                # — moving the canonical alone would otherwise orphan its reuses
+                # onto a node that is now itself a reuse (breaking the flat star).
+                if own_canonical == node_id and own_reuses:
+                    await _handoff_canonical(node_id, own_reuses)
                 mover_ids = [node_id]
             movers = [
                 n for mid in mover_ids if (n := _reconstruct_node(lib_log, mid)) is not None
@@ -9269,7 +10120,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 )
             await generation.propagate_reuses(
                 canonical_id=dest_canonical, reuses=movers,
-                runs_dir=RUNS_DIR, run_id=run_id,
+                runs_dir=RUNS_DIR, run_id=run_id, version=version,
             )
 
     async def _process(job: RegenJob) -> None:
@@ -9315,7 +10166,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # canonical is un-mirrored here; propagate re-derives its reuses
                     # below, which read the canonical's now-`none` symmetry.applied.
                     await generation.unsymmetrize_one(
-                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "symmetrize":
                     # Mirror the existing mesh across the caller-supplied plane (no
@@ -9325,7 +10176,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     cut_plane, keep_positive = job.sym  # type: ignore[misc]
                     await generation.symmetrize_one(
                         node=build_node, cut_plane=cut_plane, keep_positive=keep_positive,  # type: ignore[arg-type]
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "reorient":
                     # Re-front the canonical's raw mesh (rotate which face is +Z);
@@ -9334,7 +10185,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     rax, rdeg = job.reorient  # type: ignore[misc]
                     await generation.reorient_one(
                         node=build_node, axis=rax, degrees=rdeg,  # type: ignore[arg-type]
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "reset":
                     # Rebuild the canonical's served mesh from its pristine raw
@@ -9342,7 +10193,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # reuses below from that same clean raw, so the whole group
                     # reverts together.
                     await generation.reset_from_raw_one(
-                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "glassify":
                     # Force the glass-transparency transform onto the WHOLE prefab
@@ -9350,7 +10201,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # from the shared raw, so apply it to the canonical AND every
                     # reuse directly here and SKIP the raw-replay propagate below.
                     await generation.glassify_group(
-                        nodes=[build_node, *reuses], runs_dir=RUNS_DIR, run_id=run_id,
+                        nodes=[build_node, *reuses], runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 else:
                     if job.reuse_image:
@@ -9360,7 +10211,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         # prefab sibling still has it), restore it so we reuse the
                         # image instead of re-generating it via the API.
                         generation.recover_group_image(
-                            RUNS_DIR, run_id, build_node.id, [canonical_id, *reuse_ids],
+                            RUNS_DIR, run_id, version, build_node.id, [canonical_id, *reuse_ids],
                         )
                     # Regenerate-noun-phrase: re-distill from the build node's
                     # AUTHORED seed (the library log's bbox prompt), not its current
@@ -9384,7 +10235,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         )
                     await generation.regenerate_one(
                         node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
-                        subdir=raw_subdir, optimize=True, backend=job.backend, generated=True,
+                        subdir=raw_subdir, optimize=True, backend=job.backend, version=version,
                         reuse_image=job.reuse_image,
                         regen_noun_phrase=job.regen_noun_phrase, seed_prompt=seed_prompt,
                         scene_zone=scene_zone, scene_nodes=scene_nodes,
@@ -9395,7 +10246,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # propagate_reuses replays, so it must not run here.
                     await generation.propagate_reuses(
                         canonical_id=canonical_id, reuses=reuses,
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize", "reorient", "glassify", "reset"):
                     # A reuse regenerated on its own now owns a fresh mesh + raw —

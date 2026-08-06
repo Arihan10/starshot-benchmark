@@ -11,13 +11,23 @@ generated, so two things key off it:
     head-on front view; everything else stays on the front view.
   * `apply_symmetrize` — after Trellis, the stored plane drives the mirror.
 
-Cut planes (mesh frame, Trellis front = +Z); the name is the plane we mirror
-ACROSS, the axis is its normal:
+Cut planes (mesh frame, Trellis front = +Z, up = +Y, right = +X); the name is
+the plane we mirror ACROSS, the axis is its normal:
   * `xy` — mirror across the XY plane (reflect along Z, front/back). Walls,
     partitions, doors, vertical panels.
   * `xz` — mirror across the XZ plane (reflect along Y, top/bottom). Thin
     horizontal slabs (floor tile, ceiling panel).
+  * `yz` — mirror across the YZ plane (reflect along X, left/right). Bilaterally
+    symmetric props (vehicles, furniture, facades) whose two sides should match
+    exactly.
   * `none` — leave the mesh unchanged (chairs, plants, asymmetric props).
+
+`yz` is MANUAL-ONLY. The automatic gate exists because Trellis hallucinates the
+half the single input image never showed, and a front view shows both the left
+and the right side — so left/right is not a fix for missing information but a
+deliberate authoring choice, offered through the symmetrize control alone.
+`AutoCutPlane` is what the LLM may pick; `CutPlane` is what the mesh layer can
+apply.
 
 The decision is logged as a `symmetry.decision` event so resumes / mesh
 retries / regenerations replay the same plane instead of re-asking.
@@ -43,7 +53,11 @@ from app.services import llm
 from app.utils import logging
 from app.utils.geometry import export_glb, rescale_mesh_to_bbox, symmetrize_mesh
 
-CutPlane = Literal["none", "xy", "xz"]
+CutPlane = Literal["none", "xy", "xz", "yz"]
+# The subset the automatic LLM gate may choose (see the module docstring for why
+# `yz` is excluded). Keeping it off the decision schema means widening `CutPlane`
+# for the manual tool can't quietly change what the pipeline picks on its own.
+AutoCutPlane = Literal["none", "xy", "xz"]
 
 _SERVER_DIR = Path(__file__).resolve().parents[2]
 _OPTIMIZE_DIR = _SERVER_DIR / "tools" / "optimize-assets"
@@ -56,7 +70,15 @@ _PLANE_PARAMS: dict[CutPlane, tuple[int, bool] | None] = {
     "none": None,
     "xy": (2, True),   # mirror across XY → reflect along Z: keep +Z front, mirror to -Z back
     "xz": (1, True),   # mirror across XZ → reflect along Y: keep +Y, mirror to -Y
+    "yz": (0, True),   # mirror across YZ → reflect along X: keep +X right, mirror to -X left
 }
+
+# Every plane string the mesh layer understands, and the subset that actually
+# mirrors. Single source of truth for validating a plane read back off the event
+# log or off a request, so the set lives in one place instead of a literal tuple
+# at each call site — adding a plane above is all it takes.
+CUT_PLANES: frozenset[str] = frozenset(_PLANE_PARAMS)
+MIRROR_PLANES: frozenset[str] = CUT_PLANES - {"none"}
 
 SYSTEM_SYMMETRY_DECISION = """\
 You are part of a text-to-3D scene pipeline. Each object is generated from ONE orthographic image. The 3D model’s “front” is always facing along the +Z axis or along the -Y axis; the opposite side is often hallucinated and generates incorrectly for ambiguous panels (walls, floors tiles, ceiling sections, doors, windows, glass panels, partition walls, etc.).
@@ -79,7 +101,10 @@ Respond with ONE JSON object: `cut_plane` must be exactly `none`, `xy`, or
 
 
 class SymmetryDecisionOutput(BaseModel):
-    cut_plane: CutPlane
+    # AutoCutPlane, not CutPlane: this Literal becomes the JSON schema the model
+    # answers against, so listing `yz` here would offer it to the gate no matter
+    # what the prompt says.
+    cut_plane: AutoCutPlane
 
 
 async def decide_symmetry(
@@ -123,10 +148,12 @@ async def resolve_cut_plane(
     agree and the LLM is asked at most once. A decision failure degrades to
     `none` without aborting generation and is not logged as a decision, so a
     later retry can still attempt it."""
+    # A manual symmetrize pins its own `symmetry.decision`, so a replayed plane
+    # can be any CutPlane — including the `yz` the gate itself would never pick.
     prior = logging.find_event("symmetry.decision", id=node_id)
     if prior is not None:
         cp = prior.get("cut_plane")
-        if cp in ("none", "xy", "xz"):
+        if cp in CUT_PLANES:
             return cp  # type: ignore[return-value]
 
     try:
@@ -195,6 +222,27 @@ async def apply_symmetrize(
         return mesh if isinstance(mesh, trimesh.Scene) else trimesh.Scene(mesh)
     logging.log("symmetry.applied", id=node_id, cut_plane=cut_plane, axis=axis, keep_positive=keep)
     return trimesh.Scene(out)
+
+
+def applied_state(node_id: str) -> tuple[CutPlane, bool | None]:
+    """The mirror currently baked into `node_id`'s mesh — `(cut_plane,
+    keep_positive)` from its latest `symmetry.applied`, or `("none", None)` when
+    it has none. The read counterpart of `apply_symmetrize`.
+
+    Every path that re-derives a served mesh from the pristine raw — a prefab
+    reuse, a re-front, a reset from raw — must replay this or it silently drops
+    the object's mirror, so they all read it from here rather than each
+    re-deriving which plane strings count as valid. `keep_positive` is None on a
+    log written before that field existed, meaning the plane's default half."""
+    applied = logging.find_event("symmetry.applied", id=node_id)
+    if applied is None:
+        return "none", None
+    plane = applied.get("cut_plane")
+    keep = applied.get("keep_positive")
+    return (
+        plane if plane in CUT_PLANES else "none",  # type: ignore[return-value]
+        keep if isinstance(keep, bool) else None,
+    )
 
 
 async def _optimize(src: Path, dst: Path) -> None:

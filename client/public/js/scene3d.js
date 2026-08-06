@@ -13,6 +13,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { createLightRig, LIGHTING_DEFAULTS } from "./splatlight.js";
+import { fmtDurationMs } from "./ui.js";
 
 const BBOX_COLOR_DEFAULT = 0xff3b3b; // zones
 // Objects are colored by the decomposition step that emitted them, so the
@@ -64,6 +65,10 @@ function zoneLayerColorHex(depth) {
 }
 
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
+// Cap the device pixel ratio: beyond ~2x, HiDPI displays quietly render 4-9x the
+// fragments (multiplied again by the OIT multi-pass), which dominates the cost on
+// large scenes for no visible gain.
+const MAX_PIXEL_RATIO = 2;
 const MESH_BUNDLE_MAGIC = "SMB1";
 const MAX_INFLIGHT = 20;
 const CLICK_MAX_MOVE_PX = 4;
@@ -74,8 +79,9 @@ const CLICK_MAX_DURATION_MS = 400;
 // viewer, the trained refs, and the splat preview all share ONE bake rig.
 
 // Selected-map projection ("on mesh" control): each map's material slot + the
-// packed channel to isolate (glTF packs occlusion=R, roughness=G, metalness=B);
-// channel -1 shows the whole RGB map (base/normal/emissive).
+// packed channel to isolate (glTF packs occlusion=R, roughness=G, metalness=B,
+// and opacity in the base-colour ALPHA channel=3); channel -1 shows the whole
+// RGB map (base/normal/emissive).
 const MAP_PROJECTION_SPEC = {
 	base: { slot: "map", channel: -1 },
 	roughness: { slot: "roughnessMap", alt: "metalnessMap", channel: 1 },
@@ -83,6 +89,7 @@ const MAP_PROJECTION_SPEC = {
 	occlusion: { slot: "aoMap", channel: 0 },
 	normal: { slot: "normalMap", channel: -1 },
 	emissive: { slot: "emissiveMap", channel: -1 },
+	transparency: { slot: "map", channel: 3 },
 };
 // How far the rest of the scene desaturates toward dark grey while a map is
 // projected (0 = off, 1 = full), via the shared `_inspectDim` uniform.
@@ -138,20 +145,31 @@ function buildInspectorMaterial(sourceMat, spec) {
 			// channels; leave colour maps for three to tone-map + encode.
 			.replace(
 				"#include <opaque_fragment>",
-				`if ( uProjChannel >= 0 ) {
+				`if ( uProjChannel == 3 ) {
+					// Opacity view: false-colour the base-colour alpha, then force the
+					// fragment opaque so the heatmap reads even on transparent texels.
+					outgoingLight = _proj_srgb2lin( _proj_turbo( diffuseColor.a ) );
+					diffuseColor.a = 1.0;
+				} else if ( uProjChannel >= 0 ) {
 					float _v = uProjChannel == 0 ? outgoingLight.r : ( uProjChannel == 1 ? outgoingLight.g : outgoingLight.b );
 					outgoingLight = _proj_srgb2lin( _proj_turbo( _v ) );
 				}
 				#include <opaque_fragment>`,
 			);
 	};
-	mat.customProgramCacheKey = () => "mapproj1|" + channel;
+	mat.customProgramCacheKey = () => "mapproj2|" + channel;
 	return mat;
 }
 
-export function createViewer(host, { keyboard = true, lighting = false } = {}) {
-	const renderer = new THREE.WebGLRenderer({ antialias: true });
-	renderer.setPixelRatio(window.devicePixelRatio);
+export function createViewer(
+	host,
+	{ keyboard = true, lighting = false, maxPixelRatio = MAX_PIXEL_RATIO } = {},
+) {
+	const renderer = new THREE.WebGLRenderer({
+		antialias: true,
+		powerPreference: "high-performance",
+	});
+	renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxPixelRatio));
 	renderer.setClearColor(0x101114);
 	// Physically-based tone mapping + shadows for the MAIN viewer only; the mini /
 	// compare viewers keep flat linear shading (lighting=false), so the engine
@@ -161,6 +179,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		renderer.toneMappingExposure = 1.0;
 		renderer.shadowMap.enabled = true;
 		renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+		// A directional shadow map depends only on the geometry + sun angle, never
+		// on the view camera — so re-rendering it every frame (the default) is pure
+		// waste. We drive it on demand via invalidateShadow() when meshes or the
+		// light actually move; a plain camera orbit never touches it.
+		renderer.shadowMap.autoUpdate = false;
+		renderer.shadowMap.needsUpdate = true;
 	}
 	host.prepend(renderer.domElement);
 
@@ -172,12 +196,43 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const overlayRoot = new THREE.Group();
 	scene.add(sceneRoot, bboxRoot, overlayRoot);
 
-	const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 5000);
+	// --- render-on-demand --------------------------------------------------------
+	// The scene is static between interactions (no animation/skinning), and many
+	// viewers can be live at once (a board tile per cell, the two compare panes),
+	// so drawing every frame regardless of change pins the GPU for nothing.
+	// Instead every state change marks a frame dirty via invalidate(); the loop
+	// draws exactly one frame and idles. Camera motion (orbit damping, fly keys,
+	// FP mouse-look) is detected in the loop / control events and self-invalidates.
+	let needsRender = true;
+	// The transparent-material list only changes when the scene graph does, so we
+	// rebuild it on this flag rather than traversing every mesh each frame.
+	let oitDirty = true;
+	const invalidate = () => {
+		needsRender = true;
+	};
+	// Geometry changed (mesh added / removed / re-materialed): the frame, the OIT
+	// set, and the (view-independent) shadow map all need refreshing.
+	const invalidateGeometry = () => {
+		needsRender = true;
+		oitDirty = true;
+		if (lighting) renderer.shadowMap.needsUpdate = true;
+	};
+	// The sun moved (angle/intensity via the lighting panel): redraw + re-cast the
+	// shadow map, but the OIT material set is untouched.
+	const invalidateShadow = () => {
+		needsRender = true;
+		if (lighting) renderer.shadowMap.needsUpdate = true;
+	};
+
+	const camera = new THREE.PerspectiveCamera(75, 1, 0.05, 5000);
 	camera.position.set(14, 10, 14);
 	const controls = new OrbitControls(camera, renderer.domElement);
 	controls.enableDamping = true;
 	controls.dampingFactor = 0.08;
 	controls.target.set(0, 1, 0);
+	// Free MIDDLE + RIGHT for our own handlers: middle-click hides a node, and
+	// holding right drags a first-person look. Left still orbits; wheel zooms.
+	controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: null, RIGHT: null };
 	controls.update();
 
 	let cameraUserMoved = false;
@@ -202,9 +257,19 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		? new PointerLockControls(camera, renderer.domElement)
 		: null;
 	let cameraMode = "orbit"; // "orbit" | "fp"
-	const orbitFov = camera.fov; // restored on FP exit
-	const FP_FOV_SCALE = 1.5; // FP widens the view +50% for a natural walk-through
+	// Hold RIGHT to look: a MOMENTARY first-person fly (pointer lock) for the
+	// duration of the hold — same mechanism as the permanent toggle, so the
+	// mouse-look is 1:1 (cursor captured, no screen-edge stall). `rmbInitiated`
+	// marks a lock that came from the right-hold (so it exits on release and
+	// doesn't flip the toggle button); `rmbHeld` tracks the physical button for
+	// the async-lock race guard.
+	let rmbInitiated = false;
+	let rmbHeld = false;
 	let fpSpeedScale = 10; // scene-scaled walk speed + target-ahead distance
+	// Fly-speed multiplier the scroll wheel adjusts in first-person mode. It
+	// scales the scene-derived base speed (so the same value feels consistent at
+	// any scene size) and persists across FP sessions + scenes as a view preference.
+	let speedMultiplier = 1;
 	let onCameraModeCb = () => {};
 	const _fpDir = new THREE.Vector3();
 
@@ -220,34 +285,46 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	function setCameraMode(mode) {
 		if (!fp) return;
-		if (mode === "fp")
+		if (mode === "fp") {
+			rmbInitiated = false; // a toggle-driven lock (drives the button)
 			fp.lock(); // requestPointerLock — needs the click gesture
-		else fp.unlock();
+		} else {
+			fp.unlock();
+		}
 	}
 
 	if (fp) {
+		// FP mouse-look mutates the camera outside the orbit path (its own mousemove
+		// handler), so repaint whenever it fires a change.
+		fp.addEventListener("change", invalidate);
 		// The lock/unlock events are the single source of truth for the mode, so
-		// Esc (browser-native exit) and a refused lock are both handled cleanly.
+		// Esc (native exit), a refused lock, and the right-hold all resolve here.
 		fp.addEventListener("lock", () => {
 			cameraMode = "fp";
 			fpSpeedScale = sceneRadius();
-			camera.fov = orbitFov * FP_FOV_SCALE;
-			camera.updateProjectionMatrix();
 			controls.enabled = false; // stop orbit input; the loop skips its update()
 			setHovered(null);
 			tooltip.style.display = "none";
-			onCameraModeCb("fp");
+			// Right-hold released before the async lock engaged — exit straight out.
+			if (rmbInitiated && !rmbHeld) {
+				fp.unlock();
+				return;
+			}
+			// A right-hold look is momentary; only the toggle drives the button.
+			if (!rmbInitiated) onCameraModeCb("fp");
 		});
 		fp.addEventListener("unlock", () => {
 			cameraMode = "orbit";
-			camera.fov = orbitFov; // restore the orbit view
-			camera.updateProjectionMatrix();
 			syncTargetAhead(); // hand the FP pose to orbit before it takes back over
 			controls.enabled = true;
 			controls.update();
 			setHovered(null);
 			tooltip.style.display = "none";
-			onCameraModeCb("orbit");
+			hideSpeedHud(); // fly-speed control only applies in FP
+			const wasRmb = rmbInitiated;
+			rmbInitiated = false;
+			rmbHeld = false;
+			if (!wasRmb) onCameraModeCb("orbit");
 		});
 	}
 
@@ -401,6 +478,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Overlay-provided callbacks: node info for the tooltip + hidden-state
 	// ancestor walks, selection / hidden-set sync to the observability tree.
 	let nodeInfo = () => null;
+	// Overlay-provided: the pipeline steps that ran on/for a node (its own calls +
+	// the provenance that named/placed it), listed in the hover tooltip. Defaults
+	// to none — the mini / compare viewers don't wire it, so their tooltip stays
+	// id + base info.
+	let nodeSteps = () => [];
 	let onSelectCb = () => {};
 	let onHiddenChangeCb = () => {};
 	// Overlay-provided: the decomposition step that emitted a node (its
@@ -454,6 +536,68 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		"line-height: 1.35",
 	].join("; ");
 	document.body.appendChild(tooltip);
+
+	// Transient fly-speed HUD (main / FP viewer only). A small readout pinned to
+	// the left of the screen that flashes when the scroll wheel changes the speed
+	// and fades out shortly after — hidden the rest of the time. pointer-events:none
+	// so it never intercepts a click; opacity (not display) toggles so it fades.
+	const speedHud = keyboard ? document.createElement("div") : null;
+	let speedHudTimer = null;
+	if (speedHud) {
+		speedHud.style.cssText = [
+			"position: fixed",
+			"left: 18px",
+			"top: 50%",
+			"transform: translateY(-50%)",
+			"padding: 6px 11px",
+			"background: rgba(22, 24, 29, 0.94)",
+			"color: #e6e6e6",
+			"border: 1px solid #2a2d35",
+			"border-radius: 6px",
+			"font: 12px ui-monospace, SFMono-Regular, Menlo, monospace",
+			"pointer-events: none",
+			"opacity: 0",
+			"transition: opacity 0.25s ease",
+			"z-index: 110",
+			"white-space: nowrap",
+		].join("; ");
+		document.body.appendChild(speedHud);
+	}
+	function showSpeedHud() {
+		if (!speedHud) return;
+		speedHud.textContent = `fly speed ×${speedMultiplier.toFixed(2)}`;
+		speedHud.style.opacity = "1";
+		if (speedHudTimer) clearTimeout(speedHudTimer);
+		speedHudTimer = setTimeout(() => {
+			speedHud.style.opacity = "0";
+		}, 1200);
+	}
+	function hideSpeedHud() {
+		if (!speedHud) return;
+		if (speedHudTimer) {
+			clearTimeout(speedHudTimer);
+			speedHudTimer = null;
+		}
+		speedHud.style.opacity = "0";
+	}
+
+	// Scroll wheel adjusts the fly speed IN FIRST-PERSON MODE (multiplicative, so
+	// each notch feels the same at any current speed), flashing the HUD. In orbit
+	// mode the wheel is left to OrbitControls' zoom, untouched. Non-passive so the
+	// page can't scroll under the locked pointer.
+	if (keyboard) {
+		renderer.domElement.addEventListener(
+			"wheel",
+			(ev) => {
+				if (cameraMode !== "fp") return; // orbit: wheel stays zoom
+				ev.preventDefault();
+				const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15; // scroll up = faster
+				speedMultiplier = Math.min(16, Math.max(0.05, speedMultiplier * factor));
+				showSpeedHud();
+			},
+			{ passive: false },
+		);
+	}
 
 	// --- shared helpers ----------------------------------------------------------
 
@@ -627,6 +771,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		for (const id of bboxes.keys()) applyBboxVisibility(id);
 		for (const id of models.keys()) applyModelVisibility(id);
 		grid.visible = show.grid;
+		// Hiding/showing a mesh changes what casts shadows, so re-cast (no-op in the
+		// flat mini viewers, where invalidateShadow just marks the frame dirty).
+		invalidateShadow();
 	}
 
 	// Re-derive every bbox's base color — called after the obs model's provenance
@@ -634,6 +781,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// their decomposition step was known defaulted to the object green.
 	function recolorAll() {
 		for (const id of bboxes.keys()) applyBboxColor(id);
+		invalidate();
 	}
 
 	// --- zone-layers view --------------------------------------------------------
@@ -666,6 +814,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// The axes are world-aligned (there is one global canonical front view), so
 	// they're placed AT the inspected node to show how its geometry sits in it.
 	function setAxes(on, { center = [0, 0, 0], size = 1 } = {}) {
+		invalidate();
 		if (axesGroup) {
 			scene.remove(axesGroup);
 			axesGroup.traverse((o) => {
@@ -679,6 +828,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		helper.material.depthTest = false;
 		helper.material.transparent = true;
 		helper.renderOrder = 998;
+		helper.layers.set(OVERLAY_LAYER);
 		axesGroup = new THREE.Group();
 		axesGroup.add(helper);
 		axesGroup.position.set(center[0] ?? 0, center[1] ?? 0, center[2] ?? 0);
@@ -687,6 +837,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	function clearOrientationArrow() {
 		if (!orientationArrow) return;
+		invalidate();
 		scene.remove(orientationArrow);
 		orientationArrow.line?.geometry?.dispose?.();
 		orientationArrow.line?.material?.dispose?.();
@@ -727,9 +878,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			part.material.depthTest = false;
 			part.material.transparent = true;
 			part.renderOrder = 997;
+			part.layers.set(OVERLAY_LAYER);
 		}
 		scene.add(arrow);
 		orientationArrow = arrow;
+		invalidate();
 	}
 
 	// The depths currently present among zone bboxes + each one's runtime color,
@@ -759,6 +912,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyBboxColor(id);
 		if (prev !== null) applyBboxVisibility(prev);
 		if (id !== null) applyBboxVisibility(id);
+		invalidate();
 	}
 
 	// --- picking -------------------------------------------------------------------
@@ -884,7 +1038,38 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			lbl.style.color = "#7a8190";
 			row.appendChild(lbl);
 			row.appendChild(document.createTextNode(text));
-			tooltip.appendChild(row);
+		tooltip.appendChild(row);
+		}
+		// The pipeline steps that ran on/for this node — not just its base info.
+		// One PER LINE: the step name (×count when it ran more than once), tagged
+		// (generated)/(placed) for the provenance calls that named/positioned the
+		// node, and the step's grouped flight time (summed across its calls).
+		const steps = nodeSteps(id);
+		if (steps.length) {
+			const relTag = { emitted_by: "generated", placed_by: "placed" };
+			const head = document.createElement("div");
+			head.textContent = "steps:";
+			head.style.marginTop = "4px";
+			head.style.color = "#7a8190";
+			tooltip.appendChild(head);
+			for (const s of steps) {
+				const row = document.createElement("div");
+				row.style.color = "#bdbdbd";
+				row.style.paddingLeft = "10px";
+				row.appendChild(
+					document.createTextNode(
+						`${s.step}${s.count > 1 ? ` ×${s.count}` : ""}` +
+							`${s.relation ? ` (${relTag[s.relation] ?? s.relation})` : ""}`,
+					),
+				);
+				if (s.flightMs != null) {
+					const t = document.createElement("span");
+					t.textContent = ` · ${fmtDurationMs(s.flightMs)}`;
+					t.style.color = "#8a9099";
+					row.appendChild(t);
+				}
+				tooltip.appendChild(row);
+			}
 		}
 		placeTooltip(clientX, clientY);
 	}
@@ -904,6 +1089,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		camera.far = Math.max(100, radius * 100);
 		camera.updateProjectionMatrix();
 		controls.update();
+		invalidate();
 	}
 
 	// Toggle selection (re-selecting clears, like the old tree click). Framing
@@ -924,6 +1110,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			}
 		}
 		if (notify) onSelectCb(selectedId);
+		invalidate();
 		return selectedId;
 	}
 
@@ -935,6 +1122,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyBboxColor(prev);
 		for (const bid of bboxes.keys()) applyBboxVisibility(bid);
 		clearOrientationArrow();
+		invalidate();
 		if (notify) onSelectCb(null);
 	}
 
@@ -968,10 +1156,25 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		_downY = ev.clientY;
 		_downT = performance.now();
 		_downButton = ev.button;
+		// Hold RIGHT to look (momentary FP via pointer lock). Only from orbit —
+		// if already in FP (the toggle), leave that lock alone.
+		if (ev.button === 2 && fp && cameraMode === "orbit") {
+			rmbInitiated = true;
+			rmbHeld = true;
+			fp.lock();
+		}
 	});
 	renderer.domElement.addEventListener("pointerup", (ev) => {
+		if (ev.button === 2) {
+			rmbHeld = false;
+			if (cameraMode === "fp" && rmbInitiated) fp.unlock(); // end the look
+			return;
+		}
 		if (cameraMode !== "orbit") return; // FP: the pointer is captured for look
-		if (_downButton !== 0 || ev.button !== 0) return;
+		// A click (not a drag) of the SAME button that went down: LEFT selects,
+		// MIDDLE toggles per-node hide.
+		if (ev.button !== _downButton || (ev.button !== 0 && ev.button !== 1))
+			return;
 		const dx = ev.clientX - _downX;
 		const dy = ev.clientY - _downY;
 		if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX) return;
@@ -980,22 +1183,27 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
 		pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
 		raycaster.setFromCamera(pointer, camera);
-		const id = pickHoveredId();
-		if (id !== null) select(id);
-		else clearSelection();
+		if (ev.button === 0) {
+			const id = pickHoveredId();
+			if (id !== null) select(id);
+			else clearSelection();
+		} else {
+			const id = pickRightClickId(); // middle-click hide
+			if (id !== null) toggleHidden(id);
+		}
 	});
 
-	// Right-click toggles per-node hide for the picked id. The mesh disappears,
-	// the bbox stays as a volumetric reference and as the click target for
-	// un-hiding. Suppresses the browser's default context menu.
+	// A cancelled right-hold (lost pointer) exits the look like a normal release.
+	renderer.domElement.addEventListener("pointercancel", () => {
+		if (!rmbHeld) return;
+		rmbHeld = false;
+		if (cameraMode === "fp" && rmbInitiated) fp.unlock();
+	});
+
+	// Right-hold is the look handle (see pointerdown), so suppress the browser
+	// context menu. Per-node hide is on middle-click (see pointerup).
 	renderer.domElement.addEventListener("contextmenu", (ev) => {
 		ev.preventDefault();
-		const rect = renderer.domElement.getBoundingClientRect();
-		pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-		pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-		raycaster.setFromCamera(pointer, camera);
-		const id = pickRightClickId();
-		if (id !== null) toggleHidden(id);
 	});
 
 	function isTypingTarget(t) {
@@ -1050,11 +1258,22 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	// First-person flycam: W/S fly along the look direction (pitch included, so
 	// looking up climbs and down dives); A/D strafe level; Q/E lower/raise on
-	// world Y; Shift sprints. Mouse-look is applied by fp on mousemove.
+	// world Y; Shift sprints. Mouse-look comes from the FP pointer lock (the
+	// toggle or a right-hold).
+	// Returns whether the camera actually moved this frame, so the render loop can
+	// invalidate only when it did (shift alone, or no keys, moves nothing).
 	function applyFpMove(dt) {
-		if (pressedKeys.size === 0) return;
+		const moving =
+			pressedKeys.has("w") ||
+			pressedKeys.has("s") ||
+			pressedKeys.has("a") ||
+			pressedKeys.has("d") ||
+			pressedKeys.has("e") ||
+			pressedKeys.has("q");
+		if (!moving) return false;
 		const speed =
 			Math.max(2, fpSpeedScale * 0.5) *
+			speedMultiplier *
 			(pressedKeys.has("shift") ? 3 : 1) *
 			dt;
 		if (pressedKeys.has("w") || pressedKeys.has("s")) {
@@ -1069,11 +1288,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (pressedKeys.has("e")) camera.position.y += speed;
 		if (pressedKeys.has("q")) camera.position.y -= speed;
 		cameraUserMoved = true;
+		return true;
 	}
 
 	function applyKeyboardMove(dt) {
 		if (cameraMode === "fp") return applyFpMove(dt);
-		if (pressedKeys.size === 0) return;
+		if (pressedKeys.size === 0) return false;
 		const shifted = pressedKeys.has("shift");
 		const camDist = Math.max(
 			1,
@@ -1082,7 +1302,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const speed = Math.max(2, camDist * 0.6) * (shifted ? 3 : 1) * dt;
 		_fwd.subVectors(controls.target, camera.position);
 		_fwd.y = 0;
-		if (_fwd.lengthSq() === 0) return;
+		if (_fwd.lengthSq() === 0) return false;
 		_fwd.normalize();
 		_right.crossVectors(_fwd, _worldUp).normalize();
 		_move.set(0, 0, 0);
@@ -1092,10 +1312,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (pressedKeys.has("a")) _move.addScaledVector(_right, -speed);
 		if (pressedKeys.has("e")) _move.addScaledVector(_worldUp, speed);
 		if (pressedKeys.has("q")) _move.addScaledVector(_worldUp, -speed);
+		let moved = false;
 		if (_move.lengthSq() !== 0) {
 			camera.position.add(_move);
 			controls.target.add(_move);
 			cameraUserMoved = true;
+			moved = true;
 		}
 		if (pressedKeys.has("r") || pressedKeys.has("f")) {
 			const rate = shifted ? 4 : 1.5;
@@ -1110,8 +1332,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				);
 				camera.position.copy(controls.target).add(offset);
 				cameraUserMoved = true;
+				moved = true;
 			}
 		}
+		return moved;
 	}
 
 	// --- scene population --------------------------------------------------------------
@@ -1136,6 +1360,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		camera.far = Math.max(100, radius * 100);
 		camera.updateProjectionMatrix();
 		controls.update();
+		invalidate();
 	}
 
 	// Half the scene's largest dimension (meshes, else bboxes) — scales the FP
@@ -1280,6 +1505,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyBboxColor(id);
 		applyBboxVisibility(id);
 		scheduleFit();
+		invalidate();
 	}
 
 	// Proposed-placement overlay — the prompt-lab's "after" boxes (a tested
@@ -1292,6 +1518,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			child.geometry?.dispose?.();
 			child.material?.dispose?.();
 		}
+		invalidate();
 	}
 
 	function setOverlayBoxes(boxes) {
@@ -1319,6 +1546,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			helper.material.depthTest = false;
 			helper.material.transparent = true;
 			helper.renderOrder = 999;
+			helper.layers.set(OVERLAY_LAYER);
 			overlayRoot.add(helper);
 		}
 	}
@@ -1335,6 +1563,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			// The caster stays on; reception is gated through the shared uniform
 			// (below), so toggling shadows needs no shader recompile.
 			keepCasterOn: true,
+			// 2048² (~17 MB) rather than the capture rigs' 4096² (~67 MB): a soft
+			// contact shadow spread over the whole scene doesn't need 4K, and
+			// on-demand shadow rendering means there's no temporal shimmer to
+			// betray it. Bump back up for crisper contact shadows at ~50 MB.
+			shadowMapSize: 2048,
 			decorateLights: ({ hemi, key }) => {
 				hemi.layers.enableAll(); // also light the OIT layer
 				key.layers.enableAll();
@@ -1353,6 +1586,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			},
 			setLighting: (partial) => rig.setLighting(partial),
 			getLighting: () => rig.getLighting(),
+			// Free the shadow map's GPU texture when the viewer is hidden. three
+			// re-creates it on the next shadow render — invalidateShadow (fired by
+			// setActive on re-show) re-arms needsUpdate — so a closed overlay stops
+			// holding ~17 MB of VRAM it isn't using.
+			releaseGPU: () => rig.releaseGPU(),
 		};
 	}
 
@@ -1391,6 +1629,26 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		m.needsUpdate = true;
 	}
 
+	// Store generated normals as normalized int16 (2 B/component) instead of
+	// float32 (4). The optimized GLBs ship no normals (only int16 POSITION + uint16
+	// TEXCOORD_0), so we compute them — as float32 that buffer is the single
+	// LARGEST vertex attribute on a dense scene (bigger than the quantized
+	// positions), duplicated in both JS heap and VRAM. int16 halves it (~0.5 GB
+	// heap + ~0.5 GB VRAM saved on a ~100 M-vertex scene) and the shader normalizes
+	// per-fragment anyway, so there's no visible quality cost. Picking stays correct
+	// (raycast reads the attribute via fromBufferAttribute, which de-normalizes).
+	function quantizeNormalsInt16(geometry) {
+		const n = geometry.getAttribute("normal");
+		if (!n || !(n.array instanceof Float32Array)) return;
+		const src = n.array;
+		const q = new Int16Array(src.length);
+		for (let i = 0; i < src.length; i++) {
+			const v = src[i] < -1 ? -1 : src[i] > 1 ? 1 : src[i];
+			q[i] = (v * 32767 + (v >= 0 ? 0.5 : -0.5)) | 0; // fast round-to-nearest
+		}
+		geometry.setAttribute("normal", new THREE.BufferAttribute(q, 3, true));
+	}
+
 	// Every loaded GLB: double-sided (Trellis shells are often single-sided),
 	// shadow cast + receive, smooth normals computed when absent (generated meshes
 	// ship without them, which otherwise breaks shadow reception), and the
@@ -1404,6 +1662,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			child.receiveShadow = true;
 			if (child.geometry && !child.geometry.getAttribute("normal")) {
 				child.geometry.computeVertexNormals();
+				quantizeNormalsInt16(child.geometry);
 			}
 			if (!child.material) return;
 			const mats = Array.isArray(child.material)
@@ -1459,6 +1718,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			o.userData.__oit = false;
 			o.layers.set(0);
 		});
+		invalidateGeometry();
 		return true;
 	}
 
@@ -1476,6 +1736,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			delete o.userData.__projLayerMask;
 			delete o.userData.__projOit;
 		});
+		invalidateGeometry();
 	}
 
 	// Project `desc.mapType` of object `id`; false when the mesh isn't loaded or
@@ -1520,6 +1781,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyModelVisibility(id);
 		if (reproject) setMapProjection(id, { mapType: reproject });
 		scheduleFit();
+		invalidateGeometry();
 	}
 
 	const failedUrls = new Set(); // `${gen}|${url}` — don't re-parse known-bad GLBs
@@ -1765,6 +2027,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		// doesn't yank the user's vantage. A plain clear re-arms the auto-fit so a
 		// freshly-opened scene frames itself.
 		cameraUserMoved = keepCamera;
+		invalidateGeometry();
 	}
 
 	// Drop every loaded GLB mesh while KEEPING the bbox/proxy structure (and the
@@ -1783,6 +2046,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		}
 		models.clear();
 		failedUrls.clear();
+		invalidateGeometry();
 	}
 
 	// Reconcile the scene DOWN to an exact id set: drop every bbox/proxy/mesh no
@@ -1828,6 +2092,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			models.delete(id);
 		}
 		scheduleFit();
+		invalidateGeometry();
 	}
 
 	function scheduleFit() {
@@ -1837,9 +2102,13 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	function resize() {
 		const w = host.clientWidth || 1;
 		const h = host.clientHeight || 1;
+		renderer.setPixelRatio(
+			Math.min(window.devicePixelRatio || 1, maxPixelRatio),
+		);
 		renderer.setSize(w, h);
 		camera.aspect = w / h;
 		camera.updateProjectionMatrix();
+		invalidate();
 	}
 	const resizeObserver = new ResizeObserver(resize);
 	resizeObserver.observe(host);
@@ -1853,6 +2122,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// (windows, pools, the mostly-opaque car) with no per-triangle sorting. Only
 	// engaged while transparent meshes are loaded; otherwise the plain path runs.
 	const OIT_LAYER = 1;
+	// Depth-test-off gizmos (orientation arrow, axes, overlay boxes) live here so
+	// they render in a dedicated final pass AFTER the OIT composite — otherwise the
+	// composite quad overwrites them wherever a generated mesh is in front.
+	const OVERLAY_LAYER = 2;
 	// Depth pre-pass cutoff: fragments at/above this occlude (write depth) so solid
 	// surfaces and window frames don't bleed the background; genuine glass below it
 	// blends. Sits just above typical window alpha (~0.6-0.78) and below the
@@ -1999,15 +2272,24 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	}
 
 	const _oitMats = [];
-	function renderFrame() {
+	// Rebuilt only when the scene graph changes (oitDirty) rather than every frame:
+	// the traverse is O(all meshes) and was the render loop's standing per-frame tax
+	// on large scenes.
+	function rebuildOitMats() {
 		_oitMats.length = 0;
 		sceneRoot.traverse((o) => {
 			if (!o.userData.__oit || !o.material) return;
 			if (Array.isArray(o.material)) _oitMats.push(...o.material);
 			else _oitMats.push(o.material);
 		});
+		oitDirty = false;
+	}
+	function renderFrame() {
+		if (oitDirty) rebuildOitMats();
 		if (_oitMats.length === 0) {
 			renderer.setRenderTarget(null);
+			camera.layers.set(0);
+			camera.layers.enable(OVERLAY_LAYER);
 			renderer.render(scene, camera);
 			return;
 		}
@@ -2066,6 +2348,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		renderer.setRenderTarget(null);
 		oitCompose.uniforms.uExposure.value = renderer.toneMappingExposure;
 		renderer.render(oitQuadScene, oitQuadCamera);
+
+		// Overlay pass: depth-test-off gizmos (arrow, axes, overlay boxes) live on
+		// OVERLAY_LAYER and must render AFTER the composite so they aren't occluded.
+		renderer.autoClear = false;
+		camera.layers.set(OVERLAY_LAYER);
+		renderer.render(scene, camera);
 	}
 
 	let disposed = false;
@@ -2076,18 +2364,22 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const now = performance.now();
 		const dt = Math.min(0.1, (now - lastMoveT) / 1000);
 		lastMoveT = now;
-		applyKeyboardMove(dt);
-		if (cameraMode === "fp") syncTargetAhead();
-		else controls.update();
 
-		gridMat.uniforms.uCameraPos.value.copy(camera.position);
-		const camDist = Math.max(
-			1,
-			camera.position.distanceTo(controls.target),
-		);
-		gridMat.uniforms.uFadeStart.value = camDist * 0.5;
-		gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
+		// Camera motion is the primary "something changed" signal. Keyboard fly
+		// reports whether it moved; orbit + damping is driven by controls.update()
+		// (true while still settling); FP mouse-look self-invalidates via 'change'.
+		const moved = applyKeyboardMove(dt);
+		let cameraChanged = moved;
+		if (cameraMode === "fp") {
+			syncTargetAhead();
+		} else if (controls.update()) {
+			cameraChanged = true;
+		}
+		if (cameraChanged) invalidate();
 
+		// Hover pick runs only after a pointer move (pointerDirty); setHovered
+		// invalidates only when the hovered id actually changes, so idly sweeping
+		// the cursor over the same object costs a raycast but no redraw.
 		if (cameraMode === "orbit" && pointerDirty && !controlsInteracting) {
 			pointerDirty = false;
 			if (pointerInsideCanvas) {
@@ -2102,9 +2394,23 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 		if (fitPending) {
 			fitPending = false;
-			fitToScene();
+			fitToScene(); // invalidates when it actually reframes
 			lightingRig?.refit();
 		}
+
+		// Render-on-demand: draw exactly one frame when dirty, then idle. Nothing in
+		// the scene animates on its own, so a settled view costs only this loop's
+		// cheap bookkeeping — freeing the GPU for the other live viewers on screen.
+		if (!needsRender) return;
+		needsRender = false;
+
+		// The grid's distance fade tracks the camera, so it only needs refreshing on
+		// a frame we're actually drawing.
+		gridMat.uniforms.uCameraPos.value.copy(camera.position);
+		const camDist = Math.max(1, camera.position.distanceTo(controls.target));
+		gridMat.uniforms.uFadeStart.value = camDist * 0.5;
+		gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
+
 		renderFrame();
 	})();
 
@@ -2117,6 +2423,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		clearOverlayBoxes,
 		setOverlayVisible: (v) => {
 			overlayRoot.visible = v;
+			invalidate();
 		},
 		setBboxesVisible: (v) => {
 			show.bboxes = v;
@@ -2133,7 +2440,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			projectedId === id ? projectedMapType : null,
 		// Lighting engine (main viewer only; no-ops + null elsewhere). The panel
 		// (lighting.js) drives setLighting; lightingDefaults seeds its reset.
-		setLighting: (partial) => lightingRig?.setLighting(partial),
+		setLighting: (partial) => {
+			lightingRig?.setLighting(partial);
+			invalidateShadow(); // exposure/intensity redraw; sun angle re-casts shadows
+		},
 		getLighting: () => lightingRig?.getLighting() ?? null,
 		lightingDefaults: lightingRig ? LIGHTING_DEFAULTS : null,
 		hasModel: (id) => models.has(id),
@@ -2158,6 +2468,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		setNodeInfo: (fn) => {
 			nodeInfo = fn;
 		},
+		setNodeSteps: (fn) => {
+			nodeSteps = fn;
+		},
 		setOriginOf: (fn) => {
 			originOf = fn;
 		},
@@ -2177,11 +2490,23 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			active = v;
 			if (!v) {
 				if (fp && fp.isLocked) fp.unlock();
+				rmbHeld = false;
 				pressedKeys.clear();
 				setHovered(null);
 				tooltip.style.display = "none";
+				hideSpeedHud();
+				// Reclaim the big GPU allocations while hidden: the OIT render targets
+				// (~tens of MB at full size) and the shadow map. Both are lazily
+				// rebuilt on the next active frame (invalidateGeometry below re-arms
+				// them on re-show), so a closed overlay / off-screen tile stops
+				// holding VRAM it isn't drawing to.
+				disposeOITTargets();
+				lightingRig?.releaseGPU();
 			} else {
 				resize();
+				// Re-cast the shadow + rebuild the OIT set on the first shown frame,
+				// in case the scene changed (or the GL buffers were freed) while hidden.
+				invalidateGeometry();
 			}
 		},
 		// Camera read/write + change hook — lets the compare view keep two
@@ -2197,6 +2522,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			camera.updateProjectionMatrix();
 			controls.update();
 			cameraUserMoved = true;
+			invalidate();
 		},
 		onCameraChange: (cb) => controls.addEventListener("change", cb),
 		// First-person camera mode (main viewer only; a no-op where fp is null).
@@ -2230,6 +2556,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			oitQuad.geometry.dispose();
 			controls.dispose();
 			tooltip.remove();
+			if (speedHudTimer) clearTimeout(speedHudTimer);
+			speedHud?.remove();
 			renderer.dispose();
 			renderer.forceContextLoss?.();
 			renderer.domElement.remove();

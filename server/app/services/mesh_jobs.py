@@ -26,6 +26,11 @@ Hunyuan rather than per-backend.
 Image generation lives in `app.services.nano_banana`; callers run that first,
 then pass the resulting bytes (or a hosted URL) here.
 
+Every job that reaches the submit loop logs exactly one terminal event —
+`<scope>.done` or `<scope>.abandoned` — so a reader of the log can always tell a
+finished job from one that ended with nothing to show for it. The API layer folds
+those into the per-asset failure list the client renders.
+
 Restart-resilience on completed work lives in `app.utils.resumable`: if
 `<scope>.done` was logged and the saved GLB still exists, we short-circuit and
 reuse it. Anything not done re-submits fresh — we don't probe stale Modal
@@ -120,6 +125,16 @@ class JobLostError(Exception):
     id again is hopeless; the outer retry loop should treat this as a resubmit
     signal: drop the dead task_id and call `_post_generate` again on the next
     attempt."""
+
+
+# Every `generate_mesh` call that gets as far as submitting ends with EXACTLY one
+# terminal event: `<scope>.done` on success, or `<scope>.abandoned` on any other
+# exit. The abandoned case is logged from a `finally`, so it also covers the paths
+# that previously logged nothing at all — notably task cancellation, which raises
+# BaseException and so slips past the `except Exception` in the pipeline's
+# `_generate_one`. That invariant is what lets the client tell "still running"
+# apart from "ended with no mesh and no explanation".
+ABANDONED_CANCELLED = "cancelled before the backend returned a result"
 
 
 # Cap on in-flight jobs at any moment (process-global FIFO across all slots AND
@@ -227,6 +242,11 @@ def queue_snapshot() -> list[dict[str, Any]]:
             "job_id": job_id,
             "state": entry["state"],
             "since": entry["since"],
+            # First-seen epoch time (total in-flight); the canonical this row
+            # shares a mesh with, so the panel can nest reuses under it (None on
+            # a canonical / standalone job).
+            "enqueued_at": entry.get("enqueued_at", entry["since"]),
+            "canonical": entry.get("canonical"),
             "task_id": entry.get("task_id"),
             "backend": backend,
             "pool": _pool_for(backend),
@@ -239,14 +259,21 @@ def _queue_set(slot_id: str | None, job_id: str, state: str, **extra: Any) -> No
         return
     key = (slot_id, job_id)
     cur = _QUEUE.get(key)
-    merged = {k: v for k, v in (cur or {}).items() if k not in {"state", "since"}}
+    now = time.time()
+    merged = {
+        k: v for k, v in (cur or {}).items() if k not in {"state", "since", "enqueued_at"}
+    }
     # Overlay only explicitly-provided fields, so a state transition that omits
-    # `backend`/`task_id` keeps what an earlier call recorded (e.g. mark_queued
-    # tags the backend; the later mark_processing needn't repeat it).
+    # `backend`/`task_id`/`canonical` keeps what an earlier call recorded (e.g.
+    # mark_queued tags the backend; the later mark_processing needn't repeat it).
     merged.update({k: v for k, v in extra.items() if v is not None})
     _QUEUE[key] = {
         "state": state,
-        "since": cur["since"] if cur and cur["state"] == state else time.time(),
+        # `since` marks the CURRENT state's start (resets on transition);
+        # `enqueued_at` is the first-seen time and never resets, so the panel can
+        # show total time-in-flight across the waiting→processing handoff.
+        "since": cur["since"] if cur and cur["state"] == state else now,
+        "enqueued_at": (cur or {}).get("enqueued_at", now),
         **merged,
     }
 
@@ -262,14 +289,22 @@ def inflight_ids(slot_id: str) -> set[str]:
     return {jid for (sid, jid) in _QUEUE if sid == slot_id}
 
 
-def mark_queued(slot_id: str | None, job_id: str, *, backend: str | None = None) -> None:
+def mark_queued(
+    slot_id: str | None,
+    job_id: str,
+    *,
+    backend: str | None = None,
+    canonical: str | None = None,
+) -> None:
     """Register an externally-managed job (e.g. a regeneration awaiting its turn
     in a per-cell worker) as `waiting` in the shared queue snapshot, so it shows
     in the same queue panel as live mesh work. `backend` tags the row so the
-    panel buckets it into the right pool section. When the job actually submits,
-    `generate_mesh` takes over the (slot_id, job_id) entry; pair this with
-    `unmark_queued` at hand-off / cancellation so it can't leak."""
-    _queue_set(slot_id, job_id, "waiting", backend=backend)
+    panel buckets it into the right pool section. `canonical` (a prefab
+    canonical's job id) nests this row under that canonical's entry — set it on a
+    reuse so the shared-mesh group shows as one expandable entry. When the job
+    actually submits, `generate_mesh` takes over the (slot_id, job_id) entry; pair
+    this with `unmark_queued` at hand-off / cancellation so it can't leak."""
+    _queue_set(slot_id, job_id, "waiting", backend=backend, canonical=canonical)
 
 
 def unmark_queued(slot_id: str | None, job_id: str) -> None:
@@ -279,14 +314,20 @@ def unmark_queued(slot_id: str | None, job_id: str) -> None:
 
 
 def mark_processing(
-    slot_id: str | None, job_id: str, *, task_id: str | None = None, backend: str | None = None,
+    slot_id: str | None,
+    job_id: str,
+    *,
+    task_id: str | None = None,
+    backend: str | None = None,
+    canonical: str | None = None,
 ) -> None:
     """Promote a queue entry to `processing` for an externally-managed job that
     runs its own submit/poll lifecycle outside `generate_mesh` — e.g. the direct
     Tencent Hunyuan backend, which still belongs in the shared queue panel as the
-    live in-flight row. `backend` tags the row's pool section. Pair with
-    `mark_queued` (waiting) and `unmark_queued`."""
-    _queue_set(slot_id, job_id, "processing", task_id=task_id, backend=backend)
+    live in-flight row. `backend` tags the row's pool section; `canonical` nests
+    it under a shared-mesh canonical (see `mark_queued`). Pair with `mark_queued`
+    (waiting) and `unmark_queued`."""
+    _queue_set(slot_id, job_id, "processing", task_id=task_id, backend=backend, canonical=canonical)
 
 
 def _retry_delay(attempt: int, err: BaseException) -> float:
@@ -492,6 +533,25 @@ def _input_hash(
     })
 
 
+def log_abandoned(
+    scope: str, job_id: str, task_id: str | None, reason: str,
+) -> None:
+    """Record `<scope>.abandoned` — the job ended without a `<scope>.done`.
+    `task_id` is the backend job we walked away from (None when we never got one).
+    Shared with `app.services.hunyuan_tencent`, which runs its own submit/poll
+    lifecycle but owes the log the same terminal event.
+
+    Emitted from a `finally`, so it must not raise: an unbound SlotLog (a script
+    or a test calling `generate_mesh` outside a run) would otherwise replace the
+    exception that is already unwinding with a `LookupError`."""
+    try:
+        logging.log(
+            f"{scope}.abandoned", job_id=job_id, task_id=task_id, reason=reason,
+        )
+    except LookupError:
+        logging.console_note(f"[{scope}.abandoned] {job_id}: {reason}")
+
+
 async def generate_mesh(
     image: bytes | str,
     *,
@@ -537,16 +597,18 @@ async def generate_mesh(
 
     slot_id = logging.current_slot_id()
     _queue_set(slot_id, job_id, "waiting", backend=backend.scope)
+    # By default we hold `server_job_id` across outer retries — any retryable
+    # failure during poll or download re-enters the same Modal job instead of
+    # orphaning it and burning a fresh generation. The exception is JobLostError
+    # (404 from Modal): the worker that held the in-memory job table is gone, and
+    # polling the same id is pointless. On JobLost we clear `server_job_id` so the
+    # next attempt does a fresh submit. Hoisted above the `try` so the terminal
+    # event logged in the `finally` can name the task that was left behind.
+    server_job_id: str | None = None
+    logged_done = False
+    exit_reason = ABANDONED_CANCELLED
     try:
         async with _inflight_sem:
-            # By default we hold `server_job_id` across outer retries — any
-            # retryable failure during poll or download re-enters the same Modal
-            # job instead of orphaning it and burning a fresh generation. The
-            # exception is JobLostError (404 from Modal): the worker that held
-            # the in-memory job table is gone, and polling the same id is
-            # pointless. On JobLost we clear `server_job_id` so the next attempt
-            # does a fresh submit.
-            server_job_id: str | None = None
             for attempt in range(MAX_ATTEMPTS):
                 try:
                     if server_job_id is None:
@@ -580,6 +642,7 @@ async def generate_mesh(
                         server_job_id=server_job_id,
                         saved=str(output_path),
                     )
+                    logged_done = True
                     return output_path
                 except JobLostError as e:
                     logging.log(
@@ -622,7 +685,16 @@ async def generate_mesh(
                     if delay > 0:
                         await asyncio.sleep(delay)
             raise AssertionError("unreachable")
+    except Exception as e:
+        exit_reason = f"{type(e).__name__}: {str(e)[:200]}"
+        raise
     finally:
+        # Cancellation raises BaseException, so it reaches this `finally` without
+        # any `except` of ours seeing it — and `_generate_one` won't catch it
+        # either. That is precisely the exit that used to leave no trace, so the
+        # default `exit_reason` covers it.
+        if not logged_done:
+            log_abandoned(backend.scope, job_id, server_job_id, exit_reason)
         # Whether we succeeded, errored, or were cancelled, the job is no longer
         # in flight. Drop unconditionally so a crashed task can't leak into the
         # queue snapshot.

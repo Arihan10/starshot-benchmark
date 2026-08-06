@@ -15,7 +15,7 @@ import { state, on } from "./state.js";
 import { el, toast, buildObjectsMenu } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { createObsDock } from "./obstree.js";
-import { applySceneProjection, createObsModel, emittedStep } from "./events.js";
+import { applySceneProjection, createObsModel, emittedStep, nodeStepsOf } from "./events.js";
 import { statusView } from "./status.js";
 import { createInvestigator } from "./investigator.js";
 
@@ -92,6 +92,7 @@ function buildPane(prefix) {
   // The viewer reads node info + origin color from THIS pane's obs model; the
   // model object is swapped on each open, so the closures read pane.obs live.
   viewer.setNodeInfo((id) => pane.obs.model.nodes.get(id) ?? null);
+  viewer.setNodeSteps((id) => nodeStepsOf(pane.obs.model, id));
   viewer.setOriginOf((id) => emittedStep(pane.obs.model, id));
   viewer.onSelect((id) => dock.markSelected(id, { scroll: true }));
   dock.setOnNodeClick((id, { ensureSelected = false } = {}) => {

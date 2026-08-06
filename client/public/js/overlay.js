@@ -10,18 +10,20 @@ import {
 	cellBranches,
 	branchSummaryById,
 } from "./state.js";
-import { el, toast, stepUntilSelect, openModal, buildObjectsMenu, promptCapValue } from "./ui.js";
+import { el, toast, stepUntilSelect, openModal, buildObjectsMenu, promptCapValue, fmtDurationMs } from "./ui.js";
 import {
 	openStream,
 	dispatchSceneEvent,
 	applySceneProjection,
 	createObsModel,
 	emittedStep,
+	nodeStepsOf,
 } from "./events.js";
 import { statusView } from "./status.js";
 import { createObsDock } from "./obstree.js";
 import { createTracePanel } from "./tracepanel.js";
 import { createInvestigator } from "./investigator.js";
+import { initGenFailPanel } from "./genfails.js";
 
 const overlayEl = document.getElementById("overlay");
 const titleEl = document.getElementById("overlay-title");
@@ -47,6 +49,11 @@ let optimizedView = true; // generated meshes: optimized KTX2/Meshopt twin vs ra
 let liteOn = false; // when on, show the lite presentation tier (overrides optimized/raw)
 // The effective scene-wide variant for generated meshes.
 const genVariant = () => (liteOn ? "lite" : optimizedView ? "optimized" : "raw");
+// The from-scratch generated build is VERSIONED: a cell can hold many isolated
+// builds (V1/V2/V3…). `genVersion` is the one the generated view shows + builds
+// (null = let the server resolve the latest); `genVersions` is every id on disk.
+let genVersion = null;
+let genVersions = [];
 // Per-object override of the scene-wide optimized/raw toggle: node id ->
 // "optimized" | "raw". Absent = follow `optimizedView`. Reset whenever the
 // scene-wide toggle flips (it sets a fresh baseline for every object).
@@ -62,10 +69,18 @@ let optBtn = null;
 let liteBtn = null;
 let liteGenBtn = null;
 let genStatusEl = null;
+let verSel = null; // generated-version <select>
+let newVerBtn = null; // "＋ new version" button
+let genFails = null; // per-object report of what this build didn't return
 
 // Cache-bust a generated mesh URL by its mtime token, so a regenerated asset
 // (same id + path, new bytes) reloads instead of serving a stale cached GLB.
 const withV = (url, v) => url + (url.includes("?") ? "&" : "?") + "v=" + v;
+
+// Set when this cell was opened from the api-log, so the header can offer a
+// "← logs" return (the log stays one Escape/back away, scene loaded behind it).
+let cameFromLog = false;
+let toLogsBtn = null;
 
 export function initOverlay(sceneViewer) {
 	viewer = sceneViewer;
@@ -79,6 +94,11 @@ export function initOverlay(sceneViewer) {
 		onNavigate: focusNode,
 		onClose: () => viewer.clearSelection(),
 		onInquire: investigateCall,
+		onOpenLog: openLogForCall,
+		// "obs ↗" on a trace step → expand + reveal that same call in the
+		// observability dock (its full, untruncated bytes vs. the trace's node slice).
+		onOpenInObs: (call) => dock.expandCall(call),
+		loadCallBytes,
 		// Project (or clear) a focused-object map onto its mesh; returns whether it
 		// took. `mapProjectionOf` reads the viewer's live state back for the panel.
 		onProjectMap: (id, desc) =>
@@ -201,6 +221,10 @@ export function initOverlay(sceneViewer) {
 	// without toggling it off. 3D-side picks highlight + reveal the tree row,
 	// and the hover tooltip reads seed/plan/image text from the obs model.
 	viewer.setNodeInfo((id) => obs.model.nodes.get(id) ?? null);
+	// Hovering a bbox in 3D lists the pipeline steps that ran on/for the node
+	// (its calls + the provenance that named/placed it) under its base info —
+	// read from the same folded obs model the tree uses.
+	viewer.setNodeSteps((id) => nodeStepsOf(obs.model, id));
 	// Color objects in 3D by the decomposition step that emitted them (next_object
 	// purple, anchor green, negative_space brown) — read from the same provenance
 	// the tree shows as "via {step}". `recolorAll` (below) repaints once a load's
@@ -233,10 +257,21 @@ export function initOverlay(sceneViewer) {
 	// investigator with that step attached. Reads the live view at click time, so
 	// it's shared across source AND branch views.
 	dock.setOnInquire(investigateCall);
+	dock.setOnOpenLog(openLogForCall);
+	dock.setCallBytesLoader(loadCallBytes);
 
-	document
-		.getElementById("overlay-close")
-		.addEventListener("click", closeOverlay);
+	const closeBtn = document.getElementById("overlay-close");
+	closeBtn.addEventListener("click", closeOverlay);
+	// When this cell was reached from the api-log, offer a one-click return to
+	// it. The log overlays the scene (which stays loaded), so it's a fast toggle.
+	toLogsBtn = el("button", {
+		class: "ov-to-logs",
+		text: "← logs",
+		title: "return to the api log (scene stays loaded)",
+		onclick: () => emit("open-flights"),
+	});
+	toLogsBtn.style.display = "none";
+	closeBtn.after(toLogsBtn);
 	document.addEventListener("keydown", (ev) => {
 		if (
 			ev.key === "Escape" &&
@@ -261,6 +296,16 @@ export function initOverlay(sceneViewer) {
 	// at the head of the row. The remaining layers stay plain on/off buttons.
 	const togglesRow = document.getElementById("viewer-toggles");
 	togglesRow.prepend(buildObjectsMenu(viewer));
+	// The row wraps when the canvas is narrow, so the panels floating directly
+	// above it (lighting, the generated-failure report) can't use a fixed offset.
+	// Publish its live height for them to sit on.
+	if ("ResizeObserver" in window) {
+		const host = document.getElementById("canvas-host");
+		const publishHeight = () =>
+			host.style.setProperty("--toggles-h", `${togglesRow.offsetHeight}px`);
+		new ResizeObserver(publishHeight).observe(togglesRow);
+		publishHeight();
+	}
 	for (const btn of document.querySelectorAll(
 		"#viewer-toggles [data-toggle]",
 	)) {
@@ -385,6 +430,22 @@ function setupAssetControls() {
 		text: "optimized",
 		onclick: toggleOptimized,
 	});
+	// The generated build is versioned: this <select> picks which build (V1/V2/V3…)
+	// the view shows + the ⚡ generate button builds/resumes; "＋ new version" spins
+	// up the next empty one. Both are generated-view-only (see syncAssetControls).
+	verSel = el("select", {
+		id: "btn-gen-version",
+		title: "which generated version (V1/V2/V3…) to view + build/resume",
+		onchange: () => onVersionChange(verSel.value),
+	});
+	newVerBtn = el("button", {
+		id: "btn-gen-new-version",
+		title: "start a brand-new generated version, built fresh and kept separate from the others",
+		text: "＋ new version",
+		onclick: onNewVersion,
+	});
+	// Quality tier WITHIN the selected version — orthogonal to it, so every
+	// version carries the same raw / optimized / lite set.
 	liteBtn = el("button", {
 		id: "btn-asset-lite",
 		title: "generated view: show the LITE presentation tier — visually identical to raw, far smaller (overrides optimized/raw)",
@@ -393,12 +454,25 @@ function setupAssetControls() {
 	});
 	liteGenBtn = el("button", {
 		id: "btn-build-lite",
-		title: "build (or resume) this scene's lite presentation assets (objects-generated-lite)",
+		title: "build (or resume) the selected version's lite presentation assets (objects-generated-lite)",
 		text: "⚡ build lite",
 		onclick: onBuildLite,
 	});
 	genStatusEl = el("span", { id: "gen-status", class: "gen-status" });
-	refit.after(assetBtn, genBtn, optBtn, liteBtn, liteGenBtn, genStatusEl);
+	// Clicking a failed object frames it in 3D, so "which one is chair_4?" is one
+	// click rather than a hunt — the box is there even when the mesh never landed.
+	genFails = initGenFailPanel({ onSelect: focusNode });
+	refit.after(
+		assetBtn,
+		genBtn,
+		verSel,
+		newVerBtn,
+		optBtn,
+		liteBtn,
+		liteGenBtn,
+		genFails.button,
+		genStatusEl,
+	);
 	syncAssetControls();
 }
 
@@ -410,10 +484,13 @@ function syncAssetControls() {
 	assetBtn.style.display = show ? "" : "none";
 	const gen = show && assetMode === "generated";
 	genBtn.style.display = gen ? "" : "none";
+	verSel.style.display = gen ? "" : "none";
+	newVerBtn.style.display = gen ? "" : "none";
 	optBtn.style.display = gen ? "" : "none";
 	liteBtn.style.display = gen ? "" : "none";
 	liteGenBtn.style.display = gen ? "" : "none";
 	genStatusEl.style.display = gen ? "" : "none";
+	genFails.setVisible(gen);
 	assetBtn.classList.toggle("on", assetMode === "generated");
 	assetBtn.textContent =
 		assetMode === "generated" ? "generated ✓" : "generated";
@@ -423,6 +500,28 @@ function syncAssetControls() {
 	optBtn.disabled = liteOn;
 	liteBtn.classList.toggle("on", liteOn);
 	liteBtn.textContent = liteOn ? "lite ✓" : "lite";
+	syncVersionSelector();
+}
+
+// Rebuild the version <select> from `genVersions`/`genVersion` (newest first).
+// Skipped while the user has it open (a poll must not close the dropdown) and
+// when nothing changed; an empty list shows a placeholder until the first build.
+function syncVersionSelector() {
+	if (!verSel) return;
+	const sig = `${genVersions.join(",")}|${genVersion ?? ""}`;
+	if (document.activeElement === verSel) return;
+	if (verSel.dataset.sig !== sig) {
+		verSel.dataset.sig = sig;
+		const opts = genVersions.length
+			? genVersions
+					.slice()
+					.reverse()
+					.map((v) => el("option", { value: String(v), text: `V${v}` }))
+			: [el("option", { value: "", text: "no versions yet" })];
+		verSel.replaceChildren(...opts);
+	}
+	if (genVersion != null && genVersions.map(String).includes(String(genVersion)))
+		verSel.value = String(genVersion);
 }
 
 function setAssetMode(mode) {
@@ -473,13 +572,13 @@ function repullGenerated() {
 	pollGenerated();
 }
 
-// Build (or resume) this scene's lite assets, then poll until done and — if the
-// lite view is active — re-pull to show them.
+// Build (or resume) the SELECTED version's lite assets, then poll until done
+// and — if the lite view is active — re-pull to show them.
 async function onBuildLite() {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.buildLite(state.run, slot, model);
+		await api.buildLite(state.run, slot, model, { version: genVersion });
 		toast(`building lite for ${slot} · ${model}…`, "ok");
 		pollLiteBuild();
 	} catch (e) {
@@ -495,14 +594,20 @@ async function pollLiteBuild() {
 	}
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
+	const version = genVersion;
 	let st = null;
 	try {
-		st = await api.buildLiteStatus(state.run, slot, model);
+		st = await api.buildLiteStatus(state.run, slot, model, { version });
 	} catch {
 		/* transient — retried below if still running */
 	}
-	// Cell changed under us — stop.
-	if (!state.view || state.view.slot !== slot || state.view.model !== model)
+	// Cell or version changed under us — stop.
+	if (
+		!state.view ||
+		state.view.slot !== slot ||
+		state.view.model !== model ||
+		genVersion !== version
+	)
 		return;
 	if (!st) return;
 	if (genStatusEl && assetMode === "generated") {
@@ -520,13 +625,18 @@ async function pollLiteBuild() {
 }
 
 // Forget the generated-view bookkeeping (on cell open, mode switch, or toggle).
+// Resets the selected version too, so the next poll re-resolves the cell's
+// latest build.
 function clearGeneratedState() {
 	lastGenMesh = new Map();
 	loadedGen = new Map();
 	busyNodes = new Set();
 	objOptMode = new Map();
 	genMeshSig = null;
+	genVersion = null;
+	genVersions = [];
 	if (genStatusEl) genStatusEl.textContent = "";
+	genFails?.clear();
 }
 
 // Library meshes load as one bundle (small, complete) onto the current scene.
@@ -540,16 +650,69 @@ function loadLibraryMeshes() {
 	);
 }
 
+// ⚡ generate: build/resume the SELECTED version (the server resolves the latest
+// when none is selected yet). Adopt the version + list it returns so the selector
+// reflects a first-ever build (which mints V1) immediately.
 async function onGenerate() {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.generate(state.run, slot, model);
-		toast(`generating ${slot} · ${model}…`, "ok");
+		const r = await api.generate(state.run, slot, model, { version: genVersion });
+		if (r?.version != null) genVersion = String(r.version);
+		if (Array.isArray(r?.versions)) genVersions = r.versions.map(String);
+		syncVersionSelector();
+		toast(`generating ${slot} · ${model} · V${genVersion}…`, "ok");
 		pollGenerated();
 	} catch (e) {
 		toast(e.message, "err");
 	}
+}
+
+// ＋ new version: mint the next version and build it fresh. It starts empty, so
+// drop the current version's meshes and let the poll re-attach V<new>'s as they land.
+async function onNewVersion() {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		const r = await api.generate(state.run, slot, model, { newVersion: true });
+		if (r?.version != null) genVersion = String(r.version);
+		if (Array.isArray(r?.versions)) genVersions = r.versions.map(String);
+		loadedGen = new Map();
+		lastGenMesh = new Map();
+		busyNodes = new Set();
+		objOptMode = new Map();
+		genMeshSig = null;
+		genFails.clear();
+		viewer.clearMeshes();
+		tracePanel.clearProjection();
+		tracePanel.rerenderInfo();
+		syncVersionSelector();
+		toast(`building new version V${genVersion} of ${slot} · ${model}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Switch which generated version the view shows — like the optimized toggle, it
+// drops the current meshes and lets the poll re-attach the chosen version's set
+// (each version is fully isolated on disk).
+function onVersionChange(v) {
+	if (!state.view || state.view.branch || assetMode !== "generated") return;
+	if (!v || String(v) === String(genVersion)) return;
+	genVersion = String(v);
+	stopGenPoll();
+	loadedGen = new Map();
+	lastGenMesh = new Map();
+	busyNodes = new Set();
+	objOptMode = new Map();
+	genMeshSig = null;
+	genFails.clear();
+	viewer.clearMeshes();
+	tracePanel.clearProjection();
+	tracePanel.rerenderInfo();
+	syncVersionSelector();
+	pollGenerated();
 }
 
 function stopGenPoll() {
@@ -615,6 +778,7 @@ async function pollGenerated() {
 		status = await api.generateStatus(run, slot, model, {
 			optimized: optimizedView,
 			variant: genVariant(),
+			version: genVersion,
 		});
 	} catch {
 		/* transient — the next poll (if still in generated mode) retries */
@@ -628,6 +792,11 @@ async function pollGenerated() {
 	)
 		return;
 	if (!status) return;
+	// Adopt the resolved version + full list so the selector reflects the server's
+	// truth (a first poll resolves "latest"; a new build appears in the list).
+	if (Array.isArray(status.versions)) genVersions = status.versions.map(String);
+	if (status.version != null) genVersion = String(status.version);
+	syncVersionSelector();
 	const meshes = status.meshes ?? [];
 	lastGenMesh = new Map(
 		meshes.map((m) => [
@@ -687,6 +856,10 @@ async function pollGenerated() {
 	genStatusEl.title = ghosts
 		? `${ghosts} object${ghosts === 1 ? "" : "s"} render from a stale optimized mesh but are missing their raw/unoptimized files (an unfinished regenerate). Regenerate each to rebuild it.`
 		: "";
+	// Which objects came back with nothing, and why. Folded server-side from the
+	// version's own events.generated.jsonl — no SSE stream carries that log, so
+	// this poll is the only route any of it has to the screen.
+	genFails.render(status.failures, { running: !!status.running });
 	if (status.running) genPollTimer = setTimeout(pollGenerated, 1500);
 }
 
@@ -706,7 +879,7 @@ async function regenerateNode(id, opts) {
 	busyNodes.add(id);
 	tracePanel.rerenderInfo();
 	try {
-		await api.regenerate(state.run, slot, model, id, opts);
+		await api.regenerate(state.run, slot, model, id, { ...opts, version: genVersion });
 		toast(
 			`regenerating ${id}${opts.regenNounPhrase ? " (+ new noun phrase)" : ""} · ${opts.backend}…`,
 			"ok",
@@ -723,7 +896,7 @@ async function linkNode(id, target, { group = false } = {}) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.link(state.run, slot, model, id, target, { group });
+		await api.link(state.run, slot, model, id, target, { group, version: genVersion });
 		toast(`linking ${group ? "group" : id} → ${target}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -739,7 +912,7 @@ async function unlinkNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.unlink(state.run, slot, model, id);
+		await api.unlink(state.run, slot, model, id, { version: genVersion });
 		toast(`unlinking ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -754,6 +927,7 @@ async function symmetrizeNode(id, opts) {
 		await api.symmetrize(state.run, slot, model, id, {
 			...opts,
 			propagate: true,
+			version: genVersion,
 		});
 		toast(`symmetrizing ${id}…`, "ok");
 		pollGenerated();
@@ -766,7 +940,7 @@ async function unsymmetrizeNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.unsymmetrize(state.run, slot, model, id, { propagate: true });
+		await api.unsymmetrize(state.run, slot, model, id, { propagate: true, version: genVersion });
 		toast(`un-symmetrizing ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -784,6 +958,7 @@ async function reorientNode(id, opts) {
 		await api.reorient(state.run, slot, model, id, {
 			...opts,
 			propagate: true,
+			version: genVersion,
 		});
 		toast(`re-fronting ${id}…`, "ok");
 		pollGenerated();
@@ -800,7 +975,7 @@ async function glassifyNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.glassify(state.run, slot, model, id);
+		await api.glassify(state.run, slot, model, id, { version: genVersion });
 		toast(`applying glass transparency to ${id} + prefab group…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -815,7 +990,7 @@ async function resetNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.resetMesh(state.run, slot, model, id);
+		await api.resetMesh(state.run, slot, model, id, { version: genVersion });
 		toast(`resetting ${id} + prefab group from raw…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -967,6 +1142,7 @@ function initObsResizer() {
 function setupInvestigator() {
 	inv = createInvestigator(document.getElementById("investigator"), {
 		onClose: () => setInvestigator(false),
+		loadCallBytes,
 	});
 	document
 		.getElementById("overlay-investigate")
@@ -1054,6 +1230,19 @@ function focusNode(id) {
 	}
 }
 
+// A node to focus once the incoming cell has loaded it — set when the api log
+// opens a cell via `emit("open-cell", { focus })`. Retried as history folds /
+// events stream, then cleared, so a log→scene jump lands on the exact place.
+let pendingFocus = null;
+function tryPendingFocus() {
+	if (!pendingFocus) return;
+	const id = pendingFocus;
+	if (viewer.hasBbox(id) || obs.model.nodes.has(id)) {
+		pendingFocus = null;
+		focusNode(id);
+	}
+}
+
 // "why?" on a call row (dock OR the left trace panel) → open the investigator
 // with that step attached as deep context. The per-step chat is now just the
 // shared investigator focused on one call; it reads the live view (which the
@@ -1063,6 +1252,45 @@ function investigateCall(call) {
 	if (!state.view || call?.index == null) return;
 	setInvestigator(true);
 	inv.attachStep(call.index);
+}
+
+// Slim history/live streams omit each call's heavy prompt/output/reasoning/
+// variables bytes (so a multi-GB scene's tree loads); the dock, trace panel, and
+// investigator fetch them per-call on demand through this. It hydrates the SHARED
+// call object in place, so a call is fetched at most once no matter which panel
+// opens it first, and is a no-op once hydrated (or when the call already carries
+// bytes — compare/legacy full events). Reads the CURRENT cell's context.
+async function loadCallBytes(call) {
+	if (!call || call.index == null || call.system !== undefined) return call;
+	const { slot, model, branch } = state.view ?? {};
+	if (!branch && (!slot || !model)) return call;
+	try {
+		const bytes = branch
+			? await api.branchEventBytes(branch, call.index)
+			: await api.eventBytes(state.run, slot, model, call.index);
+		if (bytes && typeof bytes === "object") Object.assign(call, bytes);
+	} catch {
+		/* leave the call slim — the panels show a placeholder */
+	}
+	return call;
+}
+
+// "log ↗" on a call row → open the api log to this exact call. The flight
+// ledger keys rows by scene (`slot`): a source cell is `<run>/<slot>/<model>`,
+// a branch is `<run>/_branches/<bid>`. The call is matched there by its
+// generation_id (OpenRouter) or t_request (direct), the same join the log uses.
+function openLogForCall(call) {
+	if (!state.view || !call) return;
+	const { slot, model, branch } = state.view;
+	const scene = branch
+		? `${state.run}/_branches/${branch}`
+		: `${state.run}/${slot}/${model}`;
+	emit("open-flight", {
+		run: state.run,
+		scene,
+		generation_id: call.generation_id ?? null,
+		t_request: call.t_request ?? null,
+	});
 }
 
 function scheduleTreeRender() {
@@ -1079,6 +1307,7 @@ function scheduleTreeRender() {
 		// New zones may have streamed in — refresh the legend so a new depth's
 		// swatch appears (no-ops when the depth set is unchanged).
 		refreshZoneLayers();
+		tryPendingFocus(); // node from a log→scene jump may have just streamed in
 	});
 }
 
@@ -1087,19 +1316,24 @@ export async function openCell({
 	model,
 	branch = false,
 	forceLive = false,
+	focus = null,
+	fromLog = false,
 }) {
 	const seq = ++openSeq;
 	const run = state.run;
+	pendingFocus = focus || null;
 	// Keep the camera when this re-renders the SAME cell while the overlay is
 	// already open — the branch selector swapping between the source run and its
 	// per-LLM simulation lineages, or a revert/step reload. Swapping like that
 	// shouldn't pull the user off the part of the scene they're inspecting. A
 	// fresh open (overlay closed) or a different cell still frames the scene anew.
-	const keepCamera =
-		overlayEl.classList.contains("open") &&
-		!!state.view &&
-		state.view.slot === slot &&
-		state.view.model === model;
+	const sameCell =
+		!!state.view && state.view.slot === slot && state.view.model === model;
+	const keepCamera = overlayEl.classList.contains("open") && sameCell;
+	// Opening from the log arms the "← logs" return; opening a *different* cell
+	// any other way clears it. Same-cell reloads (revert/branch) keep it as-is.
+	if (fromLog) cameFromLog = true;
+	else if (!sameCell) cameFromLog = false;
 	stream?.close();
 	stream = null;
 	// A fresh cell open always starts on the library build; the generated view
@@ -1153,8 +1387,8 @@ export async function openCell({
 	let history = [];
 	try {
 		history = branch
-			? await api.branchEventsHistory(run, branch)
-			: await api.eventsHistory(run, slot, model);
+			? await api.branchEventsHistorySlim(run, branch)
+			: await api.eventsHistorySlim(run, slot, model);
 	} catch {
 		/* never-started cell */
 	}
@@ -1170,6 +1404,7 @@ export async function openCell({
 	refreshZoneLayers();
 	if (branch && state.lab.simStep) dock.renderPinned(obs.model);
 	renderHeader(); // error message comes from the just-loaded log
+	tryPendingFocus(); // a log→scene jump lands on its node once history folds
 
 	// `forceLive` subscribes without waiting for the next poll — used right
 	// after a revert relaunches the cell, so the polled summary is still stale.
@@ -1246,6 +1481,14 @@ function renderHeader() {
 	let statusText = view.label;
 	if (!branch && summary?.stepped) statusText += " · stepped";
 	statusText += ` · ${cellInfo?.events_count ?? 0} events`;
+	// Measured execution time, pauses excluded. `spans` > 1 means the cell was
+	// interrupted and resumed, so the total is the work across those stretches.
+	const activeS = cellInfo?.timing?.active_s;
+	if (activeS) {
+		const spans = cellInfo.timing.spans ?? 1;
+		statusText += ` · ran ${fmtDurationMs(activeS * 1000)}`;
+		if (spans > 1) statusText += ` (resumed ${spans - 1}×)`;
+	}
 	if (status === "error") {
 		// Put the failure reason where the eye lands first; the log strip below
 		// has the full trail.
@@ -1255,6 +1498,7 @@ function renderHeader() {
 	statusEl.textContent = statusText;
 	statusEl.title = statusText;
 	statusEl.classList.toggle("is-error", status === "error");
+	if (toLogsBtn) toLogsBtn.style.display = cameFromLog ? "" : "none";
 
 	// Action button: source cells start/resume/pause; branches pause/resume.
 	// "Live" = a running task OR one parked at a step gate (pending) — both are
@@ -1295,6 +1539,22 @@ function renderHeader() {
 		capBtn.onclick = onCapOverride;
 	} else {
 		capBtn?.remove();
+	}
+
+	// Graceful pause: a live source cell can "finish & pause" — stop issuing new
+	// LLM calls but let the in-flight one finish + commit before pausing, vs the
+	// action button's immediate hard pause. Hidden on branches and non-live cells.
+	let softBtn = document.getElementById("overlay-soft-pause");
+	if (!branch && live) {
+		if (!softBtn) {
+			softBtn = el("button", { id: "overlay-soft-pause" });
+			actionBtn.before(softBtn);
+		}
+		softBtn.textContent = "finish & pause";
+		softBtn.title = "stop issuing new LLM calls, let the in-flight call finish and commit, then pause — resume won't re-run or re-bill it";
+		softBtn.onclick = onSoftPause;
+	} else {
+		softBtn?.remove();
 	}
 
 	// One-call-at-a-time stepping controls. Shown whenever the cell is gated:
@@ -1563,6 +1823,21 @@ async function onAction() {
 	}
 }
 
+// Graceful pause (source cells): stop new LLM calls, let the in-flight one finish
+// and commit, then pause. The cell stays "running" until it drains, then flips to
+// paused on the next poll — so no reload/stream re-wire here, just a heads-up.
+async function onSoftPause() {
+	const { slot, model, branch } = state.view ?? {};
+	if (!slot || branch) return;
+	try {
+		await api.pauseSoft(state.run, slot, model);
+		toast("finishing the in-flight call, then pausing…", "ok");
+		emit("poll-now");
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
 async function onReset() {
 	const { slot, model } = state.view ?? {};
 	if (!slot) return;
@@ -1606,6 +1881,8 @@ export function closeOverlay() {
 	stopGenPoll();
 	assetMode = "library";
 	state.view = null;
+	cameFromLog = false;
+	if (toLogsBtn) toLogsBtn.style.display = "none";
 	overlayEl.classList.remove("open");
 	viewer.setActive(false);
 	dock.setPinStep(null);

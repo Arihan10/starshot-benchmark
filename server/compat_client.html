@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenAI-compat probe — LongCat / SiliconFlow</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #0a0e14; color: #cdd6e4; font-size: 13px; }
+  .app { display: grid; grid-template-columns: 380px 1fr; height: 100vh; }
+  .panel { border-right: 1px solid #1c2636; padding: 16px; overflow: auto; background: #0c111a; }
+  .results { padding: 16px 20px; overflow: auto; }
+  h1 { font-size: 15px; margin: 0 0 4px; color: #eaf0f8; }
+  .sub { font-size: 11px; color: #6d7c93; margin-bottom: 14px; }
+  label.row { display: block; margin: 10px 0 4px; font-size: 11px; color: #9fb0c6; text-transform: uppercase; letter-spacing: .04em; }
+  input, select, textarea { width: 100%; padding: 7px 9px; background: #0f1622; color: #dfe7f0;
+    border: 1px solid #2a3a52; border-radius: 6px; font-family: inherit; font-size: 13px; }
+  textarea { resize: vertical; }
+  textarea.mono { min-height: 120px; white-space: pre; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  .check { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 13px; color: #cdd6e4;
+    text-transform: none; letter-spacing: 0; cursor: pointer; }
+  .check input { width: auto; }
+  .muted { color: #6d7c93; font-size: 11px; }
+  .keyrow { display: flex; gap: 6px; align-items: center; }
+  .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
+  .tag.ok { background: rgba(53,208,127,0.16); color: #6ee7a6; border: 1px solid #2f7a52; }
+  .tag.no { background: rgba(255,85,102,0.14); color: #ff9aa6; border: 1px solid #7a2f3a; }
+  button { width: 100%; margin-top: 16px; padding: 11px; background: #2563b8; color: #fff; border: 0;
+    border-radius: 7px; font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #2b71d0; }
+  button:disabled { background: #24344c; color: #6d7c93; cursor: default; }
+  fieldset { border: 1px solid #1c2636; border-radius: 8px; margin: 12px 0 0; padding: 4px 12px 12px; }
+  fieldset legend { color: #9fb0c6; font-size: 11px; padding: 0 6px; }
+  .placeholder { color: #55647d; margin-top: 40px; text-align: center; }
+  .card { border: 1px solid #1c2636; border-radius: 9px; margin-bottom: 14px; overflow: hidden; }
+  .card > .head { padding: 8px 12px; background: #0f1622; font-size: 12px; display: flex; gap: 12px;
+    align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1c2636; }
+  .card > .body { padding: 10px 12px; }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.45;
+    max-height: 360px; overflow: auto; }
+  .pill { font-size: 11px; padding: 2px 9px; border-radius: 999px; }
+  .pill.g { background: rgba(53,208,127,0.16); color: #6ee7a6; }
+  .pill.r { background: rgba(255,85,102,0.16); color: #ff9aa6; }
+  .pill.b { background: rgba(57,208,200,0.14); color: #7fe6df; }
+  .k { color: #6d7c93; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: #9fb0c6; font-size: 12px; }
+  .chan-title { font-size: 11px; color: #9fb0c6; text-transform: uppercase; letter-spacing: .04em; margin: 10px 0 4px; }
+  .err { color: #ff9aa6; }
+  .spin { color: #7fe6df; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="panel">
+    <h1>OpenAI-compat probe</h1>
+    <div class="sub" id="serverLine">connecting…</div>
+
+    <label class="row" for="provider">Provider</label>
+    <select id="provider"></select>
+
+    <label class="row" for="baseUrl">Base URL</label>
+    <input id="baseUrl" spellcheck="false" />
+
+    <label class="row" for="model">Model</label>
+    <input id="model" spellcheck="false" />
+
+    <label class="row" for="apiKey">API key <span class="muted">(blank = use server/.env)</span></label>
+    <div class="keyrow">
+      <input id="apiKey" type="text" placeholder="using server/.env" spellcheck="false" autocomplete="off" />
+      <span id="keyTag" class="tag no">?</span>
+    </div>
+
+    <label class="row" for="system">System</label>
+    <textarea id="system" rows="2"></textarea>
+
+    <label class="row" for="user">User</label>
+    <textarea id="user" rows="4"></textarea>
+
+    <div class="grid3">
+      <div>
+        <label class="row" for="maxTokens">max_tokens</label>
+        <input id="maxTokens" type="number" min="1" />
+      </div>
+      <div>
+        <label class="row" for="temperature">temperature</label>
+        <input id="temperature" type="number" step="0.1" />
+      </div>
+      <div>
+        <label class="row" for="topP">top_p</label>
+        <input id="topP" type="number" step="0.05" />
+      </div>
+    </div>
+
+    <label class="check"><input type="checkbox" id="thinking" /> thinking <span id="thinkingMap" class="muted"></span></label>
+    <label class="check"><input type="checkbox" id="structured" /> structured output (response_format)</label>
+
+    <fieldset id="schemaBox">
+      <legend>json_schema</legend>
+      <div class="grid3" style="grid-template-columns: 2fr 1fr;">
+        <div>
+          <label class="row" for="schemaName">name</label>
+          <input id="schemaName" spellcheck="false" />
+        </div>
+        <div>
+          <label class="row">&nbsp;</label>
+          <label class="check" style="margin:0;"><input type="checkbox" id="strict" /> strict</label>
+        </div>
+      </div>
+      <label class="row" for="schema">schema</label>
+      <textarea id="schema" class="mono" rows="8" spellcheck="false"></textarea>
+    </fieldset>
+
+    <button id="send">Send</button>
+  </aside>
+
+  <main class="results" id="results">
+    <div class="placeholder">Configure on the left and hit Send.</div>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const numOrNull = (el) => (el.value.trim() === "" ? null : Number(el.value));
+
+let CONFIG = null;
+
+async function init() {
+  try {
+    CONFIG = await (await fetch("/api/config")).json();
+  } catch (e) {
+    $("serverLine").innerHTML = `<span class="err">server unreachable — run: python compat_probe.py --serve</span>`;
+    return;
+  }
+  const provSel = $("provider");
+  provSel.innerHTML = Object.keys(CONFIG.providers).map((n) => `<option value="${n}">${n}</option>`).join("");
+  const d = CONFIG.defaults;
+  provSel.value = d.provider;
+  $("system").value = d.system;
+  $("user").value = d.user;
+  $("maxTokens").value = d.max_tokens ?? "";
+  $("temperature").value = d.temperature ?? "";
+  $("topP").value = d.top_p ?? "";
+  $("thinking").checked = d.thinking;
+  $("structured").checked = d.structured;
+  $("schemaName").value = d.schema_name;
+  $("strict").checked = d.strict;
+  $("schema").value = JSON.stringify(d.schema, null, 2);
+  applyProvider();
+  toggleSchema();
+
+  provSel.addEventListener("change", applyProvider);
+  $("structured").addEventListener("change", toggleSchema);
+  $("apiKey").addEventListener("input", refreshKeyTag);
+  $("send").addEventListener("click", run);
+  $("serverLine").textContent = "local proxy · calls run server-side (no CORS)";
+}
+
+function applyProvider() {
+  const p = CONFIG.providers[$("provider").value];
+  $("baseUrl").value = p.base_url;
+  $("model").value = p.model;
+  const onField = Object.keys(p.thinking_on)[0];
+  $("thinkingMap").textContent = `→ ${JSON.stringify(p.thinking_on)} / ${JSON.stringify(p.thinking_off)}`;
+  refreshKeyTag();
+}
+
+function refreshKeyTag() {
+  const p = CONFIG.providers[$("provider").value];
+  const tag = $("keyTag");
+  if ($("apiKey").value.trim()) { tag.className = "tag ok"; tag.textContent = "override"; }
+  else if (p.key_present) { tag.className = "tag ok"; tag.textContent = `${p.api_key_env} ✓`; }
+  else { tag.className = "tag no"; tag.textContent = `${p.api_key_env} missing`; }
+}
+
+function toggleSchema() {
+  $("schemaBox").style.display = $("structured").checked ? "" : "none";
+}
+
+function buildResponseFormat() {
+  if (!$("structured").checked) return { ok: true, value: null };
+  let schema;
+  try { schema = JSON.parse($("schema").value); }
+  catch (e) { return { ok: false, error: `schema is not valid JSON: ${e.message}` }; }
+  return {
+    ok: true,
+    value: { type: "json_schema", json_schema: { name: $("schemaName").value || "output", strict: $("strict").checked, schema } },
+  };
+}
+
+async function run() {
+  const rf = buildResponseFormat();
+  if (!rf.ok) { render({ clientError: rf.error }); return; }
+
+  const payload = {
+    provider: $("provider").value,
+    base_url: $("baseUrl").value.trim(),
+    model: $("model").value.trim(),
+    api_key: $("apiKey").value.trim(),
+    system: $("system").value,
+    user: $("user").value,
+    max_tokens: numOrNull($("maxTokens")),
+    temperature: numOrNull($("temperature")),
+    top_p: numOrNull($("topP")),
+    thinking: $("thinking").checked,
+    response_format: rf.value,
+  };
+
+  const btn = $("send");
+  btn.disabled = true; btn.textContent = "Sending…";
+  $("results").innerHTML = `<div class="placeholder spin">calling ${esc(payload.provider)}… (thinking models can take a while)</div>`;
+  try {
+    const res = await (await fetch("/api/probe", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    })).json();
+    render(res);
+  } catch (e) {
+    render({ clientError: `request failed: ${e.message}` });
+  } finally {
+    btn.disabled = false; btn.textContent = "Send";
+  }
+}
+
+function channelCard(title, val) {
+  const len = typeof val === "string" ? val.length : 0;
+  return `<div class="chan-title">${title} (${len} chars)</div><pre>${esc(val && String(val).trim() ? val : "<empty>")}</pre>`;
+}
+
+function parseCard(label, val) {
+  if (!(typeof val === "string" && val.trim())) return "";
+  try {
+    const parsed = JSON.parse(val);
+    return `<div class="chan-title">[${label}] <span class="pill g">valid JSON</span></div><pre>${esc(JSON.stringify(parsed, null, 2))}</pre>`;
+  } catch (e) {
+    return `<div class="chan-title">[${label}] <span class="pill r">not JSON</span> <span class="k">${esc(e.message)}</span></div>`;
+  }
+}
+
+function render(res) {
+  const out = $("results");
+  if (res.clientError) { out.innerHTML = `<div class="card"><div class="body err">${esc(res.clientError)}</div></div>`; return; }
+  if (!res.ok) { out.innerHTML = `<div class="card"><div class="body err">${esc(res.error)}</div></div>`; return; }
+
+  const data = res.response_json;
+  const choice = (data && data.choices && data.choices[0]) || {};
+  const msg = choice.message || {};
+  const content = msg.content;
+  const reasoning = msg.reasoning_content || msg.reasoning || "";
+  const usage = (data && data.usage) || {};
+  const statusPill = res.status >= 200 && res.status < 300 ? "g" : "r";
+
+  let html = `<div class="card"><div class="head">
+      <span class="pill ${statusPill}">HTTP ${res.status}</span>
+      <span>${res.elapsed}s</span>
+      <span class="k">finish_reason=</span>${esc(JSON.stringify(choice.finish_reason ?? null))}
+      <span class="k">tokens</span> in ${usage.prompt_tokens ?? "?"} / out ${usage.completion_tokens ?? "?"}
+    </div><div class="body">`;
+
+  if (data) {
+    html += channelCard("content", content);
+    html += channelCard("reasoning_content", reasoning);
+    if (res.request_body && res.request_body.response_format) {
+      html += parseCard("content", content);
+      html += parseCard("reasoning_content", reasoning);
+    }
+  } else {
+    html += `<div class="chan-title">response body (non-JSON)</div><pre>${esc(res.response_text || "<empty>")}</pre>`;
+  }
+
+  html += `<details><summary>request body</summary><pre>${esc(JSON.stringify(res.request_body, null, 2))}</pre></details>`;
+  html += `<details><summary>raw response</summary><pre>${esc(data ? JSON.stringify(data, null, 2) : res.response_text)}</pre></details>`;
+  html += `</div></div>`;
+  out.innerHTML = html;
+}
+
+init();
+</script>
+</body>
+</html>

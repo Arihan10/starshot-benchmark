@@ -40,7 +40,7 @@ from typing import Any
 
 from app.core import prompt_store, scene_context, schemas
 from app.core.types import BoundingBox, Node, ParentRelationshipKind
-from app.pipeline import committed, generation
+from app.pipeline import committed, context_cull, generation
 from app.services import llm
 from app.utils import logging
 from app.utils.topology import uniquify_ids, validate_subregions
@@ -88,7 +88,7 @@ async def _plan_zone(
             zone_id=zone_id,
             zone_prompt=zone_prompt,
             zone_plan=None,
-            nodes=nodes,
+            nodes=context_cull.for_context(nodes, zone_id),
             target_text="This is the region you are to plan and flesh out from.",
         )
         output_schema = schemas.ZonePlanOutput
@@ -121,7 +121,7 @@ async def _decompose_zone(
         zone_id=node.id,
         zone_prompt=node.prompt,
         zone_plan=node.plan,
-        nodes=all_nodes,
+        nodes=context_cull.for_context(all_nodes, node.id),
         target_text="This is the region you are to break down and decompose.",
     )
     return await llm.call_llm(
@@ -154,7 +154,7 @@ async def _resolve_child_bboxes_batch(
         zone_id=parent.id,
         zone_prompt=parent.prompt,
         zone_plan=parent.plan,
-        nodes=all_nodes,
+        nodes=context_cull.for_context(all_nodes, parent.id),
         target_text="This is the region whose subregions you are to place.",
     )
     variables["TO_PLACE"] = scene_context.render_to_place_block(

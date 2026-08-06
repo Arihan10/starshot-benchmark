@@ -1,7 +1,7 @@
 // The run board: a pannable/zoomable plane of every (slot × model) cell in
 // the active run, each card showing live status + the step it is on.
 
-import { el, openModal, toast, stepUntilSelect, promptCapValue } from "./ui.js";
+import { el, openModal, toast, stepUntilSelect, promptCapValue, fmtDurationMs } from "./ui.js";
 import { state, emit, on, cellKey, cellSummary } from "./state.js";
 import { api } from "./api.js";
 import { createViewer } from "./scene3d.js";
@@ -68,6 +68,13 @@ boardEl.addEventListener("wheel", (ev) => {
 
 // --- cards ----------------------------------------------------------------------
 
+// Measured execution time, pauses and crash gaps already excluded (server-side
+// `runclock`). Blank for a cell that never ran, or ran for less than one tick.
+function runtimeLabel(summary) {
+  const active = summary.timing?.active_s;
+  return active ? ` · ${fmtDurationMs(active * 1000)}` : "";
+}
+
 function cellCard(slot, model) {
   const summary = slot.runs?.[model] ?? { status: "idle", events_count: 0 };
   const branches = summary.branches ?? [];
@@ -96,7 +103,7 @@ function cellCard(slot, model) {
       summary.stepped ? el("span", { class: "step-mode-tag", text: "step mode", title: "one LLM call per step — advance from the cell view or “step all”" }) : null,
     ),
     el("div", { class: "step-line", text: view.label }),
-    el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events · ${view.state}` }),
+    el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events${runtimeLabel(summary)} · ${view.state}` }),
   );
   if (branches.length) {
     const first = branches[0];
@@ -256,6 +263,10 @@ function bulkResume() {
   runBulk("resumed/started", (c) => api.resume(state.run, c.slot, c.model, stepped));
 }
 function bulkPause() { runBulk("paused", (c) => api.pause(state.run, c.slot, c.model)); }
+// Graceful pause: stop new LLM calls but let each cell's in-flight call finish +
+// commit before pausing (resume won't re-run or re-bill it). Returns immediately;
+// each cell stays running until it drains, then flips to paused on the next poll.
+function bulkPauseSoft() { runBulk("finishing & pausing", (c) => api.pauseSoft(state.run, c.slot, c.model)); }
 // Set one new spend cap on every started (non-done) cell in the selection —
 // raising the ceiling past a capped cell's spend also resumes it. Idle/done
 // cells have no run to cap, so they're filtered out client-side.
@@ -307,6 +318,7 @@ const bulkActionEls = [
   el("button", { class: "primary", title: "start idle / resume paused selected cells", onclick: bulkResume }, "resume / start"),
   el("label", { class: "bulk-stepped", title: "resume/start in step mode (pause before each LLM call)" }, steppedCheck, "stepped"),
   el("button", { title: "pause selected running cells", onclick: bulkPause }, "pause"),
+  el("button", { title: "finish the in-flight LLM call on each selected running cell, commit it, then pause — resume won't re-run or re-bill it", onclick: bulkPauseSoft }, "finish & pause"),
   el("button", { title: "advance each selected cell by one LLM call", onclick: () => bulkStep(null) }, "step"),
   untilSel,
   el("button", { title: "set the spend cap on selected cells (raising past spend resumes capped ones)", onclick: bulkOverride }, "set caps"),
@@ -646,7 +658,10 @@ function makeSceneTile(slot, model) {
     for (const e of entries) {
       if (e.isIntersecting) {
         if (!ref.viewer) {
-          ref.viewer = createViewer(host, { keyboard: false });
+          // Tiles are small glanceable previews and there can be many at once, so
+          // cap them at DPR 1 — a fraction of the framebuffer / OIT-target memory a
+          // full-DPR canvas would take, with no meaningful loss at tile size.
+          ref.viewer = createViewer(host, { keyboard: false, maxPixelRatio: 1 });
           ref.loadedCount = state.slots.find((x) => x.id === slot.id)?.runs?.[model]?.events_count ?? 0;
           ref.lastLoad = performance.now();
           loadTile(ref, slot.id, model);

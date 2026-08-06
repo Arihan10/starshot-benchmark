@@ -7,7 +7,7 @@
 // pipeline). `detailed:true` (drawer) → each node's LLM calls, expandable in
 // place to their exact system / user / output bytes.
 
-import { el, fmtJson, foldedPre } from "./ui.js";
+import { el, fmtJson, foldedPre, callTimingTitle } from "./ui.js";
 
 function statusDot(n) {
   if (n.error) return "error";
@@ -153,7 +153,9 @@ function callRow(call, opts) {
   const isOpen = opts.expanded?.has(call.index);
   const emits = callEmits(call, opts.emitFocus);
   const wrap = el("div", { class: "obsm-call-wrap" });
-  wrap.appendChild(el("div", { class: `obsm-call${isOpen ? " open" : ""}${emits ? " emits" : ""}`, onclick: () => opts.onToggle?.(call) },
+  // Hover shows the call's execution stats (generation time, throughput, request/
+  // response times) — the same timing the api log surfaces per flight.
+  wrap.appendChild(el("div", { class: `obsm-call${isOpen ? " open" : ""}${emits ? " emits" : ""}`, title: callTimingTitle(call), onclick: () => opts.onToggle?.(call) },
     el("span", { class: "caret", text: isOpen ? "▾" : "▸" }),
     el("span", { class: "step-badge", text: call.template ?? call.step ?? "?" }),
     emits ? el("span", { class: "emit-badge", text: "emitted here" }) : null,

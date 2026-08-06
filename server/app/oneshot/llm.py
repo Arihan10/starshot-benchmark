@@ -37,14 +37,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from app.oneshot.slots import DllmModel
-from app.utils import cache, logging
+from app.utils import cache, flightlog, logging
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -120,9 +121,20 @@ async def _post_completion(cfg: DllmModel, body: dict) -> dict:
     """POST /chat/completions with transport retries (connection flaps, 5xx,
     cold-start hiccups). 4xx raises immediately — that's a config problem.
     Error bodies are carried in full — these logs are the debugging surface
-    for experimental backends, so nothing is truncated."""
+    for experimental backends, so nothing is truncated.
+
+    Every attempt records a row in the process-global flight ledger
+    (`app.utils.flightlog`) — request/response times, status, tokens — same as
+    the main pipeline's transports, so the dashboard's api log covers the
+    one-shot track too."""
     attempt = 0
     while True:
+        t_request = time.time()
+        flight: dict[str, Any] = dict(
+            transport="direct", model=cfg.model, base_url=cfg.base_url,
+            api_key=os.environ.get(cfg.api_key_env) if cfg.api_key_env else None,
+            kind="oneshot", attempt=attempt + 1, t_request=t_request,
+        )
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 res = await client.post(
@@ -131,13 +143,28 @@ async def _post_completion(cfg: DllmModel, body: dict) -> dict:
                     json=body,
                 )
             if res.status_code < 400:
-                return res.json()
+                data = res.json()
+                usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
+                flightlog.record(
+                    **flight, t_response=time.time(), status=res.status_code,
+                    tokens_in=usage.get("prompt_tokens"),
+                    tokens_out=usage.get("completion_tokens"),
+                )
+                return data
+            flightlog.record(
+                **flight, t_response=time.time(), status=res.status_code,
+                error=res.text[:500],
+            )
             if res.status_code < 500:
                 raise DllmRequestError(
                     f"{cfg.model} HTTP {res.status_code}: {res.text}"
                 )
             reason = f"HTTP {res.status_code}: {res.text}"
         except (httpx.HTTPError, json.JSONDecodeError) as e:
+            flightlog.record(
+                **flight, t_response=time.time(),
+                error=f"{type(e).__name__}: {e}", exc_type=type(e).__name__,
+            )
             reason = f"{type(e).__name__}: {e}"
         if attempt >= TRANSPORT_MAX - 1:
             raise DllmRequestError(f"{cfg.model} transport failed: {reason}")

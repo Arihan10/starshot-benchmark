@@ -21,6 +21,16 @@ def hash_llm_call(*, model: str, system: str, user: str, schema_name: str) -> st
     return hashlib.sha256(payload).hexdigest()
 
 
+def hash_llm_replay_key(*, system: str, user: str, schema_name: str) -> str:
+    """Model-INDEPENDENT hash of a call's inputs — `hash_llm_call` minus the model.
+    Stamped on every `cache.llm` event as `replay_key` so `find_llm_replay` can
+    match a committed step across a model swap WITHOUT holding the (huge) system /
+    user prompt bytes in memory. Events logged before this field existed simply
+    won't match (the branch re-runs that step — safe, just not free)."""
+    payload = _SEP.join((system, user, schema_name)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def find_llm_cache_hit(
     events: list[dict[str, Any]], key: str,
 ) -> dict[str, Any] | None:
@@ -42,14 +52,15 @@ def find_llm_replay(
     committed output instead of re-running. The cut is exact: a reverted step's
     `cache.llm` is truncated away, so only genuinely-committed prefix steps match
     — the frontier the user is re-running finds nothing here and proceeds to the
-    live call. Used ONLY on the gated (branch) path, never the main pipeline."""
+    live call. Used ONLY on the gated (branch) path, never the main pipeline.
+
+    Matches on the stored model-independent `replay_key` rather than the raw
+    system/user bytes, so it works while those bytes are offloaded from the
+    in-memory event buffer (see `logging._HEAVY_OFFLOAD`). `output` is kept
+    resident, so a match returns without a disk read."""
+    replay_key = hash_llm_replay_key(system=system, user=user, schema_name=schema_name)
     for event in reversed(events):
-        if (
-            event.get("kind") == "cache.llm"
-            and event.get("schema") == schema_name
-            and event.get("system") == system
-            and event.get("user") == user
-        ):
+        if event.get("kind") == "cache.llm" and event.get("replay_key") == replay_key:
             output = event.get("output")
             return output if isinstance(output, dict) else None
     return None

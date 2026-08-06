@@ -158,43 +158,96 @@ def object_specs(zone_id: str, scenario: str) -> list[Any] | None:
     return specs
 
 
+def _spec_from_next_event(e: dict[str, Any]) -> Any | None:
+    """Reconstruct one `generation.next` event's `ObjectSpec` — from its full
+    `object` dump, or (legacy ids-only events) rebuilt from the object's `bbox`
+    event. None when neither is available."""
+    obj = e.get("object")
+    if isinstance(obj, dict):
+        try:
+            return schemas.ObjectSpec.model_validate(obj)
+        except Exception:
+            pass
+    oid = e.get("id")
+    if isinstance(oid, str):
+        return _spec_from_bbox(oid)
+    return None
+
+
+def next_object_rounds(zone_id: str) -> list[list[Any]]:
+    """Committed next-object specs grouped by the anchor-loop ROUND that
+    proposed them, in emission order.
+
+    The completion loop proposes a LIST of objects per `next_object` step and
+    resolves that whole list in ONE `object_bbox_batch`. Replaying it the same
+    way — one batch per round — reproduces that call's `TO_PLACE`/prompt so the
+    placement replays from the LLM cache (or, when that batch never committed,
+    still collapses N single-object re-solves into one) and preserves
+    intra-round parent/relationship resolution.
+
+    The grouping is recovered from the log as-is, with no extra field: a round's
+    `generation.next` events are appended back-to-back (the accept loop logs
+    them with no `await` in between), and the round's solve — its
+    `object_bbox_batch` + `bbox`/image events, or simply the next round's
+    `next_object` call — always lands between one block and the next. So a
+    maximal run of THIS zone's `generation.next` events, uninterrupted by any
+    other logged event, is exactly one round."""
+    groups: list[list[Any]] = []
+    current: list[Any] = []
+    for e in logging.current_events():
+        if e.get("kind") == "generation.next" and e.get("zone") == zone_id:
+            spec = _spec_from_next_event(e)
+            if spec is not None:
+                current.append(spec)
+        elif current:
+            # Any other logged event closes the current round's contiguous block.
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
 def next_object_specs(zone_id: str) -> list[Any]:
     """Ordered committed next-object specs from a zone's anchor completion
-    loop — one per accepted `generation.next`, in emission order."""
-    out: list[Any] = []
-    for e in logging.current_events():
-        if e.get("kind") != "generation.next" or e.get("zone") != zone_id:
-            continue
-        obj = e.get("object")
-        if isinstance(obj, dict):
-            try:
-                out.append(schemas.ObjectSpec.model_validate(obj))
-                continue
-            except Exception:
-                pass
-        oid = e.get("id")
-        if isinstance(oid, str):
-            spec = _spec_from_bbox(oid)
-            if spec is not None:
-                out.append(spec)
-    return out
+    loop — one per accepted `generation.next`, in emission order (rounds
+    flattened)."""
+    return [spec for group in next_object_rounds(zone_id) for spec in group]
+
+
+def next_object_ids() -> set[str]:
+    """Every object id emitted by ANY zone's anchor-completion (`next_object`)
+    loop, run-wide — read from the committed `generation.next` events. Used by
+    the temporary context-cull patch (`app.pipeline.context_cull`) to drop the
+    'detail' tier from non-focus zones' scene context."""
+    return {
+        e["id"]
+        for e in logging.current_events()
+        if e.get("kind") == "generation.next" and isinstance(e.get("id"), str)
+    }
 
 
 def next_done(zone_id: str) -> bool:
-    """True if the zone's anchor completion loop already TERMINATED — by either
-    of its two exits:
-      * `generation.next.done`  — the model said the zone is complete, or
-      * `generation.next.stuck` — the progress guard tripped (the model kept
-        re-proposing objects that can't be admitted).
+    """True if the zone's anchor completion loop already TERMINATED — by any of
+    its three exits:
+      * `generation.next.done`   — the model said the zone is complete,
+      * `generation.next.stuck`  — the progress guard tripped (the model kept
+        re-proposing objects that can't be admitted), or
+      * `generation.next.capped` — the optional round cap
+        (`STARSHOT_NEXT_OBJECT_CAP`) was reached.
 
-    Both are terminal, so resume must treat either as "loop complete". Counting
-    only `done` meant a zone that ended via the stuck guard had no marker, so
-    `next_done` stayed False and EVERY resume/rewind/fork re-ran (and re-got-
-    stuck on) that zone's `next_object` loop — blocking the resume from ever
-    reaching later zones (and re-billing the stuck calls each time)."""
+    All three are terminal, so resume must treat any of them as "loop complete".
+    Counting only `done` meant a zone that ended via the stuck guard had no
+    marker, so `next_done` stayed False and EVERY resume/rewind/fork re-ran (and
+    re-got-stuck on) that zone's `next_object` loop — blocking the resume from
+    ever reaching later zones (and re-billing the stuck calls each time). A
+    capped zone is terminal for the same reason: its cap decision is baked into
+    the log, so a resume replays the placed rounds and stops without re-deciding
+    (a rewind past the cap event is the way to re-open the loop)."""
     return (
         logging.find_event("generation.next.done", zone=zone_id) is not None
         or logging.find_event("generation.next.stuck", zone=zone_id) is not None
+        or logging.find_event("generation.next.capped", zone=zone_id) is not None
     )
 
 

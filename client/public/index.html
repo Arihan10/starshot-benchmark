@@ -430,8 +430,8 @@
                 padding: 2px 0;
             }
             /* Capped cells: flag the collapsed pill purple so a spend-cap trip is
-			   noticeable without expanding. Every cell shows its cap inline (faint
-			   by default, purple once tripped). */
+               noticeable without expanding. Every cell shows its cap inline (faint
+               by default, purple once tripped). */
             #cost-tracker.has-capped #cost-pill {
                 border-color: var(--purple);
             }
@@ -969,7 +969,7 @@
             /* "step (all) until <step>" picker — sits next to step / step-all. */
             /* ---------- step-until picker (custom popover) ---------- */
             /* Trigger button (replaces the old native <select>); the popover it
-			   opens carries the before/after toggle + the step list. */
+               opens carries the before/after toggle + the step list. */
             .step-until {
                 font-size: 11px;
                 padding: 3px 8px;
@@ -1186,6 +1186,14 @@
             #overlay-head .crumbs {
                 color: var(--text-faint);
             }
+            #overlay-head .ov-to-logs {
+                color: var(--accent);
+                border-color: var(--accent-line);
+            }
+            #overlay-head .ov-to-logs:hover:not(:disabled) {
+                color: var(--accent);
+                background: var(--panel-2);
+            }
             #overlay-status {
                 min-width: 0;
                 white-space: nowrap;
@@ -1213,6 +1221,12 @@
                 left: 10px;
                 bottom: 10px;
                 display: flex;
+                /* Wraps (like .cmp-toggles) instead of running off the canvas: with
+                   the obs dock open the host is often ~650px while this row wants
+                   ~1300px, which silently pushed the generated-build controls —
+                   progress label and failure badge included — past the edge. */
+                flex-wrap: wrap;
+                max-width: calc(100% - 20px);
                 gap: 6px;
                 z-index: 5;
                 transition: left 0.2s ease;
@@ -1225,8 +1239,8 @@
                 opacity: 0.5;
             }
             /* Objects multiselect dropdown (buildObjectsMenu) — lives inline in a
-			   viewer's toggle row; the trigger button inherits the row's button
-			   style, so only the popup + items need styling here. */
+               viewer's toggle row; the trigger button inherits the row's button
+               style, so only the popup + items need styling here. */
             .vt-menu {
                 position: relative;
                 display: inline-flex;
@@ -1299,19 +1313,20 @@
                 transition: left 0.2s ease;
             }
             /* While the emittance-trace panel is open, slide the canvas overlays
-			   clear of it so the toggles + zone legend stay usable. */
+               clear of it so the toggles + zone legend stay usable. */
             #canvas-host:has(#trace-panel.open) #viewer-toggles,
             #canvas-host:has(#trace-panel.open) #zone-layers-legend {
                 left: calc(var(--trace-w) + 16px);
             }
+            #canvas-host:has(#trace-panel.open) #viewer-toggles,
             #canvas-host:has(#trace-panel.open) #zone-layers-legend {
                 max-width: calc(100% - var(--trace-w) - 36px);
             }
 
             /* ---------- emittance-trace panel (left, selection-driven) ----------
-			   Floats over the left of the scene canvas; slides in when an object
-			   or zone is picked in 3D and shows that node's full LLM-call lineage
-			   (reuses the .obsm-* trace styles from the scenes drawer). */
+               Floats over the left of the scene canvas; slides in when an object
+               or zone is picked in 3D and shows that node's full LLM-call lineage
+               (reuses the .obsm-* trace styles from the scenes drawer). */
             #trace-panel {
                 position: absolute;
                 left: 0;
@@ -1327,12 +1342,12 @@
                 flex-direction: row; /* [ inner column | drag handle ] */
                 min-height: 0;
                 /* Hide via visibility, not transform alone: the panel lives inside
-				   the overlay, which itself slides off-screen (translateX(100%)) when
-				   closed — so the panel's own translateX(-100%) cancels against it and
-				   would leave an empty strip pinned to the right edge. visibility
-				   guarantees it's gone whenever it isn't .open. It flips instantly
-				   (no delay) so closing the scene never flashes the panel; the slide
-				   is kept only on open. */
+                   the overlay, which itself slides off-screen (translateX(100%)) when
+                   closed — so the panel's own translateX(-100%) cancels against it and
+                   would leave an empty strip pinned to the right edge. visibility
+                   guarantees it's gone whenever it isn't .open. It flips instantly
+                   (no delay) so closing the scene never flashes the panel; the slide
+                   is kept only on open. */
                 visibility: hidden;
                 transform: translateX(-100%);
                 transition:
@@ -1375,7 +1390,7 @@
                 background: var(--accent-line);
             }
             /* While dragging the handle, pin the canvas overlays to the cursor
-			   (drop their slide transition so they don't lag the panel edge). */
+               (drop their slide transition so they don't lag the panel edge). */
             body.trace-resizing #viewer-toggles,
             body.trace-resizing #zone-layers-legend {
                 transition: none;
@@ -1574,6 +1589,17 @@
                 color: var(--text-faint);
                 font-size: 10px;
             }
+            #trace-panel .tp-atomic {
+                font-size: 9px;
+                padding: 0 5px;
+                border-radius: 3px;
+                border: 1px solid var(--line-2);
+                color: var(--text-faint);
+            }
+            #trace-panel .tp-atomic.is-atomic {
+                border-color: var(--accent-line);
+                color: var(--accent);
+            }
             #trace-panel .tp-count {
                 margin-left: auto;
                 flex-shrink: 0;
@@ -1589,8 +1615,8 @@
                 white-space: nowrap;
             }
             /* per-call detail: each section (output / input / system / reasoning)
-			   has its own expand toggle; output starts on its relevant slice, the
-			   rest start collapsed. */
+               has its own expand toggle; output starts on its relevant slice, the
+               rest start collapsed. */
             #trace-panel .tp-sec-head {
                 display: flex;
                 align-items: center;
@@ -1679,7 +1705,7 @@
                 flex-shrink: 0;
             }
             /* Jump-to-node search: an input + a floating matches dropdown that
-			   overlays the tree below it (absolute, so it never reflows the dock). */
+               overlays the tree below it (absolute, so it never reflows the dock). */
             .obs-search {
                 position: relative;
                 padding: 6px 10px;
@@ -2023,6 +2049,37 @@
                 color: #e6d6ff;
                 border-color: var(--purple);
                 background: rgba(201, 166, 255, 0.16);
+            }
+            /* "log ↗" — jump to this call's api-log entry (obs dock + trace panel). */
+            .call-log {
+                font-size: 9px;
+                padding: 1px 7px;
+                color: var(--accent);
+                border: 1px solid var(--accent-line);
+                border-radius: 4px;
+                background: transparent;
+                white-space: nowrap;
+            }
+            .call-log:hover {
+                color: #d6ecff;
+                border-color: var(--accent);
+                background: rgba(154, 212, 255, 0.16);
+            }
+            /* "obs ↗" — jump from a truncated trace step to its full call in the
+               observability panel (trace panel only). */
+            .call-obs {
+                font-size: 9px;
+                padding: 1px 7px;
+                color: var(--amber);
+                border: 1px solid var(--amber);
+                border-radius: 4px;
+                background: transparent;
+                white-space: nowrap;
+            }
+            .call-obs:hover {
+                color: #ffe6b0;
+                border-color: var(--amber);
+                background: rgba(240, 200, 120, 0.16);
             }
             /* obs dock emit-trace mode (root → object lineage of one node). */
             .obs-call.emits .step-badge {
@@ -2691,9 +2748,9 @@
             /* ---------- prompt lab ---------- */
             #lab {
                 /* The lab runs its own type system: a clean UI sans for chrome
-				   (headers, labels, step list, buttons) and a comfortable mono
-				   for the actual prompt text — a "prompt IDE" feel, and a big
-				   readability jump over the monospace-everywhere board. */
+                   (headers, labels, step list, buttons) and a comfortable mono
+                   for the actual prompt text — a "prompt IDE" feel, and a big
+                   readability jump over the monospace-everywhere board. */
                 --lab-sans:
                     "Inter", "Segoe UI Variable", "Segoe UI", system-ui,
                     -apple-system, sans-serif;
@@ -2852,7 +2909,7 @@
                 line-height: 1;
             }
             /* An edited row already pushes its flag to the right; keep the revert
-			   button snug beside it rather than taking the auto-margin itself. */
+               button snug beside it rather than taking the auto-margin itself. */
             .lab-step-row .edited-flag + .lab-step-revert {
                 margin-left: 0;
             }
@@ -2870,8 +2927,8 @@
                 overflow: auto;
             }
             /* Each editor section (variables / system / user) is a self-contained
-			   card with a header bar — so the two templates read as distinct
-			   blocks instead of near-identical textareas bleeding together. */
+               card with a header bar — so the two templates read as distinct
+               blocks instead of near-identical textareas bleeding together. */
             .ed-block {
                 display: flex;
                 flex-direction: column;
@@ -3595,7 +3652,7 @@
                 padding: 9px 11px;
                 font-size: 12.5px;
                 line-height: 1.6;
-                max-height: 260px;
+                max-height: 130px;
                 overflow: auto;
             }
             .rv-card.err {
@@ -3817,8 +3874,8 @@
                 color: var(--green);
             }
             /* Shared dock layout for every createObsDock() host — the overlay's
-			   #obsdock keeps its own width/bg; each run-compare pane's .rc-obs
-			   supplies sizing. Both are flex columns whose body scrolls. */
+               #obsdock keeps its own width/bg; each run-compare pane's .rc-obs
+               supplies sizing. Both are flex columns whose body scrolls. */
             .obsdock {
                 display: flex;
                 flex-direction: column;
@@ -3827,8 +3884,8 @@
 
             /* ---------- run-compare (same cell across two runs) ---------- */
             /* Two independent inspector panes, A = active run, B = compareRunB.
-			   Read-only; each owns a viewer + a full observability dock. Sits
-			   below the overlay so a pane can still be opened full there. */
+               Read-only; each owns a viewer + a full observability dock. Sits
+               below the overlay so a pane can still be opened full there. */
             #btn-compare-runs.on {
                 border-color: var(--purple);
                 color: var(--purple);
@@ -3844,7 +3901,7 @@
                 max-width: 220px;
             }
             /* Splat screen: a full-screen selector panel, same layer/behaviour
-			   as run-compare. Pick a completed cell from any run (splat.js). */
+               as run-compare. Pick a completed cell from any run (splat.js). */
             #splat {
                 position: fixed;
                 inset: 0;
@@ -3983,7 +4040,7 @@
                 background: var(--red);
             }
             /* Stage-2 per-cell control (sample / view the Gaussian cloud) on the
-			   right of a row; its own button so it doesn't trigger a Stage-1 click. */
+               right of a row; its own button so it doesn't trigger a Stage-1 click. */
             .splat-stage2 {
                 display: flex;
                 align-items: center;
@@ -4264,8 +4321,8 @@
                 display: none;
             }
             /* Generated-asset view controls (overlay toolbar) + per-object
-			   regenerate / symmetry actions (trace panel) — from the hunyuan
-			   generation + symmetry features. */
+               regenerate / symmetry actions (trace panel) — from the hunyuan
+               generation + symmetry features. */
             #btn-asset-mode.on,
             #btn-asset-optimized.on {
                 border-color: var(--accent);
@@ -4274,10 +4331,192 @@
             #btn-generate {
                 font-weight: 600;
             }
+            /* Generated-version selector — a native <select> in the toolbar row, so
+               it needs the dark toolbar look the sibling <button>s inherit. */
+            #btn-gen-version {
+                font-size: 10px;
+                padding: 3px 6px;
+                background: var(--panel);
+                color: var(--text);
+                border: 1px solid var(--line);
+                border-radius: 4px;
+            }
             .gen-status {
                 font-size: 10px;
                 color: var(--text-faint);
                 align-self: center;
+            }
+            /* Generated-build failure report (genfails.js): the ⚠ button in the
+               viewer toggle row plus the panel it opens. Reuses the .vt-menu shell,
+               so it grows upward out of the bottom-left row like the objects
+               dropdown; everything below is the panel's own content. Shown only
+               when the build actually left something out. */
+            .gf-btn {
+                border-color: #7a3f3f;
+                color: var(--red);
+            }
+            .gf-btn:hover:not(:disabled),
+            .gf-btn.on {
+                background: #2c1d1d;
+                border-color: #af4f4f;
+            }
+            /* Anchored to the canvas like #lighting-panel — and shifted clear of the
+               trace panel by the same rule — rather than to its button: the toggle
+               row is a wide flex row whose right-hand buttons can sit past the
+               viewport edge, and a button-anchored popover goes off-screen with
+               them. Wide enough to read a backend error without truncating it. */
+            #genfail-panel {
+                position: absolute;
+                left: 10px;
+                bottom: calc(var(--toggles-h, 30px) + 16px);
+                width: 560px;
+                max-width: calc(100% - 20px);
+                max-height: min(56vh, 520px);
+                display: none;
+                flex-direction: column;
+                background: var(--panel);
+                border: 1px solid var(--line);
+                border-radius: 8px;
+                box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+                overflow: hidden;
+                z-index: 8;
+                transition: left 0.2s ease;
+            }
+            #genfail-panel.open {
+                display: flex;
+            }
+            #canvas-host:has(#trace-panel.open) #genfail-panel {
+                left: calc(var(--trace-w) + 16px);
+                max-width: calc(100% - var(--trace-w) - 36px);
+            }
+            .gf-head {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 7px 10px;
+                border-bottom: 1px solid var(--line);
+            }
+            .gf-title {
+                color: var(--text-dim);
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                font-size: 10px;
+            }
+            .gf-act {
+                font-size: 10px;
+                color: var(--text-faint);
+                cursor: pointer;
+            }
+            .gf-act:hover {
+                color: var(--accent);
+            }
+            .gf-copy {
+                margin-left: auto;
+            }
+            .gf-x {
+                font-size: 13px;
+                line-height: 1;
+            }
+            .gf-note {
+                padding: 5px 10px;
+                font-size: 10px;
+                color: var(--amber);
+                background: rgba(224, 194, 113, 0.07);
+                border-bottom: 1px solid var(--line-2);
+            }
+            .gf-body {
+                overflow-y: auto;
+                min-height: 0;
+                padding: 0 8px 8px;
+            }
+            .gf-section {
+                margin-top: 6px;
+            }
+            .gf-sec-head {
+                display: flex;
+                justify-content: space-between;
+                color: var(--text-faint);
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                padding: 2px 0;
+                border-bottom: 1px solid var(--line);
+            }
+            .gf-row {
+                display: flex;
+                align-items: baseline;
+                gap: 7px;
+                padding: 3px 4px;
+                border-radius: 3px;
+                font-size: 11px;
+                color: var(--text-dim);
+                cursor: pointer;
+            }
+            .gf-row:hover {
+                background: #1d2027;
+            }
+            /* Indented under the row above: this object lost its mesh because the
+               prefab canonical it shares one with failed. */
+            .gf-child {
+                padding-left: 18px;
+            }
+            .gf-child .gf-id {
+                color: var(--text-faint);
+            }
+            .gf-dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                flex-shrink: 0;
+                align-self: center;
+                background: var(--text-faint);
+            }
+            .gf-err .gf-dot {
+                background: var(--red);
+            }
+            .gf-warn .gf-dot {
+                background: var(--amber);
+            }
+            .gf-id {
+                flex-shrink: 0;
+                max-width: 190px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                color: var(--text);
+            }
+            .gf-kind,
+            .gf-stale {
+                flex-shrink: 0;
+                font-size: 9px;
+                padding: 0 5px;
+                border: 1px solid var(--line);
+                border-radius: 3px;
+                color: var(--text-faint);
+                white-space: nowrap;
+            }
+            .gf-err .gf-kind {
+                color: var(--red);
+                border-color: #7a3f3f;
+            }
+            .gf-warn .gf-kind {
+                color: var(--amber);
+                border-color: #5a4d2a;
+            }
+            .gf-stale {
+                color: var(--orange);
+                border-color: #6b4526;
+            }
+            .gf-msg {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                color: var(--text-faint);
+            }
+            .gf-more {
+                padding: 5px 2px 2px;
+                font-size: 10px;
+                color: var(--text-faint);
             }
             .tp-actions {
                 display: flex;
@@ -4297,8 +4536,7 @@
                 font-size: 11px;
                 padding: 3px 9px;
             }
-            .tp-act-btn:disabled,
-            .tp-act-sel:disabled {
+            .tp-act-btn:disabled, .tp-act-sel:disabled {
                 opacity: 0.35;
                 cursor: not-allowed;
             }
@@ -4321,13 +4559,13 @@
                 font-size: 11px;
                 line-height: 1.4;
                 color: var(--text-dim);
-                background: var(--bg-inset, rgba(0, 0, 0, 0.15));
+                background: var(--bg-inset, rgba(0,0,0,0.15));
                 border-radius: 4px;
                 padding: 4px 6px;
                 user-select: text;
             }
             /* Prefab group controls (link / unlink) — set off from the regenerate +
-			   symmetry rows within the same generated-asset block. */
+               symmetry rows within the same generated-asset block. */
             .tp-prefab {
                 display: flex;
                 flex-direction: column;
@@ -4337,7 +4575,7 @@
                 border-top: 1px dashed var(--line);
             }
             /* Front-view (raw-mesh re-orientation) controls — set off like the prefab
-			   block within the same generated-asset section. */
+               block within the same generated-asset section. */
             .tp-frontview {
                 display: flex;
                 flex-direction: column;
@@ -4347,33 +4585,73 @@
                 border-top: 1px dashed var(--line);
             }
             /* Global mesh-generation queue panel: every in-flight + waiting
-			   generation across the concurrency pools, from /trellis/queue. Shown
-			   only over the cell overlay; queue.js pins `right` just left of the
-			   observability dock (and the investigator when open) so it never
-			   overlaps the obs tree. The `right` below is only the pre-JS fallback. */
+               generation across the concurrency pools, from /trellis/queue. Shown
+               only over the cell overlay; queue.js pins `right` just left of the
+               observability dock (and the investigator when open) so it never
+               overlaps the obs tree. The `right` below is only the pre-JS fallback. */
             #queue-panel {
                 position: fixed;
                 right: 12px;
-                bottom: 12px;
+                bottom: 0;
                 width: 270px;
                 max-height: 50vh;
                 /* Hidden by default — the queue only floats over the main scene
-				   canvas (the cell overlay), never on the board or in the prompt
-				   lab, where it's just noise. Shown by the :has() rule below. */
+                   canvas (the cell overlay), never on the board or in the prompt
+                   lab, where it's just noise. Shown by the :has() rule below. */
                 display: none;
                 flex-direction: column;
+                align-items: flex-end;
+                z-index: 105; /* above the overlay (100), below modals (120) */
+                font-size: 12px;
+                pointer-events: none;
+            }
+            /* Reveal it only while the main canvas (cell overlay) is up. Mirrors
+               the app's other context-scoped overlays (e.g. #canvas-host:has(...)). */
+            body:has(#overlay.open) #queue-panel {
+                display: flex;
+            }
+            #queue-inner,
+            #queue-tab {
+                pointer-events: auto;
+            }
+            #queue-inner {
+                display: flex;
+                flex-direction: column;
+                width: 100%;
+                max-height: 50vh;
                 background: var(--panel);
                 border: 1px solid var(--line);
                 border-radius: 8px;
-                z-index: 105; /* above the overlay (100), below modals (120) */
-                font-size: 12px;
                 box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
                 overflow: hidden;
+                margin-bottom: 12px;
             }
-            /* Reveal it only while the main canvas (cell overlay) is up. Mirrors
-			   the app's other context-scoped overlays (e.g. #canvas-host:has(...)). */
-            body:has(#overlay.open) #queue-panel {
+            #queue-panel.docked-away #queue-inner {
+                display: none;
+            }
+            #queue-tab {
+                display: none;
+                align-items: center;
+                gap: 6px;
+                padding: 5px 10px 6px;
+                margin-bottom: 0;
+                cursor: pointer;
+                user-select: none;
+                background: var(--panel);
+                border: 1px solid var(--line);
+                border-bottom: none;
+                border-radius: 8px 8px 0 0;
+                box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+            }
+            #queue-tab:hover {
+                border-color: var(--accent-line);
+            }
+            #queue-panel.docked-away #queue-tab {
                 display: flex;
+            }
+            #queue-tab .q-tab-caret {
+                color: var(--text-faint);
+                font-size: 9px;
             }
             #queue-head {
                 display: flex;
@@ -4384,7 +4662,18 @@
                 user-select: none;
                 flex-shrink: 0;
             }
-            #queue-head .q-title {
+            #queue-head .q-dock {
+                margin-left: 4px;
+                color: var(--text-faint);
+                font-size: 9px;
+                padding: 0 2px;
+                flex-shrink: 0;
+            }
+            #queue-head .q-dock:hover {
+                color: var(--accent);
+            }
+            #queue-head .q-title,
+            #queue-tab .q-title {
                 color: var(--text-dim);
                 text-transform: uppercase;
                 letter-spacing: 0.05em;
@@ -4394,8 +4683,10 @@
                 color: var(--text-faint);
                 font-size: 10px;
             }
-            #queue-panel .q-count {
+            #queue-head .q-count {
                 margin-left: auto;
+            }
+            #queue-panel .q-count {
                 min-width: 18px;
                 text-align: center;
                 color: var(--bg);
@@ -4403,6 +4694,9 @@
                 border-radius: 999px;
                 padding: 0 6px;
                 font-variant-numeric: tabular-nums;
+            }
+            #queue-panel .q-count:empty {
+                display: none;
             }
             #queue-panel.busy .q-count {
                 background: var(--accent);
@@ -4476,6 +4770,40 @@
                 color: var(--text-dim);
                 font-size: 10px;
             }
+            .q-elapsed {
+                color: var(--text-faint);
+                font-size: 10px;
+                font-variant-numeric: tabular-nums;
+                min-width: 40px;
+                text-align: right;
+            }
+            /* Prefab group in the queue: a canonical row (caret + "+N" reuse count)
+               with its shared-mesh reuse rows nested under it; the caret collapses
+               the group (reuses derive from the canonical, so they queue together). */
+            .q-parent {
+                cursor: pointer;
+            }
+            .q-gcaret {
+                color: var(--text-faint);
+                font-size: 9px;
+                width: 9px;
+                flex-shrink: 0;
+            }
+            .q-gcount {
+                color: var(--text-faint);
+                font-size: 10px;
+                flex-shrink: 0;
+            }
+            .q-children.collapsed {
+                display: none;
+            }
+            .q-child {
+                padding-left: 14px;
+                opacity: 0.85;
+            }
+            .q-child .q-job {
+                color: var(--text-dim);
+            }
             /* Reference image in the object viewer, beneath the 3D mini preview. */
             .tp-img-wrap {
                 display: flex;
@@ -4491,8 +4819,8 @@
                 background: #0c0d10;
             }
             /* Per-object PBR texture maps (base color / roughness / metallic /
-			   occlusion / normal / emissive), one thumbnail each, under the 3D
-			   preview. Click a tile to span it full-width for a closer look. */
+               occlusion / normal / emissive), one thumbnail each, under the 3D
+               preview. Click a tile to span it full-width for a closer look. */
             .tp-maps {
                 display: flex;
                 flex-direction: column;
@@ -4544,11 +4872,13 @@
                 color: #06121c;
             }
             /* Lighting panel — opened from the ☀ light toggle in #viewer-toggles;
-			   floats bottom-left over the canvas, shifting clear of the trace panel. */
+               floats bottom-left over the canvas, shifting clear of the trace panel. */
             #lighting-panel {
                 position: absolute;
                 left: 10px;
-                bottom: 46px;
+                /* Clears the toggle row, whose height changes as it wraps
+                   (overlay.js publishes it as --toggles-h). */
+                bottom: calc(var(--toggles-h, 30px) + 16px);
                 width: 230px;
                 display: none;
                 flex-direction: column;
@@ -4613,6 +4943,1162 @@
             #btn-camera-mode.on {
                 border-color: var(--accent);
                 color: var(--accent);
+            }
+            /* --- api log (the first-party LLM request ledger) ------------------- */
+            /* ===== api log — OpenRouter-style light theme (namespaced .flog-*) ===== */
+            #flights {
+                position: fixed;
+                inset: 0;
+                display: none;
+                flex-direction: row;
+                z-index: 118; /* above the scene overlay (100) + tooltip (110), below modals (120), so the log can sit over an open scene */
+                --l-fg: #111827;
+                --l-muted: #6b7280;
+                --l-faint: #9ca3af;
+                --l-border: #e9e9ee;
+                --l-hover: #f9fafb;
+                --l-sel: #f3f4f6;
+                --l-accent: #6467f2;
+                --l-green: #22c55e;
+                --l-green-bg: #e7f8ee;
+                --l-green-fg: #15803d;
+                --l-blue: #3b82f6;
+                --l-red: #dc2626;
+                --l-red-bg: #fdecec;
+                --l-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+                --l-sans: -apple-system, "Segoe UI", Inter, Roboto, system-ui, sans-serif;
+                background: #fff;
+                color: var(--l-fg);
+                font-family: var(--l-sans);
+                font-size: 13px;
+            }
+            #flights.open {
+                display: flex;
+            }
+            .flog-list {
+                flex: 1 1 50%;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                border-right: 1px solid var(--l-border);
+                overflow: hidden;
+            }
+            .flog-lhead {
+                padding: 18px 22px 0;
+                flex-shrink: 0;
+            }
+            .flog-lhead-top {
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+            }
+            .flog-title {
+                font-size: 22px;
+                font-weight: 700;
+                letter-spacing: -0.01em;
+            }
+            .flog-sub {
+                color: var(--l-muted);
+                margin-top: 2px;
+            }
+            .flog-ctl {
+                margin-left: auto;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .flog-back {
+                border: 1px solid var(--l-border);
+                background: #fff;
+                color: var(--l-fg);
+                border-radius: 7px;
+                padding: 5px 10px;
+                cursor: pointer;
+                font: inherit;
+            }
+            .flog-back:hover {
+                background: var(--l-hover);
+            }
+            .flog-run {
+                border: 1px solid var(--l-border);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--l-fg);
+                font: inherit;
+                font-size: 12px;
+                padding: 5px 8px;
+                max-width: 220px;
+            }
+            .flog-live {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--l-faint);
+                flex-shrink: 0;
+            }
+            .flog-live.on {
+                background: var(--l-green);
+                box-shadow: 0 0 6px var(--l-green);
+            }
+            .flog-tabs {
+                display: flex;
+                gap: 18px;
+                padding: 0 22px;
+                margin-top: 14px;
+                border-bottom: 1px solid var(--l-border);
+                flex-shrink: 0;
+            }
+            .flog-tab {
+                padding: 8px 2px;
+                color: var(--l-muted);
+                border-bottom: 2px solid transparent;
+                font-weight: 500;
+                cursor: default;
+            }
+            .flog-tab.active {
+                color: var(--l-fg);
+                border-bottom-color: var(--l-accent);
+            }
+            /* filter bar (facet dropdowns) — matches the light theme */
+            .flog-filters {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 7px;
+                padding: 12px 22px 4px;
+                flex-shrink: 0;
+            }
+            .flog-facet-wrap {
+                position: relative;
+            }
+            .flog-facet {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                border: 1px solid var(--l-border);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--l-muted);
+                font: inherit;
+                font-size: 12px;
+                padding: 5px 9px;
+                cursor: pointer;
+            }
+            .flog-facet:hover {
+                border-color: var(--l-faint);
+                color: var(--l-fg);
+            }
+            .flog-facet-wrap.active .flog-facet {
+                border-color: var(--l-accent);
+                color: var(--l-accent);
+                background: #f5f5ff;
+            }
+            .flog-facet-badge:not(:empty) {
+                min-width: 16px;
+                text-align: center;
+                padding: 0 4px;
+                border-radius: 9px;
+                background: var(--l-accent);
+                color: #fff;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            .flog-facet-caret {
+                color: var(--l-faint);
+                font-size: 10px;
+            }
+            .flog-clear-all {
+                border: 1px solid var(--l-border);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--l-red);
+                font: inherit;
+                font-size: 12px;
+                padding: 5px 9px;
+                cursor: pointer;
+            }
+            .flog-clear-all:hover {
+                border-color: var(--l-red);
+            }
+            .flog-pop {
+                position: absolute;
+                top: calc(100% + 5px);
+                left: 0;
+                z-index: 80;
+                width: 250px;
+                max-width: 80vw;
+                background: #fff;
+                border: 1px solid var(--l-border);
+                border-radius: 9px;
+                box-shadow: 0 10px 30px rgba(16, 24, 40, 0.14);
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+            .flog-pop-search {
+                margin: 8px;
+                padding: 6px 8px;
+                border: 1px solid var(--l-border);
+                border-radius: 6px;
+                background: #fff;
+                color: var(--l-fg);
+                font: inherit;
+                font-size: 12px;
+            }
+            .flog-pop-search:focus {
+                outline: none;
+                border-color: var(--l-accent);
+            }
+            .flog-pop-list {
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            .flog-pop-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 6px 12px;
+                cursor: pointer;
+                font-size: 12.5px;
+                color: var(--l-fg);
+            }
+            .flog-pop-item:hover {
+                background: var(--l-hover);
+            }
+            .flog-pop-item.on {
+                color: var(--l-accent);
+            }
+            .flog-pop-item input {
+                margin: 0;
+                flex-shrink: 0;
+                accent-color: var(--l-accent);
+            }
+            .flog-pop-val {
+                flex: 1;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-pop-count {
+                color: var(--l-faint);
+                font-variant-numeric: tabular-nums;
+            }
+            .flog-pop-empty {
+                padding: 12px;
+                color: var(--l-faint);
+                text-align: center;
+            }
+            .flog-pop-foot {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 7px 12px;
+                border-top: 1px solid var(--l-border);
+            }
+            .flog-pop-lab {
+                color: var(--l-faint);
+                font-size: 11px;
+            }
+            .flog-pop-clear {
+                border: 1px solid var(--l-border);
+                border-radius: 6px;
+                background: #fff;
+                color: var(--l-muted);
+                font: inherit;
+                font-size: 11px;
+                padding: 3px 9px;
+                cursor: pointer;
+            }
+            .flog-pop-clear:hover {
+                border-color: var(--l-faint);
+                color: var(--l-fg);
+            }
+            .flog-chart {
+                display: flex;
+                align-items: flex-end;
+                gap: 2px;
+                height: 62px;
+                padding: 16px 22px 10px;
+                flex-shrink: 0;
+            }
+            .flog-bar {
+                flex: 1;
+                min-width: 0;
+                background: var(--l-green);
+                border-radius: 2px 2px 0 0;
+                min-height: 3px;
+                opacity: 0.85;
+            }
+            .flog-thead,
+            .flog-row {
+                display: grid;
+                grid-template-columns: 118px 1fr 0.95fr 1.05fr 1.1fr 58px;
+                gap: 10px;
+                align-items: center;
+                padding: 0 22px;
+            }
+            /* both-times mode needs a wider first column for the stacked pair */
+            .flog-list.tc-both .flog-thead,
+            .flog-list.tc-both .flog-row {
+                grid-template-columns: 158px 1fr 0.95fr 1.05fr 1.1fr 58px;
+            }
+            .flog-thead {
+                height: 34px;
+                color: var(--l-muted);
+                font-size: 12px;
+                border-bottom: 1px solid var(--l-border);
+                flex-shrink: 0;
+            }
+            .flog-rows {
+                flex: 1;
+                overflow-y: auto;
+            }
+            .flog-row {
+                height: 33px;
+                border-bottom: 1px solid var(--l-border);
+                cursor: pointer;
+            }
+            .flog-row:hover {
+                background: var(--l-hover);
+            }
+            .flog-row.selected {
+                background: var(--l-sel);
+            }
+            .flog-row.err {
+                background: var(--l-red-bg);
+            }
+            .flog-row.err:hover {
+                background: #fbe0e0;
+            }
+            .flog-row > div {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-date {
+                color: var(--l-muted);
+                font-variant-numeric: tabular-nums;
+            }
+            /* header control that swaps the first column between start/end/both */
+            .flog-timecol {
+                justify-self: start;
+                border: 0;
+                background: transparent;
+                color: var(--l-muted);
+                font: inherit;
+                font-size: 12px;
+                padding: 0;
+                margin: 0;
+                cursor: pointer;
+            }
+            .flog-timecol:hover {
+                color: var(--l-fg);
+            }
+            .flog-timecol:focus {
+                outline: none;
+            }
+            .flog-date-both {
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                gap: 1px;
+                font-size: 11px;
+                line-height: 1.2;
+                font-variant-numeric: tabular-nums;
+            }
+            .flog-date-both > span {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-date-both .flog-ts-a {
+                color: var(--l-muted);
+            }
+            .flog-date-both .flog-ts-b {
+                color: var(--l-faint);
+            }
+            .flog-mv {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                min-width: 0;
+            }
+            .flog-mv > span {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-ico {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                flex-shrink: 0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 10px;
+                font-weight: 700;
+                color: #fff;
+            }
+            .flog-app {
+                color: var(--l-fg);
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                min-width: 0;
+            }
+            .flog-app .flog-zone {
+                color: var(--l-faint);
+            }
+            .flog-step {
+                font-family: var(--l-mono);
+                font-size: 11.5px;
+                color: var(--l-fg);
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                min-width: 0;
+            }
+            .flog-time {
+                color: var(--l-muted);
+                text-align: right;
+                font-variant-numeric: tabular-nums;
+                white-space: nowrap;
+            }
+            .flog-empty {
+                padding: 40px;
+                text-align: center;
+                color: var(--l-faint);
+            }
+            .flog-pager {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 9px 22px;
+                border-top: 1px solid var(--l-border);
+                flex-shrink: 0;
+            }
+            .flog-page-lab {
+                color: var(--l-muted);
+                font-size: 12px;
+                margin-right: auto;
+            }
+            .flog-arrow {
+                border: 1px solid var(--l-border);
+                background: #fff;
+                border-radius: 7px;
+                width: 32px;
+                height: 28px;
+                cursor: pointer;
+                color: var(--l-fg);
+            }
+            .flog-arrow:disabled {
+                color: var(--l-faint);
+                cursor: default;
+            }
+            .flog-arrow:not(:disabled):hover {
+                background: var(--l-hover);
+            }
+            .flog-detail {
+                flex: 1 1 50%;
+                min-width: 0;
+                overflow-y: auto;
+                padding: 20px 24px 40px;
+            }
+            .flog-ph {
+                color: var(--l-faint);
+                text-align: center;
+                padding: 64px 20px;
+            }
+            .flog-d-head {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .flog-d-title {
+                font-size: 16px;
+                font-weight: 700;
+            }
+            .flog-x {
+                margin-left: auto;
+                border: none;
+                background: none;
+                color: var(--l-muted);
+                font-size: 18px;
+                line-height: 1;
+                cursor: pointer;
+            }
+            .flog-x:hover {
+                color: var(--l-fg);
+            }
+            .flog-pills {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin: 12px 0 4px;
+            }
+            .flog-pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                border: 1px solid var(--l-border);
+                border-radius: 999px;
+                padding: 4px 11px;
+                font-size: 12px;
+            }
+            /* detail actions: jump back into the 3D scene from a log entry */
+            .flog-d-actions {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin: 6px 0 2px;
+            }
+            .flog-goto {
+                border: 1px solid var(--l-accent);
+                border-radius: 7px;
+                background: #f5f5ff;
+                color: var(--l-accent);
+                font: inherit;
+                font-size: 12px;
+                font-weight: 500;
+                padding: 5px 11px;
+                cursor: pointer;
+                max-width: 100%;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-goto:hover {
+                background: var(--l-accent);
+                color: #fff;
+            }
+            .flog-cards {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 10px;
+                margin: 16px 0 4px;
+            }
+            .flog-card {
+                border: 1px solid var(--l-border);
+                border-radius: 9px;
+                padding: 11px 13px;
+            }
+            .flog-card-lab {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                color: var(--l-muted);
+                font-size: 12px;
+            }
+            .flog-card-val {
+                font-size: 15px;
+                font-weight: 600;
+                margin-top: 5px;
+            }
+            .flog-sech {
+                font-weight: 700;
+                font-size: 13px;
+                margin: 22px 0 8px;
+            }
+            .flog-kv {
+                display: flex;
+                gap: 12px;
+                padding: 3px 0;
+                align-items: baseline;
+            }
+            .flog-kv-k {
+                flex: 0 0 130px;
+                color: var(--l-muted);
+            }
+            .flog-kv-v {
+                flex: 1;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-mono {
+                font-family: var(--l-mono);
+                font-size: 12px;
+            }
+            .flog-resp-row {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 6px 0;
+            }
+            .flog-resp-lab {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                flex: 0 0 156px;
+                overflow: hidden;
+            }
+            .flog-resp-lab > span {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .flog-badge {
+                font-size: 11px;
+                font-weight: 600;
+                padding: 0 6px;
+                border-radius: 5px;
+                flex-shrink: 0;
+            }
+            .flog-badge.ok {
+                color: var(--l-green-fg);
+                background: var(--l-green-bg);
+            }
+            .flog-badge.err {
+                color: var(--l-red);
+                background: var(--l-red-bg);
+            }
+            .flog-track {
+                flex: 1;
+                height: 20px;
+                background: #f3f4f6;
+                border-radius: 4px;
+                overflow: hidden;
+            }
+            .flog-fill {
+                height: 100%;
+                border-radius: 4px;
+                display: flex;
+                align-items: center;
+                padding: 0 7px;
+                font-size: 11px;
+                color: #fff;
+                white-space: nowrap;
+            }
+            .flog-fill.green {
+                background: var(--l-green);
+            }
+            .flog-fill.blue {
+                background: var(--l-blue);
+            }
+            .flog-resp-t {
+                flex: 0 0 auto;
+                color: var(--l-muted);
+                font-size: 12px;
+                font-variant-numeric: tabular-nums;
+            }
+            .flog-total {
+                text-align: right;
+                color: var(--l-muted);
+                font-size: 12px;
+                padding-top: 4px;
+            }
+            .flog-fold {
+                border: 1px solid var(--l-border);
+                border-radius: 9px;
+                margin-top: 8px;
+                overflow: hidden;
+            }
+            .flog-fold-h {
+                display: flex;
+                align-items: center;
+                gap: 9px;
+                padding: 11px 13px;
+                cursor: pointer;
+            }
+            .flog-fold-h:hover {
+                background: var(--l-hover);
+            }
+            .flog-fold-ct {
+                color: var(--l-faint);
+                margin-left: auto;
+                font-size: 12px;
+            }
+            .flog-fold-body {
+                display: none;
+                border-top: 1px solid var(--l-border);
+            }
+            .flog-fold.open .flog-fold-body {
+                display: block;
+            }
+            .flog-pre {
+                margin: 0;
+                padding: 12px 14px;
+                max-height: 360px;
+                overflow: auto;
+                white-space: pre-wrap;
+                word-break: break-word;
+                font-family: var(--l-mono);
+                font-size: 12px;
+                line-height: 1.55;
+                color: #1f2937;
+            }
+            .flog-pre + .flog-pre {
+                border-top: 1px solid var(--l-border);
+            }
+            .flog-pre-lab {
+                padding: 8px 14px 0;
+                color: var(--l-faint);
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            .flog-err-box {
+                margin: 12px 0;
+                padding: 10px 12px;
+                border: 1px solid var(--l-red);
+                background: var(--l-red-bg);
+                border-radius: 8px;
+                color: var(--l-red);
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+            .flog-note {
+                padding: 12px;
+                color: var(--l-faint);
+            }
+            #flights.open {
+                display: flex;
+            }
+            #flights-head {
+                height: 46px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 0 12px;
+                background: var(--panel-2);
+                border-bottom: 1px solid var(--line);
+                flex-shrink: 0;
+            }
+            #flights-head .title {
+                font-weight: 600;
+            }
+            #flights-head .sep {
+                flex: 0 0 1px;
+                height: 20px;
+                background: var(--line);
+            }
+            #flights-head .fl-stats {
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .fl-live {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--text-faint);
+                flex-shrink: 0;
+            }
+            .fl-live.on {
+                background: var(--green);
+                box-shadow: 0 0 6px var(--green);
+            }
+            #fl-run {
+                background: var(--panel);
+                border: 1px solid var(--line);
+                border-radius: 4px;
+                color: var(--text);
+                font: inherit;
+                font-size: 11px;
+                padding: 3px 6px;
+                max-width: 240px;
+            }
+            #fl-run:focus {
+                outline: none;
+                border-color: var(--accent-line);
+            }
+            #flights-filters {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 6px;
+                padding: 7px 12px;
+                background: var(--panel);
+                border-bottom: 1px solid var(--line);
+                flex-shrink: 0;
+            }
+            .fl-facet-wrap {
+                position: relative;
+            }
+            .fl-facet {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                padding: 3px 8px;
+                font-size: 11px;
+            }
+            .fl-facet-wrap.active .fl-facet {
+                border-color: var(--accent-line);
+                color: var(--accent);
+            }
+            .fl-facet-badge:not(:empty) {
+                min-width: 15px;
+                text-align: center;
+                padding: 0 4px;
+                border-radius: 8px;
+                background: var(--accent-line);
+                color: #fff;
+                font-size: 10px;
+            }
+            .fl-facet-caret {
+                color: var(--text-faint);
+            }
+            .fl-clear-all {
+                padding: 3px 8px;
+                font-size: 11px;
+                color: var(--amber);
+                border-color: var(--amber);
+            }
+            .fl-pop {
+                position: absolute;
+                top: calc(100% + 4px);
+                left: 0;
+                z-index: 70;
+                width: 240px;
+                max-width: 80vw;
+                background: var(--panel-2);
+                border: 1px solid var(--accent-line);
+                border-radius: 6px;
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+            .fl-pop-search {
+                margin: 6px;
+                padding: 4px 7px;
+                background: var(--bg);
+                border: 1px solid var(--line);
+                border-radius: 4px;
+                color: var(--text);
+                font: inherit;
+                font-size: 11px;
+            }
+            .fl-pop-search:focus {
+                outline: none;
+                border-color: var(--accent-line);
+            }
+            .fl-pop-list {
+                max-height: 280px;
+                overflow-y: auto;
+            }
+            .fl-pop-item {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                padding: 4px 10px;
+                cursor: pointer;
+            }
+            .fl-pop-item:hover {
+                background: var(--panel);
+            }
+            .fl-pop-item.on {
+                color: var(--accent);
+            }
+            .fl-pop-item input {
+                margin: 0;
+                flex-shrink: 0;
+            }
+            .fl-pop-val {
+                flex: 1;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .fl-pop-count {
+                color: var(--text-faint);
+                font-variant-numeric: tabular-nums;
+            }
+            .fl-pop-empty {
+                padding: 10px;
+                color: var(--text-faint);
+                text-align: center;
+            }
+            .fl-pop-foot {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 6px 10px;
+                border-top: 1px solid var(--line);
+            }
+            .fl-pop-clear {
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            .fl-row {
+                display: grid;
+                grid-template-columns:
+                    78px 64px 74px minmax(150px, 1.1fr) 120px minmax(180px, 1.5fr)
+                    86px 76px 56px;
+                gap: 10px;
+                align-items: center;
+                padding: 4px 12px 4px 9px;
+                border-left: 3px solid transparent;
+                border-bottom: 1px solid var(--line-2);
+                font-variant-numeric: tabular-nums;
+            }
+            .fl-cols {
+                color: var(--text-faint);
+                font-size: 11px;
+                background: var(--panel);
+                border-bottom: 1px solid var(--line);
+                padding: 6px 12px 6px 9px;
+                flex-shrink: 0;
+            }
+            #flights-rows {
+                flex: 1;
+                overflow-y: auto;
+                overflow-x: hidden;
+            }
+            #flights-rows .fl-row {
+                cursor: pointer;
+            }
+            .fl-row.tr-openrouter {
+                border-left-color: var(--accent-line);
+            }
+            .fl-row.tr-direct {
+                border-left-color: var(--purple);
+            }
+            #flights-rows .fl-row:nth-child(even) {
+                background: rgba(127, 127, 127, 0.05);
+            }
+            #flights-rows .fl-row.limited {
+                background: rgba(224, 194, 113, 0.1);
+            }
+            #flights-rows .fl-row.failed {
+                background: rgba(255, 128, 128, 0.09);
+            }
+            #flights-rows .fl-row:hover {
+                background: var(--panel);
+            }
+            #flights-rows .fl-row.selected {
+                background: rgba(154, 212, 255, 0.16);
+            }
+            .fl-row > span {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .fl-time {
+                color: var(--text-dim);
+            }
+            .fl-chip {
+                justify-self: start;
+                padding: 1px 7px;
+                border-radius: 9px;
+                font-size: 11px;
+                border: 1px solid var(--line);
+                color: var(--text-dim);
+            }
+            .fl-chip.ok {
+                color: var(--green);
+                border-color: var(--green-line);
+            }
+            .fl-chip.warn {
+                color: var(--amber);
+                border-color: var(--amber);
+            }
+            .fl-chip.err {
+                color: var(--red);
+                border-color: var(--red);
+            }
+            .fl-flight {
+                color: var(--text);
+            }
+            .fl-flight.slow {
+                color: var(--amber);
+            }
+            .fl-flight.veryslow {
+                color: var(--orange);
+            }
+            .fl-provider,
+            .fl-tok {
+                color: var(--text-dim);
+            }
+            .fl-provider.tr-openrouter {
+                color: var(--accent);
+            }
+            .fl-provider.tr-direct {
+                color: var(--purple);
+            }
+            .fl-key {
+                color: var(--amber);
+            }
+            .fl-ctx-slot {
+                color: var(--text-dim);
+            }
+            .fl-ctx-step {
+                color: var(--accent);
+            }
+            .fl-ctx .faint,
+            .fl-ctx.faint,
+            .faint {
+                color: var(--text-faint);
+            }
+            .fl-sep {
+                border-left: 1px solid var(--line);
+                padding-left: 11px;
+            }
+            .fl-try {
+                color: var(--amber);
+                font-size: 11px;
+            }
+            .fl-empty {
+                padding: 28px;
+                color: var(--text-faint);
+                text-align: center;
+            }
+            .fl-more {
+                display: flex;
+                justify-content: center;
+                padding: 12px;
+            }
+            .fl-more-btn {
+                padding: 5px 14px;
+            }
+            .fl-more-msg {
+                color: var(--text-faint);
+                font-size: 11px;
+            }
+            #flights-main {
+                flex: 1;
+                display: flex;
+                min-height: 0;
+            }
+            #flights-table {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                min-width: 0;
+            }
+            #flights-detail {
+                flex: 0 0 440px;
+                max-width: 46%;
+                display: none;
+                flex-direction: column;
+                overflow-y: auto;
+                background: var(--panel);
+                border-left: 1px solid var(--line);
+            }
+            #flights-detail.open {
+                display: flex;
+            }
+            .fl-d-head {
+                position: sticky;
+                top: 0;
+                z-index: 1;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 14px;
+                background: var(--panel-2);
+                border-bottom: 1px solid var(--line);
+            }
+            .fl-d-title {
+                font-weight: 600;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .fl-d-close {
+                margin-left: auto;
+                padding: 2px 9px;
+            }
+            .fl-d-grid {
+                display: grid;
+                grid-template-columns: 1fr;
+                gap: 3px;
+                padding: 12px 14px;
+            }
+            .fl-d-pair {
+                display: flex;
+                gap: 8px;
+                min-width: 0;
+            }
+            .fl-d-k {
+                flex: 0 0 92px;
+                color: var(--text-faint);
+            }
+            .fl-d-v {
+                flex: 1;
+                color: var(--text-dim);
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .fl-d-err {
+                margin: 0 14px 12px;
+                padding: 8px 10px;
+                background: var(--bg);
+                border: 1px solid var(--red);
+                border-radius: 4px;
+                color: var(--red);
+                white-space: pre-wrap;
+                word-break: break-word;
+                max-height: 180px;
+                overflow-y: auto;
+            }
+            .fl-d-prompts {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                padding: 0 14px 14px;
+            }
+            .fl-d-sec-lab {
+                color: var(--text-faint);
+                font-size: 11px;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                margin-top: 4px;
+            }
+            .fl-d-note,
+            .fl-d-loading {
+                padding: 10px;
+                color: var(--text-faint);
+                background: var(--bg);
+                border: 1px solid var(--line);
+                border-radius: 4px;
+            }
+            .fl-sec {
+                border: 1px solid var(--line);
+                border-radius: 4px;
+                overflow: hidden;
+            }
+            .fl-sec-head {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                padding: 6px 9px;
+                cursor: pointer;
+                background: var(--panel-2);
+                user-select: none;
+            }
+            .fl-sec-head:hover {
+                color: var(--accent);
+            }
+            .fl-sec-title {
+                flex: 1;
+            }
+            .fl-sec-meta {
+                color: var(--text-faint);
+                font-size: 11px;
+            }
+            .fl-sec-caret {
+                color: var(--text-faint);
+            }
+            .fl-sec:not(.open) .fl-pre {
+                display: none;
+            }
+            .fl-pre {
+                margin: 0;
+                padding: 9px 11px;
+                max-height: 340px;
+                overflow: auto;
+                white-space: pre-wrap;
+                word-break: break-word;
+                background: var(--bg);
+                border-top: 1px solid var(--line);
+                font-size: 11px;
+                line-height: 1.5;
             }
         </style>
         <script type="importmap">
@@ -4706,10 +6192,22 @@
                 copy slot…
             </button>
             <button
+                id="btn-seed-start"
+                title="Start a scene's generation seeded with another scene's root zone plan + overall bounding box — the plan and canvas are held fixed and everything inside them regenerates"
+            >
+                seed start…
+            </button>
+            <button
                 id="btn-copy-cell"
                 title="Copy one slot's cell from one model (or run) into another model (or run), overwriting the destination cell"
             >
                 copy cell…
+            </button>
+            <button
+                id="btn-flights"
+                title="The api log — every LLM request across all transports (OpenRouter + direct providers), live: request/response times, flight duration, status (429s, timeouts), rotating-pool key, tokens"
+            >
+                api log
             </button>
             <span id="status-text"></span>
             <div id="cost-tracker" class="collapsed">
@@ -4767,7 +6265,7 @@
                 <div id="canvas-host">
                     <div id="viewer-toggles">
                         <!-- objects multiselect (anchors/next/negative space/frames) is
-						     inserted here by overlay.js via buildObjectsMenu() -->
+                             inserted here by overlay.js via buildObjectsMenu() -->
                         <button data-toggle="zones">zones</button>
                         <button data-toggle="meshes">meshes</button>
                         <button data-toggle="grid">grid</button>
@@ -4801,7 +6299,7 @@
                     </div>
                     <div id="zone-layers-legend" style="display: none"></div>
                     <!-- Selection-driven emittance-trace inspector; filled +
-					     slid in by tracepanel.js when a node is picked in 3D. -->
+                         slid in by tracepanel.js when a node is picked in 3D. -->
                     <div id="trace-panel"></div>
                 </div>
                 <div
@@ -4830,7 +6328,7 @@
                     style="display: none"
                 ></div>
                 <!-- Per-slot investigator chat; built + driven by investigator.js,
-				     toggled from the header (#overlay-investigate). -->
+                     toggled from the header (#overlay-investigate). -->
                 <div id="investigator" class="investigator"></div>
             </div>
         </div>
@@ -5063,7 +6561,7 @@
                     <div id="rc-b-obs" class="rc-obs open"></div>
                 </div>
                 <!-- Scene investigator for run-compare; bound per-pane on "why?"
-				     (see runcompare.js), toggled from #rc-investigate. -->
+                     (see runcompare.js), toggled from #rc-investigate. -->
                 <div id="rc-investigator" class="investigator"></div>
             </div>
         </div>
@@ -5117,6 +6615,9 @@
                 <b>Esc</b> exits
             </div>
         </div>
+        <!-- api log — full-screen live view of the LLM request ledger;
+             built + driven by flights.js, toggled from #btn-flights. -->
+        <div id="flights"></div>
         <div id="modal-root"></div>
         <div id="toast-root"></div>
         <script type="module" src="/js/main.js"></script>

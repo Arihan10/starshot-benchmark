@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,7 +246,7 @@ def _emit(kind: str, **fields: Any) -> None:
     try:
         logging.log(kind, **fields)
     except LookupError:
-        print(f"[{kind}] {fields}", file=sys.stderr)
+        logging.console_note(f"[{kind}] {fields}")
 
 
 def _is_429(err: genai_errors.APIError) -> bool:

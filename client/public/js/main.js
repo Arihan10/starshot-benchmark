@@ -2,7 +2,7 @@
 // Owns the canonical state.slots refresh loop every panel renders from.
 
 import { api } from "./api.js";
-import { state, emit, on } from "./state.js";
+import { state, emit, on, branchSummaryById } from "./state.js";
 import { el, toast, openModal, field, stepUntilSelect } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { renderBoard } from "./board.js";
@@ -11,6 +11,7 @@ import { initLab } from "./promptlab.js";
 import { initCompare } from "./compare.js";
 import { initRunCompare } from "./runcompare.js";
 import { initCost } from "./cost.js";
+import { initFlights } from "./flights.js";
 import { initQueuePanel } from "./queue.js";
 import { initLighting } from "./lighting.js";
 import { createRunCombo } from "./runcombo.js";
@@ -107,6 +108,29 @@ runCombo = createRunCombo(runPickerEl, {
 on("switch-run", async (name) => {
     await refreshRuns();
     await switchRun(name);
+});
+
+// api log → scene viewer: switch to the request's run if needed, then open its
+// cell in the overlay, focusing the node the call produced. Branch flights
+// resolve their origin cell (slot/model) from the live /slots snapshot.
+on("open-cell-focus", async ({ run, slot, model, branch = false, focus = null }) => {
+  if (run && run !== state.run) {
+    await refreshRuns();
+    await switchRun(run);
+  }
+  let openSlot = slot;
+  let openModel = model;
+  let openBranch = branch;
+  if (openBranch && (!openSlot || !openModel)) {
+    const b = branchSummaryById(openBranch);
+    if (b) { openSlot = b.slot; openModel = b.model; }
+    else { openBranch = false; }
+  }
+  if (!openSlot || !openModel) {
+    toast("couldn't resolve that request's cell", "err");
+    return;
+  }
+  emit("open-cell", { slot: openSlot, model: openModel, branch: openBranch, focus, fromLog: true });
 });
 
 // --- slots polling -----------------------------------------------------------------
@@ -798,6 +822,104 @@ async function copySlotModal() {
     });
 }
 
+// Start a scene's generation seeded with ANOTHER scene's committed root zone
+// plan + overall bounding box: pick a SOURCE cell to grab the plan + canvas
+// from and the TARGET cell (slot + model) to run. The target replays that fixed
+// plan + bbox verbatim and re-derives everything inside it under its OWN prompt
+// + model — so holding a source fixed while varying the target model is the
+// benchmark's core comparison. The target is reset first; the source is
+// untouched. The server rejects a source with no committed root plan + bbox.
+async function seedStartModal() {
+    if (!state.run) return;
+    // Seed candidates: every started cell on this run. The server validates each
+    // actually committed a root zone plan + overall bbox and rejects otherwise.
+    const sources = [];
+    for (const slot of state.slots) {
+        for (const m of state.models) {
+            const c = slot.runs?.[m];
+            if (c && (c.events_count ?? 0) > 0) {
+                sources.push({ slot: slot.id, model: m, events: c.events_count ?? 0 });
+            }
+        }
+    }
+    if (!sources.length) { toast(`no started cells in "${state.run}" to seed from`, "err"); return; }
+
+    const sourceSel = el("select", {}, sources.map((c) =>
+        el("option", { value: `${c.slot}|${c.model}`, text: `${c.slot} · ${c.model} · ${c.events} ev` })));
+    const slotSel = el("select", {}, state.slots.map((s) => el("option", { value: s.id, text: s.id })));
+    const modelSel = el("select", {}, state.models.map((m) => el("option", { value: m, text: m })));
+    const warnEl = el("div", { class: "m-hint" });
+
+    // slot ids may contain spaces but never "|", so the last "|" splits the pair.
+    const srcOf = () => {
+        const v = sourceSel.value;
+        const i = v.lastIndexOf("|");
+        return { slot: v.slice(0, i), model: v.slice(i + 1) };
+    };
+
+    // Same cell as the source is invalid; a populated target is reset & reseeded
+    // (destructive), an idle one just fills in.
+    function refreshWarn() {
+        const src = srcOf();
+        const targetSlot = slotSel.value, targetModel = modelSel.value;
+        if (targetSlot === src.slot && targetModel === src.model) {
+            warnEl.className = "m-error";
+            warnEl.textContent = "target and source are the same cell — pick a different target model or source.";
+            return;
+        }
+        const count = state.slots.find((s) => s.id === targetSlot)?.runs?.[targetModel]?.events_count ?? 0;
+        warnEl.className = count > 0 ? "m-error" : "m-hint";
+        warnEl.textContent = count > 0
+            ? `⚠ "${targetSlot} · ${targetModel}" has ${count} event${count === 1 ? "" : "s"} — reset & reseeded.`
+            : `"${targetSlot} · ${targetModel}" is idle — nothing overwritten.`;
+    }
+
+    // Nudge the target to the source's OWN slot (the coherent case: hold that
+    // scene's plan + canvas fixed, vary the model) and off the source's model so
+    // the default target is a valid, different cell.
+    function alignTargetToSource() {
+        const src = srcOf();
+        slotSel.value = src.slot;
+        if (modelSel.value === src.model) {
+            const alt = state.models.find((m) => m !== src.model);
+            if (alt) modelSel.value = alt;
+        }
+    }
+
+    sourceSel.addEventListener("change", () => { alignTargetToSource(); refreshWarn(); });
+    slotSel.addEventListener("change", refreshWarn);
+    modelSel.addEventListener("change", refreshWarn);
+    alignTargetToSource();
+
+    openModal("seed a scene's start", (close, setError) => {
+        refreshWarn();
+        return {
+            body: [
+                field("seed root plan + overall bbox from", sourceSel),
+                field("scene to start (slot)", slotSel),
+                field("start with model", modelSel),
+                el("div", { class: "m-hint", text:
+                    "Starts the target cell holding the source's root zone plan + overall bounding box fixed, regenerating everything inside them under the target scene's own prompt + model. The target is reset first; the source is untouched." }),
+                warnEl,
+            ],
+            actions: [
+                el("button", { text: "cancel", onclick: close }),
+                el("button", { class: "primary", text: "seed & start", onclick: async () => {
+                    const src = srcOf();
+                    const targetSlot = slotSel.value, targetModel = modelSel.value;
+                    if (targetSlot === src.slot && targetModel === src.model) { setError("pick a different target cell"); return; }
+                    try {
+                        await api.seedStart(state.run, targetSlot, targetModel, src.slot, src.model);
+                        close();
+                        toast(`seeded "${targetSlot} · ${targetModel}" from "${src.slot} · ${src.model}" — started`, "ok");
+                        refreshSlots();
+                    } catch (e) { setError(e.message); }
+                } }),
+            ],
+        };
+    });
+}
+
 // Copy a single cell (one slot's log + meshes for one model) into another model
 // and/or run — the cross-model / cross-run transplant. The source is a cell on
 // THIS run; the destination is any run's cell for the SAME slot (content is
@@ -1027,6 +1149,9 @@ document
     .getElementById("btn-copy-slot")
     .addEventListener("click", copySlotModal);
 document
+    .getElementById("btn-seed-start")
+    .addEventListener("click", seedStartModal);
+document
     .getElementById("btn-copy-cell")
     .addEventListener("click", copyCellModal);
 
@@ -1042,6 +1167,7 @@ document
     initCompare();
     initRunCompare();
     initCost();
+    initFlights();
     initQueuePanel();
     initSplat();
 

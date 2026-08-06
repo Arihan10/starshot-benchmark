@@ -14,7 +14,7 @@
 // rebuilt only when the focus changes (or its data streams in), so the mini
 // viewer's WebGL context survives the body's frequent rebuilds.
 
-import { el, foldedPre, fmtJson, shortBytes } from "./ui.js";
+import { el, foldedPre, fmtJson, shortBytes, callTimingTitle, fmtClockTime } from "./ui.js";
 import { emittanceLineage, extractRelevantOutput } from "./events.js";
 import { createViewer } from "./scene3d.js";
 import { api } from "./api.js";
@@ -46,6 +46,15 @@ export function createTracePanel(
 		onNavigate = () => {},
 		onClose = () => {},
 		onInquire = null,
+		onOpenLog = null,
+		// Jump from a (node-truncated) trace step to its FULL call in the
+		// observability panel — expands + scrolls that call open in the obs dock.
+		// null hides the affordance.
+		onOpenInObs = null,
+		// Fetch a slim call's heavy bytes on demand (history/live streams omit
+		// them); hydrates the shared call object in place. null = calls already
+		// carry full bytes inline (nothing to fetch).
+		loadCallBytes = null,
 		// Project a map onto the focused object's mesh (null desc clears); returns
 		// whether it took. `mapProjectionOf` reads the viewer's live projection back.
 		onProjectMap = () => {},
@@ -112,7 +121,7 @@ export function createTracePanel(
 	};
 
 	// Per-object texture maps: the raw mesh's PBR maps (base color, roughness,
-	// metallic, occlusion, normal, emissive), each rendered to its own thumbnail
+	// metallic, occlusion, normal, emissive, transparency), each rendered to its own thumbnail
 	// so every map can be inspected separately. Filled by `renderMaps` once the
 	// raw GLB loads; hidden when the focused node exposes no readable maps.
 	const mapsGrid = el("div", { class: "tp-maps-grid" });
@@ -330,7 +339,7 @@ export function createTracePanel(
 			if (nounChk.checked) reuse.checked = false;
 		});
 		const sym = actions.symmetryOf?.(id);
-		const mirrored = !!sym && (sym.plane === "xy" || sym.plane === "xz");
+		const mirrored = !!sym && !!sym.plane && sym.plane !== "none";
 
 		let symRow;
 		if (mirrored) {
@@ -353,12 +362,16 @@ export function createTracePanel(
 				{ class: "tp-act-sel", title: "mirror plane", disabled: busy },
 				el("option", { value: "xy", text: "xy · front/back" }),
 				el("option", { value: "xz", text: "xz · top/bottom" }),
+				el("option", { value: "yz", text: "yz · left/right" }),
 			);
 			const keepSel = el("select", {
 				class: "tp-act-sel",
 				title: "which half to keep, then mirror onto the other",
 				disabled: busy,
 			});
+			// keepPositive=true is the +axis half of the raw mesh frame, where front
+			// is +Z, up is +Y and right is +X — so every label here is from the
+			// viewer's side looking at the object's front.
 			const KEEP = {
 				xy: [
 					["true", "keep front"],
@@ -367,6 +380,10 @@ export function createTracePanel(
 				xz: [
 					["true", "keep top"],
 					["false", "keep bottom"],
+				],
+				yz: [
+					["true", "keep right"],
+					["false", "keep left"],
 				],
 			};
 			const syncKeep = () =>
@@ -767,8 +784,8 @@ export function createTracePanel(
 	}
 
 	// Render one texture (optionally a single channel, splatted to grayscale) to a
-	// capped 2D canvas. channel ∈ {null, "r", "g", "b"} — glTF packs occlusion in
-	// R, roughness in G, and metalness in B of the metallic-roughness texture.
+	// capped 2D canvas. channel ∈ {null, "r", "g", "b", "a"} — glTF packs occlusion
+	// in R, roughness in G, metalness in B, and opacity in the base-colour alpha.
 	function drawMapCanvas(src, channel) {
 		const scale = Math.min(1, MAP_CANVAS_CAP / Math.max(src.w, src.h));
 		const cw = Math.max(1, Math.round(src.w * scale));
@@ -790,7 +807,7 @@ export function createTracePanel(
 				return null;
 			}
 			const px = data.data;
-			const off = channel === "r" ? 0 : channel === "g" ? 1 : 2;
+			const off = channel === "r" ? 0 : channel === "g" ? 1 : channel === "b" ? 2 : 3;
 			for (let i = 0; i < px.length; i += 4) {
 				const v = px[i + off];
 				px[i] = px[i + 1] = px[i + 2] = v;
@@ -875,6 +892,11 @@ export function createTracePanel(
 				if (!found.ao && m.aoMap) found.ao = m.aoMap;
 				if (!found.emissive && m.emissiveMap)
 					found.emissive = m.emissiveMap;
+				// Opacity is the base-colour texture's ALPHA channel (glTF alphaMode
+				// BLEND/MASK — what the glassify transform bakes into). Only surfaced
+				// when the material actually uses it, so opaque meshes get no flat tile.
+				if (!found.alpha && m.map && (m.transparent || m.alphaTest > 0))
+					found.alpha = m.map;
 			}
 		});
 		const tiles = [];
@@ -890,6 +912,7 @@ export function createTracePanel(
 		add(found.ao, "r", "occlusion", "occlusion");
 		add(found.normal, null, "normal", "normal");
 		add(found.emissive, null, "emissive", "emissive");
+		add(found.alpha, "a", "transparency", "transparency");
 		if (!tiles.length) return;
 		mapsGrid.replaceChildren(...tiles);
 		mapsWrap.style.display = "";
@@ -1222,32 +1245,59 @@ export function createTracePanel(
 	}
 
 	function callDetail(call, nodeId) {
-		const detail = el(
-			"div",
-			{ class: "obsm-detail tp-call-detail" },
-			el("div", {
+		const detail = el("div", { class: "obsm-detail tp-call-detail" });
+		detail.addEventListener("click", (ev) => ev.stopPropagation());
+		// Slim calls (history/live streams) carry no bytes; fetch them on open,
+		// hydrating the shared call object so the dock/investigator reuse them.
+		if (call.system !== undefined || !loadCallBytes) {
+			fillCallDetail(detail, call, nodeId);
+		} else {
+			detail.appendChild(el("div", { class: "muted", text: "loading exact bytes…" }));
+			Promise.resolve(loadCallBytes(call)).then(() => {
+				detail.textContent = "";
+				fillCallDetail(detail, call, nodeId);
+			}).catch(() => {
+				detail.textContent = "";
+				detail.appendChild(el("div", { class: "muted", text: "failed to load call bytes" }));
+			});
+		}
+		return detail;
+	}
+
+	function fillCallDetail(detail, call, nodeId) {
+		detail.appendChild(el("div", {
+			class: "muted",
+			style: "margin-bottom:6px",
+			text: [
+				call.model ?? "",
+				`${call.tokens_in ?? "?"} in / ${call.tokens_out ?? "?"} out tok`,
+				call.flight_ms != null
+					? `flight ${(call.flight_ms / 1000).toFixed(1)}s${(call.attempts ?? 1) > 1 ? ` (${call.attempts} tries)` : ""}`
+					: null,
+			]
+				.filter(Boolean)
+				.join(" · "),
+		}));
+		// Exact request/response wall-clock — the call's start and end (matches the
+		// api log's detail). Only when timing was recorded (not a seeded/legacy call).
+		if (call.t_request != null || call.t_response != null) {
+			detail.appendChild(el("div", {
 				class: "muted",
 				style: "margin-bottom:6px",
 				text: [
-					call.model ?? "",
-					`${call.tokens_in ?? "?"} in / ${call.tokens_out ?? "?"} out tok`,
-				]
-					.filter(Boolean)
-					.join(" · "),
-			}),
-			outputSection(call, nodeId),
-			collapsedSection("input (user)", call.user ?? "", {
-				variables: call.variables,
-			}),
-			collapsedSection("system", call.system ?? "", {
-				variables: call.variables,
-			}),
-			call.reasoning
-				? collapsedSection("reasoning", call.reasoning)
-				: null,
-		);
-		detail.addEventListener("click", (ev) => ev.stopPropagation());
-		return detail;
+					call.t_request != null ? `requested ${fmtClockTime(call.t_request)}` : null,
+					call.t_response != null ? `responded ${fmtClockTime(call.t_response)}` : null,
+				].filter(Boolean).join(" · "),
+			}));
+		}
+		detail.appendChild(outputSection(call, nodeId));
+		detail.appendChild(collapsedSection("input (user)", call.user ?? "", {
+			variables: call.variables,
+		}));
+		detail.appendChild(collapsedSection("system", call.system ?? "", {
+			variables: call.variables,
+		}));
+		if (call.reasoning) detail.appendChild(collapsedSection("reasoning", call.reasoning));
 	}
 
 	function callRow({ call, relation }, nodeId) {
@@ -1263,6 +1313,9 @@ export function createTracePanel(
 			"div",
 			{
 				class: `obsm-call tp-call${relation === "emitted_by" ? " emits" : ""}`,
+				// Hover shows the call's execution stats: generation time (provider
+				// latency), token throughput, and the exact request/response times.
+				title: callTimingTitle(call),
 				onclick: () => {
 					if (expandedCalls.has(call.index)) {
 						expandedCalls.delete(call.index);
@@ -1303,6 +1356,30 @@ export function createTracePanel(
 						},
 					})
 				: null,
+			onOpenLog
+				? el("button", {
+						class: "call-log",
+						text: "log ↗",
+						style: onInquire ? "" : "margin-left:auto",
+						title: "open this exact call in the api log — its prompt, output, latency, status, and key",
+						onclick: (ev) => {
+							ev.stopPropagation();
+							onOpenLog(call);
+						},
+					})
+				: null,
+			onOpenInObs
+				? el("button", {
+						class: "call-obs",
+						text: "obs ↗",
+						style: onInquire || onOpenLog ? "" : "margin-left:auto",
+						title: "open this call in the observability panel — its full, untruncated system / user / output (this trace shows only this node's slice)",
+						onclick: (ev) => {
+							ev.stopPropagation();
+							onOpenInObs(call);
+						},
+					})
+				: null,
 		);
 		wrap.appendChild(row);
 		if (expandedCalls.has(call.index)) {
@@ -1339,6 +1416,15 @@ export function createTracePanel(
 			el("span", { class: `dot ${statusDot(n)}` }),
 			el("span", { class: "obsm-id", text: id }),
 			n ? el("span", { class: "tp-kind", text: n.kind }) : null,
+			n && n.kind === "zone" && n.atomic != null
+				? el("span", {
+						class: `tp-atomic ${n.atomic ? "is-atomic" : "is-composite"}`,
+						text: n.atomic ? "atomic" : "composite",
+						title: n.atomic
+							? "atomic zone — a leaf; its objects are generated directly (no sub-zones)"
+							: "composite zone — decomposed into sub-zones / objects",
+					})
+				: null,
 			via
 				? el("span", {
 						class: "obsm-via",
@@ -1414,7 +1500,7 @@ export function createTracePanel(
 			const prov = (model.provenance?.get(id) ?? [])
 				.map((p) => `${p.relation}#${p.call.index}`)
 				.join(",");
-			return `${id}:${n?.calls.length ?? 0}:${prov}:${expandedNodes.has(id) ? 1 : 0}`;
+			return `${id}:${n?.calls.length ?? 0}:${n?.atomic ?? ""}:${prov}:${expandedNodes.has(id) ? 1 : 0}`;
 		};
 		const exp = [...expandedCalls].sort((a, b) => a - b).join(",");
 		return `${focusId}|exp:${exp}|${chain.map(nodeSig).join(";")}`;

@@ -61,6 +61,18 @@ TRELLIS_RESOLUTION = "1024"
 TRELLIS_TEXTURE_SIZE = 2048
 TRELLIS_DECIMATION_TARGET = 500_000
 TRELLIS_SEED = 0
+# PBR metallic-roughness knobs. `LUMITEX_MIX` replaces TRELLIS' baked
+# metallic-roughness map with a LumiTex-generated one (base color + geometry
+# stay TRELLIS'); off (the API default) leaves the TRELLIS GLB untouched. When
+# on, the job runs a second GPU stage — it reports `texturing` and adds ~2 min
+# of latency per mesh. `LUMITEX_LVSM` (only consulted when mix is on) does an
+# LVSM dense-view inpaint of texels the 6 generated views can't reach.
+# `METALLIC_CAP` clamps TRELLIS' OWN predicted metalness to a ceiling (1.0 =
+# off, 0.0 = fully matte); it acts on the TRELLIS bake and is independent of the
+# LumiTex mix. Booleans go on the wire as "true"/"false" for the form parser.
+TRELLIS_LUMITEX_MIX = False
+TRELLIS_LUMITEX_LVSM = True
+TRELLIS_METALLIC_CAP = 1.0
 
 
 def _form_fields(object_name: str, bbox: BoundingBox | None) -> dict[str, str]:
@@ -73,6 +85,9 @@ def _form_fields(object_name: str, bbox: BoundingBox | None) -> dict[str, str]:
         "texture_size": str(TRELLIS_TEXTURE_SIZE),
         "decimation_target": str(TRELLIS_DECIMATION_TARGET),
         "object_name": object_name,
+        "metallic_cap": str(TRELLIS_METALLIC_CAP),
+        "lumitex_mix": str(TRELLIS_LUMITEX_MIX).lower(),
+        "lumitex_lvsm": str(TRELLIS_LUMITEX_LVSM).lower(),
     }
 
 
@@ -86,6 +101,9 @@ def _hash_payload(object_name: str, bbox: BoundingBox | None) -> dict[str, objec
         "decimation_target": TRELLIS_DECIMATION_TARGET,
         "seed": TRELLIS_SEED,
         "object_name": object_name,
+        "metallic_cap": TRELLIS_METALLIC_CAP,
+        "lumitex_mix": TRELLIS_LUMITEX_MIX,
+        "lumitex_lvsm": TRELLIS_LUMITEX_LVSM,
     }
 
 

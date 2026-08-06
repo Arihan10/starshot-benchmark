@@ -9,6 +9,9 @@
 
 import * as THREE from "three";
 
+// Default for the reference-capture rigs, where the shadow map is baked once and
+// crispness is worth the memory. Interactive viewers override it (see the
+// `shadowMapSize` option on createLightRig).
 const SHADOW_MAP_SIZE = 4096;
 
 // Client-side source of truth (mirrors splat/stage5.py LIGHTING). `shadow` is the
@@ -192,8 +195,12 @@ export function restoreToneMapping(renderer, prev) {
 //   decorateLights — hook to tweak the created lights, e.g. layers.enableAll().
 //   onShadows      — called with the shadows flag on every apply (uniform gating).
 //   defaults       — initial lighting config (client or server schema).
+//   shadowMapSize  — shadow map resolution. 2048² (~17 MB) is plenty for a soft
+//                    contact shadow spread over a whole scene, and on-demand
+//                    shadow rendering means there's no temporal shimmer to
+//                    betray it; the capture rigs keep the 4096² default.
 // Returns { key, hemi, catcher, setLighting, refit, getLighting, setEnabled,
-//           dispose }.
+//           releaseGPU, dispose }.
 export function createLightRig(renderer, scene, opts = {}) {
 	const {
 		catcher: withCatcher = false,
@@ -201,6 +208,7 @@ export function createLightRig(renderer, scene, opts = {}) {
 		decorateLights = null,
 		onShadows = null,
 		defaults = LIGHTING_DEFAULTS,
+		shadowMapSize = SHADOW_MAP_SIZE,
 	} = opts;
 	const state = normalizeLighting(defaults);
 
@@ -223,7 +231,7 @@ export function createLightRig(renderer, scene, opts = {}) {
 	const hemi = new THREE.HemisphereLight(0xffffff, 0x202028, state.fill);
 	const key = new THREE.DirectionalLight(0xffffff, state.key);
 	key.castShadow = true;
-	key.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+	key.shadow.mapSize.set(shadowMapSize, shadowMapSize);
 	key.shadow.bias = -0.0001;
 	if (decorateLights) decorateLights({ hemi, key });
 	scene.add(hemi, key, key.target);
@@ -278,7 +286,7 @@ export function createLightRig(renderer, scene, opts = {}) {
 		cam.updateProjectionMatrix();
 		// Normal-offset bias scaled to the shadow texel's world size — the main
 		// defense against self-shadow acne, consistent across scene scales.
-		key.shadow.normalBias = ((2 * extent) / SHADOW_MAP_SIZE) * 2.0;
+		key.shadow.normalBias = ((2 * extent) / shadowMapSize) * 2.0;
 		if (catcher) {
 			catcher.position.set(center.x, minY + radius * 0.003, center.z);
 			catcher.scale.set(radius * 6, radius * 6, 1);
@@ -333,6 +341,13 @@ export function createLightRig(renderer, scene, opts = {}) {
 			hemi.visible = enabled;
 			key.visible = enabled;
 			if (catcher) catcher.visible = enabled && state.shadows;
+		},
+		// Free the shadow map's GPU texture while the viewer is hidden. three
+		// re-creates it on the next shadow render, so a closed overlay stops
+		// holding VRAM it isn't using; the caller re-arms needsUpdate on re-show.
+		releaseGPU() {
+			key.shadow.map?.dispose();
+			key.shadow.map = null;
 		},
 		dispose() {
 			scene.remove(hemi, key, key.target);

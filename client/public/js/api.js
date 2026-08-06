@@ -41,6 +41,9 @@ const cellPath = (slot, model, tail = "") =>
 
 // Read a JSONL event log straight from the artifact server (full history,
 // cache.llm payloads included). Tolerates a torn final line written mid-flush.
+// The whole file becomes one string, so it's capped at V8's ~512 MB string
+// limit — fine for the compare/board/runcompare panels (small/older cells), but
+// the single-cell overlay uses the slim streaming path below instead.
 async function readEventsJsonl(rel) {
     const res = await fetch(u(`/artifacts/${rel}`), { cache: "no-store" });
     if (!res.ok) return [];
@@ -54,6 +57,43 @@ async function readEventsJsonl(rel) {
             /* torn tail line mid-write */
         }
     }
+    return out;
+}
+
+// Stream a SLIM NDJSON event history (the server strips cache.llm prompt/output
+// bytes; see /events-history). Parsed line-by-line off the response stream, so a
+// multi-gigabyte scene's history never has to become a single JS string — the
+// ~512 MB string cap that made whole-file reads fail on large logs. Only one
+// line is ever held in `buf` at a time; heavy per-call bytes load lazily via
+// eventBytes(). Tolerates a torn final line written mid-flush.
+async function readEventsStream(url) {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return [];
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const out = [];
+    let buf = "";
+    const push = (line) => {
+        const s = line.trim();
+        if (s) {
+            try {
+                out.push(JSON.parse(s));
+            } catch {
+                /* torn line mid-write */
+            }
+        }
+    };
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+            push(buf.slice(0, nl));
+            buf = buf.slice(nl + 1);
+        }
+    }
+    push(buf + decoder.decode());
     return out;
 }
 
@@ -72,13 +112,7 @@ export const api = {
     // rest under the new prompts. With `includeOverallBbox` the copy carries each
     // cell's root overall bounding box too, so B holds the scene canvas fixed and
     // varies only what fills it. Returns {current, seeded:[...], skipped:[...]}.
-    abTest: (
-        name,
-        promptVersion,
-        sourceRun,
-        cells,
-        includeOverallBbox = false,
-    ) =>
+    abTest: (name, promptVersion, sourceRun, cells, includeOverallBbox = false) =>
         request("/runs/ab-test", {
             method: "POST",
             body: {
@@ -88,6 +122,18 @@ export const api = {
                 cells,
                 include_overall_bbox: includeOverallBbox,
             },
+        }),
+    // Start the target cell (`run`/`slot`/`model`) seeded with ANOTHER cell's
+    // committed ROOT zone plan + overall bounding box. The source cell
+    // (`sourceSlot`, `sourceModel`) on the same run is copied through its root
+    // zone plan + overall bbox; the target replays that fixed plan + canvas and
+    // re-derives everything inside it under its own prompt + model. Returns
+    // {run, slot_id, model, source_slot, source_model, seed_events}.
+    seedStart: (run, slot, model, sourceSlot, sourceModel) =>
+        request(cellPath(slot, model, "/seed-start"), {
+            method: "POST",
+            params: { run },
+            body: { source_slot: sourceSlot, source_model: sourceModel },
         }),
     // Copy an entire slot folder (every model cell + its meshes) from
     // `sourceRun` into `destRun`, OVERWRITING destRun's slot. Returns
@@ -148,7 +194,7 @@ export const api = {
             { method: "POST" },
         ),
     // Export this cell's Stage-3 cloud + Stage-5 references to a COLMAP model under
-	// `splat/colmap/` (cameras.txt + images.txt + points3D.txt + RGBA PNGs) — the
+    // `splat/colmap/` (cameras.txt + images.txt + points3D.txt + RGBA PNGs) — the
     // folder Postshot / COLMAP-based tools ingest. Needs Stage 3 + Stage 5; 409s
     // otherwise. Returns { cameras, images, points, dir, url }.
     splatColmapExport: (run, slot, model) =>
@@ -349,12 +395,7 @@ export const api = {
     // that step (it executes), pausing before the following one. A plain step
     // (neither) advances one call — queued if the cell is mid-call, so a "step
     // all" never skips a slow model.
-    cellStep: (
-        run,
-        slot,
-        model,
-        { auto = false, until = null, untilBefore = false } = {},
-    ) =>
+    cellStep: (run, slot, model, { auto = false, until = null, untilBefore = false } = {}) =>
         request(cellPath(slot, model, "/step"), {
             method: "POST",
             params: { run },
@@ -367,6 +408,14 @@ export const api = {
         }),
     pause: (run, slot, model) =>
         request(cellPath(slot, model, "/pause"), {
+            method: "POST",
+            params: { run },
+        }),
+    // Graceful pause: stop issuing new LLM calls but let the in-flight call finish
+    // and commit before pausing (no re-run/re-bill on resume). Returns immediately
+    // with {status:"pausing"}; the cell flips to paused once the call drains.
+    pauseSoft: (run, slot, model) =>
+        request(cellPath(slot, model, "/pause-soft"), {
             method: "POST",
             params: { run },
         }),
@@ -405,48 +454,62 @@ export const api = {
     // tears down branches + in-flight tasks first and does not auto-resume.
     deleteObject: (run, slot, model, nodeId) =>
         request(
-            cellPath(
-                slot,
-                model,
-                `/delete-object/${encodeURIComponent(nodeId)}`,
-            ),
+            cellPath(slot, model, `/delete-object/${encodeURIComponent(nodeId)}`),
             { method: "POST", params: { run } },
         ),
 
     // --- from-scratch generated assets (Nano-Banana + a mesh backend) ---
-    // The single generated build of a cell, built/regenerated alongside the
-    // library build and viewed by flipping `meshesUrl(..., { mode: "generated" })`.
-    // generate(): build/resume the whole scene's generated assets (409 if a build
-    // is already in flight). generateStatus(): whether a build/regen is running +
-    // the finished ids (each with its symmetry plane, served `url`, and the raw
-    // generation-API `raw` mesh url for the per-object view; plus each mesh's
-    // prefab `canonical`). regenerate/symmetrize/unsymmetrize act on ONE object's
-    // generated mesh; with propagate they apply to its whole prefab group.
-    // `unlink` splits the object out of its group into a standalone asset (its own
-    // raw, no rebuild); `link` moves it into another object's group. backend ∈
-    // {trellis, hunyuan, hunyuan-tencent}.
-    generate: (run, slot, model) =>
+    // VERSIONED: a cell can hold many independent generated builds (V1/V2/V3…),
+    // each fully isolated under `generated/<version>/`, built/regenerated alongside
+    // the library build and viewed by flipping `meshesUrl(..., { mode: "generated",
+    // version })`. Every call below takes an optional `version` (omit → the server
+    // resolves the latest; a pre-versioning build is folded into V1). NOTE: this is
+    // the GENERATED-ASSET version, distinct from the prompt-set `versions()` above.
+    // generate(): build/resume the selected version's assets (409 if that version's
+    // build is already in flight); `newVersion:true` mints + builds the next version.
+    // generateStatus(): whether a build/regen is running + the finished ids (each
+    // with its symmetry plane, served `url`, and the raw generation-API `raw` mesh
+    // url for the per-object view; plus each mesh's prefab `canonical`) + the full
+    // `versions` list and resolved `version`. regenerate/symmetrize/unsymmetrize act
+    // on ONE object's generated mesh; with propagate they apply to its whole prefab
+    // group. `unlink` splits the object out of its group into a standalone asset
+    // (its own raw, no rebuild); `link` moves it into another object's group.
+    // backend ∈ {trellis, hunyuan, hunyuan-tencent}.
+    // symmetrize plane ∈ {xy front/back, xz top/bottom, yz left/right}, with
+    // keepPositive selecting which half survives (+Z front / +Y top / +X right).
+    generate: (run, slot, model, { version = null, newVersion = false } = {}) =>
         request(cellPath(slot, model, "/generate"), {
             method: "POST",
-            params: { run },
+            params: { run, version, new: newVersion ? true : undefined },
         }),
-    generateStatus: (run, slot, model, { optimized = true, variant } = {}) =>
+    // `variant` (raw | lite | optimized) picks the quality tier WITHIN `version`;
+    // the two are orthogonal. Omitting it falls back to the `optimized` bool.
+    generateStatus: (
+        run,
+        slot,
+        model,
+        { optimized = true, variant, version = null } = {},
+    ) =>
         request(cellPath(slot, model, "/generate"), {
             params: {
                 run,
                 optimized: optimized ? 1 : 0,
                 ...(variant ? { variant } : {}),
+                version,
             },
         }),
-    // Build (or resume) this cell's LITE presentation tier (objects-generated-lite/)
-    // as a background job; poll buildLiteStatus for {running, done, total, ok, status}.
-    buildLite: (run, slot, model) =>
+    // Build (or resume) one version's LITE presentation tier
+    // (generated/<version>/objects-generated-lite/) as a background job; poll
+    // buildLiteStatus for {running, done, total, ok, status}.
+    buildLite: (run, slot, model, { version = null } = {}) =>
         request(cellPath(slot, model, "/build-lite"), {
             method: "POST",
-            params: { run },
+            params: { run, version },
         }),
-    buildLiteStatus: (run, slot, model) =>
-        request(cellPath(slot, model, "/build-lite"), { params: { run } }),
+    buildLiteStatus: (run, slot, model, { version = null } = {}) =>
+        request(cellPath(slot, model, "/build-lite"), {
+            params: { run, version },
+        }),
     regenerate: (
         run,
         slot,
@@ -457,6 +520,7 @@ export const api = {
             propagate = true,
             reuseImage = false,
             regenNounPhrase = false,
+            version = null,
         } = {},
     ) =>
         request(
@@ -465,6 +529,7 @@ export const api = {
                 method: "POST",
                 params: {
                     run,
+                    version,
                     backend,
                     propagate,
                     reuse_image: reuseImage,
@@ -476,38 +541,35 @@ export const api = {
     // member of that group) so it shares the group's mesh — the inverse of
     // `unlink`. Re-derives the object's mesh from the group canonical; no backend
     // call.
-    link: (run, slot, model, nodeId, target, { group = false } = {}) =>
+    link: (run, slot, model, nodeId, target, { group = false, version = null } = {}) =>
         request(cellPath(slot, model, `/link/${encodeURIComponent(nodeId)}`), {
             method: "POST",
-            params: { run, target, group },
+            params: { run, version, target, group },
         }),
     // Split a generated object OUT of its prefab group into a standalone asset with
     // its own copy of the shared raw mesh (the inverse of `link`), so it stops
     // sharing and can then be regenerated alone. No backend call — a fast local
     // re-derivation on the regen worker.
-    unlink: (run, slot, model, nodeId) =>
-        request(
-            cellPath(slot, model, `/unlink/${encodeURIComponent(nodeId)}`),
-            {
-                method: "POST",
-                params: { run },
-            },
-        ),
+    unlink: (run, slot, model, nodeId, { version = null } = {}) =>
+        request(cellPath(slot, model, `/unlink/${encodeURIComponent(nodeId)}`), {
+            method: "POST",
+            params: { run, version },
+        }),
     symmetrize: (
         run,
         slot,
         model,
         nodeId,
-        { plane = "xy", keepPositive = true, propagate = true } = {},
+        { plane = "xy", keepPositive = true, propagate = true, version = null } = {},
     ) =>
         request(
             cellPath(slot, model, `/symmetrize/${encodeURIComponent(nodeId)}`),
             {
                 method: "POST",
-                params: { run, plane, keep_positive: keepPositive, propagate },
+                params: { run, version, plane, keep_positive: keepPositive, propagate },
             },
         ),
-    unsymmetrize: (run, slot, model, nodeId, { propagate = true } = {}) =>
+    unsymmetrize: (run, slot, model, nodeId, { propagate = true, version = null } = {}) =>
         request(
             cellPath(
                 slot,
@@ -516,7 +578,7 @@ export const api = {
             ),
             {
                 method: "POST",
-                params: { run, propagate },
+                params: { run, version, propagate },
             },
         ),
     // Change an object's "front view" (which face points +Z in its raw mesh) by
@@ -527,31 +589,31 @@ export const api = {
         slot,
         model,
         nodeId,
-        { axis = "y", degrees = 90, propagate = true } = {},
+        { axis = "y", degrees = 90, propagate = true, version = null } = {},
     ) =>
         request(
             cellPath(slot, model, `/reorient/${encodeURIComponent(nodeId)}`),
             {
                 method: "POST",
-                params: { run, axis, degrees, propagate },
+                params: { run, version, axis, degrees, propagate },
             },
         ),
     // Force the window/glass transparency transform (white texels → near-clear)
     // onto an object's served mesh, bypassing the pipeline's keyword + symmetry
     // gates. Applies to the whole prefab group; dropped by a later regenerate/reset.
-    glassify: (run, slot, model, nodeId) =>
+    glassify: (run, slot, model, nodeId, { version = null } = {}) =>
         request(
             cellPath(slot, model, `/glassify/${encodeURIComponent(nodeId)}`),
-            { method: "POST", params: { run } },
+            { method: "POST", params: { run, version } },
         ),
     // Rebuild an object's served mesh from its pristine raw, dropping any in-place
     // served edit (e.g. a forced glassify) while keeping its current symmetry.
     // Applies to the whole prefab group. (Named `resetMesh` so it doesn't collide
     // with the cell-level `reset` above — they're distinct operations.)
-    resetMesh: (run, slot, model, nodeId) =>
+    resetMesh: (run, slot, model, nodeId, { version = null } = {}) =>
         request(
             cellPath(slot, model, `/reset-mesh/${encodeURIComponent(nodeId)}`),
-            { method: "POST", params: { run } },
+            { method: "POST", params: { run, version } },
         ),
 
     // --- source cell data ---
@@ -563,14 +625,16 @@ export const api = {
         }),
     eventsUrl: (run, slot, model, { since } = {}) =>
         u(cellPath(slot, model, "/events"), { run, since }).toString(),
-    //   mode="generated" streams the cell's from-scratch generated build instead
-    //     of the library objects/; optimized=false streams the raw bbox-fitted
-    //     Trellis mesh instead of the served KTX2/Meshopt twin.
+    //   mode="generated" streams one generated version of the cell instead of the
+    //     library objects/; `version` selects which build (omit → latest) and
+    //     `variant` (raw | lite | optimized) the quality tier within it.
+    //     optimized=false streams the raw bbox-fitted Trellis mesh instead of the
+    //     served KTX2/Meshopt twin.
     meshesUrl: (
         run,
         slot,
         model,
-        { untilIndex, mode, optimized, variant } = {},
+        { untilIndex, mode, optimized, variant, version } = {},
     ) =>
         u(cellPath(slot, model, "/meshes"), {
             run,
@@ -578,11 +642,23 @@ export const api = {
             mode,
             optimized: optimized === false ? 0 : undefined,
             variant,
+            version,
         }).toString(),
-    // Full source-cell history backfill (cache.llm payloads included) from disk.
+    // Full source-cell history backfill (cache.llm payloads included) from disk —
+    // used by compare/board/runcompare, which render call bytes inline.
     async eventsHistory(run, slot, model) {
         return readEventsJsonl(`${run}/${slot}/${model}/events.jsonl`);
     },
+    // SLIM source-cell history for the observability tree: the server strips
+    // cache.llm prompt/output bytes, so a multi-GB scene's tree loads; expand
+    // fetches a call's bytes on demand via eventBytes(). Used by the overlay.
+    async eventsHistorySlim(run, slot, model) {
+        return readEventsStream(u(cellPath(slot, model, "/events-history"), { run }).toString());
+    },
+    // The heavy bytes (system/user/output/reasoning/variables) for ONE call,
+    // fetched on demand when its tree row is expanded.
+    eventBytes: (run, slot, model, index) =>
+        request(cellPath(slot, model, "/event-bytes"), { params: { run, index } }),
     artifactUrl: (path) => u(`/artifacts/${path}`).toString(),
     absUrl: (path) => new URL(path, SERVER_URL).toString(),
 
@@ -603,6 +679,11 @@ export const api = {
     async branchEventsHistory(run, bid) {
         return readEventsJsonl(`${run}/_branches/${bid}/events.jsonl`);
     },
+    async branchEventsHistorySlim(run, bid) {
+        return readEventsStream(u(`/branches/${encodeURIComponent(bid)}/events-history`).toString());
+    },
+    branchEventBytes: (bid, index) =>
+        request(`/branches/${encodeURIComponent(bid)}/event-bytes`, { params: { index } }),
 
     // --- prompt lab ---
     promptTemplates: (run) =>
@@ -704,6 +785,44 @@ export const api = {
             method: "POST",
             body: { steps, cells },
         }),
+
+    // --- LLM request ledger (the first-party "activity log", SQLite-backed) ---
+    // One keyset page (newest first) of a run's requests, unified across its
+    // per-scene DBs. `filters` is {facet: [values]}; `cursor` pages older.
+    // Returns { rows, cursor, has_more } — metadata only, no prompt bytes.
+    flightsPage: (run, { cursor, filters, limit = 100 } = {}) =>
+        request("/flights", {
+            params: {
+                run,
+                cursor,
+                limit,
+                filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+            },
+        }),
+    // Per-attribute distinct values + counts (filter dropdowns) + total.
+    flightFacets: (run, filters) =>
+        request("/flights/facets", {
+            params: {
+                run,
+                filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+            },
+        }),
+    // Bucketed request counts over the run's span — the activity chart.
+    flightHistogram: (run, filters) =>
+        request("/flights/histogram", {
+            params: {
+                run,
+                filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+            },
+        }),
+    // The exact system/user prompt + output for ONE row, fetched lazily on
+    // opening its detail panel. `scene` is the row's `slot`.
+    flightDetail: (scene, id) => request("/flights/detail", { params: { scene, id } }),
+    // Resolve one flight row from a scene's cache.llm call (scene→log jump).
+    flightLocate: (scene, { generation_id, t_request } = {}) =>
+        request("/flights/locate", { params: { scene, generation_id, t_request } }),
+    // SSE tail of new rows for `run` (history comes from flightsPage).
+    flightsStreamUrl: (run) => u("/flights/stream", { run }).toString(),
 
     // --- reviewer chat ---
     // The stateless reviewer (Claude Opus 4.8, xhigh) behind the scene

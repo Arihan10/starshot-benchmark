@@ -1,10 +1,10 @@
 """Complete, permanent removal of one object from a cell's source of truth.
 
-Erases every reference to a node id from BOTH event logs (the library build's
-`events.jsonl` and the from-scratch build's `events.generated.jsonl`), reindexes
+Erases every reference to a node id from ALL event logs (the library build's
+`events.jsonl` and EVERY generated version's `events.generated.jsonl`), reindexes
 each so `index == line position` holds again, deletes the object's mesh / image
-artifacts from every build directory, and repairs the two structural invariants
-a bare delete would break:
+artifacts from every build directory (each version included), and repairs the two
+structural invariants a bare delete would break:
 
   * ORPHANED CHILDREN — any object that was anchored to the wiped one is
     re-parented onto the wiped object's owning region (a zone). Placement bboxes
@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from app.pipeline import generation
-from app.services import prefabs
+from app.services import prefabs, symmetry
 from app.utils.logging import SlotLog
 
 # Keys whose value is a list of object/subregion spec dicts across the committed
@@ -143,8 +143,13 @@ def _transform(
     Dropped: the node's own per-node events (`id == node_id`), its resumable
     provider bookkeeping (`job_id == node_id`), its own LLM calls
     (`cache.llm` with `node == node_id`) plus their `llm.cost` rows, its `step`
-    markers, and warnings that name it as a `source`."""
+    markers, and warnings that name it as a `source`.
+
+    An `llm.cost` joins its call by `generation_id` (OpenRouter) or by the
+    content-hash `key` (a token-priced compat backend), so both are collected
+    from the dropped calls and both forms of cost row are removed."""
     dropped_gen_ids: set[str] = set()
+    dropped_keys: set[str] = set()
     survivors: list[dict[str, Any]] = []
     for e in events:
         kind = e.get("kind")
@@ -162,12 +167,21 @@ def _transform(
                 gid = e.get("generation_id")
                 if isinstance(gid, str):
                     dropped_gen_ids.add(gid)
+                key = e.get("key")
+                if isinstance(key, str):
+                    dropped_keys.add(key)
             continue
         survivors.append(e)
+
+    def _is_dropped_cost(e: dict[str, Any]) -> bool:
+        if e.get("kind") != "llm.cost":
+            return False
+        return e.get("generation_id") in dropped_gen_ids or e.get("key") in dropped_keys
+
     return [
         _edit_event(e, node_id=node_id, region_id=region_id, new_canonical=new_canonical)
         for e in survivors
-        if not (e.get("kind") == "llm.cost" and e.get("generation_id") in dropped_gen_ids)
+        if not _is_dropped_cost(e)
     ]
 
 
@@ -208,7 +222,7 @@ def _latest_symmetry(events: list[dict[str, Any]], node_id: str) -> dict[str, An
         if e.get("kind") != "symmetry.applied" or e.get("id") != node_id:
             continue
         cut_plane = e.get("cut_plane")
-        if cut_plane in ("xy", "xz"):
+        if cut_plane in symmetry.MIRROR_PLANES:
             state = {"cut_plane": cut_plane}
             if isinstance(e.get("keep_positive"), bool):
                 state["keep_positive"] = e["keep_positive"]
@@ -244,13 +258,14 @@ def _write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
 
 
 def _clone_raw_to_successor(
-    runs_dir: Path, run_id: str, old_id: str, new_id: str,
+    runs_dir: Path, run_id: str, version: str, old_id: str, new_id: str,
 ) -> bool:
     """Copy the wiped canonical's raw Trellis mesh (and its reference image when
-    the successor lacks one) onto the successor so it becomes a self-sufficient
-    canonical the group can still be re-derived from. Returns whether the raw was
-    cloned (a missing source raw — e.g. an interrupted build — is skipped)."""
-    raw_dir, _opt_dir = generation.latest_generated_dirs(runs_dir, run_id)
+    the successor lacks one) onto the successor WITHIN one generated version, so it
+    becomes a self-sufficient canonical the version's group can still be re-derived
+    from. Returns whether the raw was cloned (a missing source raw — e.g. an
+    interrupted build, or a version where the node was a reuse — is skipped)."""
+    raw_dir, _opt_dir = generation.generated_dirs(runs_dir, run_id, version)
     src_raw = raw_dir / f"{old_id}.raw.glb"
     if not src_raw.exists():
         return False
@@ -265,13 +280,18 @@ def _clone_raw_to_successor(
 def _delete_object_files(runs_dir: Path, run_id: str, node_id: str) -> list[str]:
     """Unlink the node's served/raw/image artifacts (and stranded temporaries)
     from every build dir: the library `objects/` (+ migrated `objects-optimized/`),
-    the generated raw + optimized dirs, and any legacy `generated/<n>/` builds."""
+    a pre-versioning non-versioned generated build (defensive — normally already
+    folded into v1), and EVERY generated version under `generated/<n>/`."""
     base = runs_dir / run_id
-    raw_gen, opt_gen = generation.generated_dirs(runs_dir, run_id)
-    dirs = [base / "objects", base / "objects-optimized", raw_gen, opt_gen]
-    legacy_root = base / "generated"
-    if legacy_root.is_dir():
-        for version in legacy_root.iterdir():
+    dirs = [
+        base / "objects",
+        base / "objects-optimized",
+        base / generation.GENERATED_RAW_SUBDIR,
+        base / generation.GENERATED_OPT_SUBDIR,
+    ]
+    gen_root = base / generation.GENERATED_DIR
+    if gen_root.is_dir():
+        for version in gen_root.iterdir():
             if version.is_dir():
                 dirs.append(version / generation.GENERATED_RAW_SUBDIR)
                 dirs.append(version / generation.GENERATED_OPT_SUBDIR)
@@ -295,10 +315,14 @@ def wipe_object(
     the cell holds no such object (no `bbox` event — the caller raises 404).
 
     The library log gates rendering (its `model` events drive both builds'
-    `/meshes` bundles), so it is wiped first; the generated log is wiped second,
-    after handing off the prefab canonical role if needed; files are deleted last
-    (after the successor has cloned the raw it inherits)."""
-    lib_events = library_log.state["events"]
+    `/meshes` bundles), so it is wiped first; EVERY generated version's log is wiped
+    next, each handing off its own prefab canonical role if needed (versions group
+    independently); files are deleted last (after each successor has cloned the raw
+    it inherits)."""
+    # Read the FULL events from disk (not the slim in-memory buffer, which drops
+    # the cache.llm prompt/variables/reasoning bytes) so the rewrite preserves every
+    # surviving event's heavy bytes; `replace_events` re-slims the resident copy.
+    lib_events = _read_jsonl(library_log.events_path)
     if not any(e.get("kind") == "bbox" and e.get("id") == node_id for e in lib_events):
         return None
 
@@ -309,15 +333,22 @@ def wipe_object(
         _transform(lib_events, node_id=node_id, region_id=region_id, new_canonical=None)
     )
 
-    new_canonical: str | None = None
-    raw_cloned = False
-    gen_path = generation.latest_generated_events_path(runs_dir, run_id)
-    if gen_path.exists():
+    # Wipe the node from EACH generated version's log independently — every version
+    # owns its own prefab grouping, so the canonical handoff is resolved + applied
+    # per version. Fold any pre-versioning build into v1 first so it's covered.
+    generation.migrate_legacy_generated(runs_dir, run_id)
+    new_canonicals: dict[str, str] = {}
+    for version in generation.list_generated_versions(runs_dir, run_id):
+        gen_path = generation.generated_events_path(runs_dir, run_id, version)
+        if not gen_path.exists():
+            continue
         gen_events = _read_jsonl(gen_path)
         canonical_id, reuse_ids = prefabs.resolve_group(gen_events, node_id)
+        new_canonical: str | None = None
         if canonical_id == node_id and reuse_ids:
             new_canonical = reuse_ids[0]
-            raw_cloned = _clone_raw_to_successor(runs_dir, run_id, node_id, new_canonical)
+            if _clone_raw_to_successor(runs_dir, run_id, version, node_id, new_canonical):
+                new_canonicals[version] = new_canonical
         new_gen = _transform(
             gen_events, node_id=node_id, region_id=region_id, new_canonical=new_canonical,
         )
@@ -331,8 +362,7 @@ def wipe_object(
     return {
         "node_id": node_id,
         "region": region_id,
-        "new_canonical": new_canonical,
-        "raw_cloned": raw_cloned,
+        "new_canonicals": new_canonicals,
         "library_events": len(library_log.state["events"]),
         "deleted_files": deleted,
     }
