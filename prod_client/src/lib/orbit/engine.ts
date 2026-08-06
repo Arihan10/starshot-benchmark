@@ -343,7 +343,7 @@ function centrePan(
 	return pan;
 }
 
-const BROWSE_SPIN_SPEED = 2.1;
+const BROWSE_SPIN_SPEED = 1.05;
 
 const _centreRight = new Vector3();
 const _fitFwd = new Vector3();

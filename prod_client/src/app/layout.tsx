@@ -35,6 +35,9 @@ const instrumentSerif = Instrument_Serif({
 export const metadata: Metadata = {
 	title: "SceneBench",
 	description: "A spatial reasoning benchmark for LLMs.",
+	icons: {
+		icon: "/icon.png",
+	},
 };
 
 export default function RootLayout({
