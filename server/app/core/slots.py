@@ -217,12 +217,29 @@ DEFAULT_MODEL_ALIAS = "gemini-flash-lite"
 
 DEFAULT_MODEL = MODELS[DEFAULT_MODEL_ALIAS]
 
+# Effort requested from any model that names no level of its own below.
 DEFAULT_REASONING = "xhigh"
 
-REASONING_DOWNGRADE_LIST = [
-    "openai/gpt-5.5",
-    "anthropic/claude-opus-5"
-]
+# Per-model reasoning effort, keyed by the SAME OpenRouter id MODELS maps to.
+# Each model carries its OWN level ("none", "minimal", "low", "medium", "high",
+# "xhigh"), so one that's slow or costly at `xhigh` — and whose reasoning depth
+# isn't what the run measures — sits exactly where it should instead of sharing a
+# single downgrade preset. Ids absent here request `DEFAULT_REASONING`.
+#
+# Only the OpenRouter transport reads this. `OPENAI_COMPAT_MODELS` backends spell
+# thinking their own way (`reasoning_effort`, `thinking`, `enable_thinking`), so
+# their level belongs in that config's `extra`.
+REASONING_LEVELS: dict[str, str] = {
+    "openai/gpt-5.5": "medium",
+    "anthropic/claude-opus-5": "none",
+}
+
+
+def model_reasoning(model_id: str | None) -> str:
+    """The reasoning effort to request for `model_id` — its own entry in
+    `REASONING_LEVELS`, else `DEFAULT_REASONING`."""
+    return REASONING_LEVELS.get(model_id or "", DEFAULT_REASONING)
+
 
 # OpenRouter model ids whose only provider can't honor structured outputs
 # (`response_format: json_schema`). For these, `llm._send_structured` omits the

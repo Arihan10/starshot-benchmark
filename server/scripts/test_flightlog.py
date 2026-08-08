@@ -95,11 +95,11 @@ def bind(scene: str) -> None:
 
 
 def put(scene: str, t: float, *, status: int = 200, model: str = "m",
-        key: str = "key-zzzz", transport: str = "direct") -> None:
+        key: str = "key-zzzz", transport: str = "direct", node: str | None = None) -> None:
     """Record one attempt row directly (bypassing the transport) for the bulk
     pagination/facet/merge tests."""
     bind(scene)
-    flightlog.begin_call()
+    flightlog.begin_call(node=node)
     flightlog.record(
         transport=transport, model=model, t_request=t, t_response=t,
         base_url="https://api.example/v1", api_key=key, status=status,
@@ -194,6 +194,21 @@ def scenario_facets() -> None:
     # statuses (computed without the status filter), but total reflects it.
     res2 = flightlog.facets("pg", filters={"status": ["429"]})
     check("filtered total", res2["total"] == 50, str(res2["total"]))
+
+    put("zones/s/m", 1.0, node="atrium")
+    put("zones/s/m", 2.0, node="gallery")
+    put("zones/s/m", 3.0, node="atrium")
+    zone_facets = flightlog.facets("zones", filters={})["facets"]["node"]
+    zone_counts = {x["value"]: x["count"] for x in zone_facets}
+    check("zone facet", zone_counts == {"atrium": 2, "gallery": 1}, str(zone_counts))
+    zone_rows = flightlog.page(
+        "zones", cursor=None, limit=100, filters={"node": ["gallery"]},
+    )["rows"]
+    check(
+        "zone filter",
+        len(zone_rows) == 1 and zone_rows[0]["node"] == "gallery",
+        str(zone_rows),
+    )
 
 
 def scenario_big_run() -> None:

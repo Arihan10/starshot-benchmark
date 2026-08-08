@@ -32,10 +32,15 @@ from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
 
-from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel, model_pricing, token_cost
+from app.core.slots import (
+    NO_STRUCTURED_OUTPUT_LIST,
+    OPENAI_COMPAT_MODELS,
+    OpenAICompatModel,
+    model_pricing,
+    model_reasoning,
+    token_cost,
+)
 from app.utils import cache, flightlog, keypool, logging
-
-from app.core.slots import DEFAULT_REASONING, NO_STRUCTURED_OUTPUT_LIST, REASONING_DOWNGRADE_LIST
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -87,14 +92,6 @@ def apply_model_quirks(user: str, model: str) -> str:
         if DEEPSEEK_INJECTION.strip() not in user:
             return user + DEEPSEEK_INJECTION
     return user
-
-
-def _reasoning_effort(model: str) -> str:
-    """The reasoning effort to request for `model`. OpenAI/GPT models are pinned
-    to "minimal" for now — xhigh makes them slow + costly and we're not
-    measuring their reasoning depth here; every other provider stays at "xhigh"."""
-    
-    return "none" if (model or "") in REASONING_DOWNGRADE_LIST else DEFAULT_REASONING
 
 
 # Optional per-task breakpoint. When set, `call_llm` awaits it right before
@@ -585,7 +582,7 @@ async def _send_structured(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "reasoning": {"effort": _reasoning_effort(model)},
+                "reasoning": {"effort": model_reasoning(model)},
                 # Force routing to a provider that actually honors the parameters we
                 # send. Omitted, OpenRouter silently strips any param the chosen
                 # provider lacks — so a model whose provider can't do

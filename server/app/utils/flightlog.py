@@ -80,13 +80,14 @@ _FACET_EXPR: dict[str, str] = {
     "model": "model",
     "provider": "provider",
     "slot": "slot",
+    "node": "node",
     "step": "step",
     "key": "api_key",
 }
 # Facet key -> the column a WHERE filter on it targets.
 _FILTER_COL: dict[str, str] = {
     "transport": "transport", "kind": "kind", "model": "model", "provider": "provider",
-    "slot": "slot", "step": "step", "key": "api_key",
+    "slot": "slot", "node": "node", "step": "step", "key": "api_key",
 }
 
 _call_counter = itertools.count(1)
@@ -608,7 +609,7 @@ def histogram(run: str, *, filters: dict[str, list[str]], buckets: int = 48) -> 
     scenes = _scene_keys(run)
     where, params = _where(filters, None)
     t0 = t1 = None
-    cols = "t_response, status, exc_type, transport, kind, model, provider, slot, step, api_key"
+    cols = "t_response, status, exc_type, transport, kind, model, provider, slot, step, node, api_key"
     for batch in _batches(scenes):
         con = sqlite3.connect(":memory:")
         try:
@@ -649,7 +650,7 @@ def facets(run: str, *, filters: dict[str, list[str]]) -> dict[str, Any]:
     scenes = _scene_keys(run)
     acc: dict[str, dict[Any, int]] = {fk: {} for fk in _FACET_EXPR}
     total = 0
-    cols = "status, exc_type, transport, kind, model, provider, slot, step, api_key"
+    cols = "status, exc_type, transport, kind, model, provider, slot, step, node, api_key"
     for batch in _batches(scenes):
         con = sqlite3.connect(":memory:")
         con.row_factory = sqlite3.Row

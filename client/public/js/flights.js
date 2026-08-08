@@ -50,11 +50,13 @@ const state = {
 	hasMore: false,
 	loading: false,
 	locating: false, // a scene→log jump is resolving a specific row
-	filters: {}, // facet key -> Set(selected values)
+	sceneScope: null, // locked when the log was entered from one specific scene
+	filters: {}, // user-controlled facet key -> Set(selected values)
 	facetData: {}, // facet key -> [{value, count}] from the server
 	histo: null, // { buckets, t0, t1, bucket_s } activity histogram
 	histoAt: 0, // last histogram fetch (throttles live refreshes)
 	timeCol: loadTimeCol(), // first column: "start" | "end" | "both"
+	detailCollapsed: false,
 };
 
 // Attributes the log can be filtered on individually — server-side facets.
@@ -65,6 +67,7 @@ const FACETS = [
 	{ key: "model", label: "Model" },
 	{ key: "provider", label: "Provider" },
 	{ key: "slot", label: "Scene", display: (v) => sceneName(v) },
+	{ key: "node", label: "Zone" },
 	{ key: "step", label: "Step" },
 	{ key: "key", label: "Key" },
 ];
@@ -362,7 +365,7 @@ export function initFlights() {
 			else openFacetPopover(def, wrap, sync);
 		});
 		sync();
-		return { wrap, sync };
+		return { key: def.key, wrap, sync };
 	}
 
 	const facetControls = FACETS.map(buildFacet);
@@ -406,7 +409,8 @@ export function initFlights() {
 		el("div", { text: "Model" }),
 		el("div", { text: "Provider" }),
 		el("div", { text: "Step" }),
-		el("div", { text: "Scene" }),
+		el("div", { class: "flog-scene-col", text: "Scene" }),
+		el("div", { text: "Zone" }),
 		el("div", { class: "flog-time", text: "Time" }),
 	);
 	const rowsEl = el("div", { class: "flog-rows" });
@@ -436,9 +440,15 @@ export function initFlights() {
 		rowsEl,
 		pager,
 	);
-	const detailEl = el("div", { class: "flog-detail" });
+	const detailCollapseBtn = el("button", {
+		class: "flog-detail-collapse",
+		onclick: toggleDetail,
+	});
+	const detailBody = el("div", { class: "flog-detail-body" });
+	const detailEl = el("aside", { class: "flog-detail" }, detailCollapseBtn, detailBody);
 	view.append(listEl, detailEl);
 	listEl.classList.toggle("tc-both", state.timeCol === "both");
+	syncDetailCollapse();
 
 	document.addEventListener("keydown", (ev) => {
 		if (
@@ -501,11 +511,15 @@ export function initFlights() {
 	function filtersParam() {
 		const out = {};
 		for (const [k, s] of Object.entries(state.filters)) if (s.size) out[k] = [...s];
+		if (state.sceneScope) out.slot = [state.sceneScope];
 		return out;
 	}
 	function matches(r) {
-		return Object.entries(state.filters).every(
-			([k, s]) => !s.size || s.has(facetValue(k, r)),
+		return (
+			(!state.sceneScope || r.slot === state.sceneScope) &&
+			Object.entries(state.filters).every(
+				([k, s]) => !s.size || s.has(facetValue(k, r)),
+			)
 		);
 	}
 	let filterTimer = null;
@@ -582,8 +596,17 @@ export function initFlights() {
 	// Scene→log: open the log to one exact call, resolving its row on the server
 	// (by generation_id / t_request) so we can select it even if it's not on the
 	// current page.
+	function syncSceneScope() {
+		view.classList.toggle("scene-scoped", !!state.sceneScope);
+		const sceneFacet = facetControls.find((fc) => fc.key === "slot");
+		if (sceneFacet) sceneFacet.wrap.style.display = state.sceneScope ? "none" : "";
+	}
+
 	async function openToFlight(payload) {
 		if (!payload?.scene) return;
+		state.sceneScope = payload.scene;
+		syncSceneScope();
+		closePopover();
 		if (!state.open) {
 			state.open = true;
 			view.classList.add("open");
@@ -598,11 +621,9 @@ export function initFlights() {
 			state.run = payload.run;
 			runSel.value = payload.run;
 		}
-		// Scope the log to the call's cell so the jump lands on that scene's
-		// requests. Legacy logs predate the request id/timestamp that pins the
-		// exact call, so scoping keeps the user on the right cell regardless of
-		// whether the specific row below can be resolved.
-		state.filters = { slot: new Set([payload.scene]) };
+		// The scene scope is locked separately from visible filters. Legacy logs
+		// may not resolve the exact call, but still stay on the right scene.
+		state.filters = {};
 		for (const fc of facetControls) fc.sync();
 		syncClearAll();
 		refreshFacets();
@@ -685,15 +706,16 @@ export function initFlights() {
 				text: r.step || "—",
 				title: r.step || "",
 			}),
-			el(
-				"div",
-				{
-					class: "flog-app",
-					title: [r.slot, r.node].filter(Boolean).join(" · "),
-				},
-				el("span", { text: sceneName(r.slot) }),
-				r.node ? el("span", { class: "flog-zone", text: ` · ${r.node}` }) : null,
-			),
+			el("div", {
+				class: "flog-app flog-scene-col",
+				text: sceneName(r.slot),
+				title: r.slot || "",
+			}),
+			el("div", {
+				class: "flog-zone",
+				text: r.node || "—",
+				title: r.node || "",
+			}),
 			el("div", {
 				class: "flog-time",
 				text: fmtDur(r.flight_ms),
@@ -812,11 +834,27 @@ export function initFlights() {
 		renderDetail(r);
 	}
 
+	function syncDetailCollapse() {
+		detailEl.classList.toggle("collapsed", state.detailCollapsed);
+		detailCollapseBtn.textContent = state.detailCollapsed ? "‹" : "›";
+		const label = state.detailCollapsed
+			? "Expand Generation details"
+			: "Collapse Generation details";
+		detailCollapseBtn.title = label;
+		detailCollapseBtn.setAttribute("aria-label", label);
+		detailCollapseBtn.setAttribute("aria-expanded", String(!state.detailCollapsed));
+	}
+
+	function toggleDetail() {
+		state.detailCollapsed = !state.detailCollapsed;
+		syncDetailCollapse();
+	}
+
 	function deselect() {
 		state.selectedKey = null;
 		markSelected();
-		detailEl.textContent = "";
-		detailEl.append(
+		detailBody.textContent = "";
+		detailBody.append(
 			el("div", {
 				class: "flog-ph",
 				text: "Select a request to see its details.",
@@ -827,7 +865,7 @@ export function initFlights() {
 	function renderDetail(r) {
 		const mLabel = prettyModel(r.model);
 		const pLabel = prettyProvider(r);
-		detailEl.textContent = "";
+		detailBody.textContent = "";
 		for (const _k of [
 			el(
 				"div",
@@ -926,7 +964,7 @@ export function initFlights() {
 			el("div", { class: "flog-sech", text: "Provider Responses" }),
 			providerResponses(r),
 		].filter(Boolean))
-			detailEl.append(_k);
+			detailBody.append(_k);
 
 		// Collapsible prompt/output/reasoning (lazy) + raw JSON (immediate).
 		const prompt = fold(
@@ -944,7 +982,7 @@ export function initFlights() {
 		);
 		for (const f of [prompt, completion, reasoning])
 			f.body.append(el("div", { class: "flog-note", text: "loading…" }));
-		detailEl.append(prompt.node, completion.node, reasoning.node, raw.node);
+		detailBody.append(prompt.node, completion.node, reasoning.node, raw.node);
 
 		loadPrompts(r, { prompt, completion, reasoning });
 	}
@@ -1105,6 +1143,8 @@ export function initFlights() {
 
 	function setRun(run) {
 		if (!run || run === state.run) return;
+		state.sceneScope = null;
+		syncSceneScope();
 		state.run = run;
 		runSel.value = run;
 		state.pageIndex = 0;
@@ -1121,6 +1161,8 @@ export function initFlights() {
 	}
 
 	async function open() {
+		state.sceneScope = null;
+		syncSceneScope();
 		state.open = true;
 		view.classList.add("open");
 		syncBackLabel();

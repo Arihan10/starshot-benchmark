@@ -5233,14 +5233,25 @@
             .flog-thead,
             .flog-row {
                 display: grid;
-                grid-template-columns: 118px 1fr 0.95fr 1.05fr 1.1fr 58px;
+                grid-template-columns: 118px 1fr 0.95fr 1.05fr 1.1fr 1.1fr 58px;
                 gap: 10px;
                 align-items: center;
                 padding: 0 22px;
             }
+            #flights.scene-scoped .flog-thead,
+            #flights.scene-scoped .flog-row {
+                grid-template-columns: 118px 1fr 0.95fr 1.05fr 1.1fr 58px;
+            }
+            #flights.scene-scoped .flog-scene-col {
+                display: none;
+            }
             /* both-times mode needs a wider first column for the stacked pair */
             .flog-list.tc-both .flog-thead,
             .flog-list.tc-both .flog-row {
+                grid-template-columns: 158px 1fr 0.95fr 1.05fr 1.1fr 1.1fr 58px;
+            }
+            #flights.scene-scoped .flog-list.tc-both .flog-thead,
+            #flights.scene-scoped .flog-list.tc-both .flog-row {
                 grid-template-columns: 158px 1fr 0.95fr 1.05fr 1.1fr 58px;
             }
             .flog-thead {
@@ -5348,8 +5359,10 @@
                 white-space: nowrap;
                 min-width: 0;
             }
-            .flog-app .flog-zone {
-                color: var(--l-faint);
+            .flog-zone {
+                color: var(--l-muted);
+                font-family: var(--l-mono);
+                font-size: 11.5px;
             }
             .flog-step {
                 font-family: var(--l-mono);
@@ -5401,10 +5414,48 @@
                 background: var(--l-hover);
             }
             .flog-detail {
+                position: relative;
                 flex: 1 1 50%;
                 min-width: 0;
+                overflow: visible;
+                transition: flex-basis 160ms ease;
+            }
+            .flog-detail-body {
+                height: 100%;
                 overflow-y: auto;
                 padding: 20px 24px 40px;
+                box-sizing: border-box;
+            }
+            .flog-detail-collapse {
+                position: absolute;
+                top: 50%;
+                left: 0;
+                z-index: 2;
+                width: 22px;
+                height: 42px;
+                padding: 0;
+                transform: translate(-50%, -50%);
+                border: 1px solid var(--l-border);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--l-muted);
+                font: 20px/1 var(--l-sans);
+                cursor: pointer;
+                box-shadow: 0 2px 8px rgba(16, 24, 40, 0.08);
+            }
+            .flog-detail-collapse:hover {
+                color: var(--l-fg);
+                border-color: var(--l-faint);
+            }
+            .flog-detail.collapsed {
+                flex: 0 0 28px;
+                min-width: 28px;
+            }
+            .flog-detail.collapsed .flog-detail-body {
+                display: none;
+            }
+            .flog-detail.collapsed .flog-detail-collapse {
+                left: 50%;
             }
             .flog-ph {
                 color: var(--l-faint);
