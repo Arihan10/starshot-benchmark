@@ -22,7 +22,9 @@ RUNS_DIR_ENV = "STARSHOT_RUNS_DIR"
 _SERVER_ENV_FILE = REPO_ROOT / "server" / ".env"
 
 
-def _server_env_value(key: str) -> str | None:
+def server_env_value(key: str) -> str | None:
+    """Read one key out of ``server/.env``, ignoring the process environment.
+    Lets a launcher report the settings the server it spawns will actually see."""
     try:
         text = _SERVER_ENV_FILE.read_text(encoding="utf-8")
     except OSError:
@@ -41,7 +43,7 @@ def _server_env_value(key: str) -> str | None:
 
 def runs_root() -> Path:
     """Parent directory holding the named runs."""
-    value = os.environ.get(RUNS_DIR_ENV) or _server_env_value(RUNS_DIR_ENV)
+    value = os.environ.get(RUNS_DIR_ENV) or server_env_value(RUNS_DIR_ENV)
     if not value:
         return REPO_ROOT / "runs"
     path = Path(value).expanduser()

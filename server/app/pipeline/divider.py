@@ -35,6 +35,7 @@ this module only decides which step fires when and with which scene state.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,14 @@ from app.pipeline import committed, context_cull, generation
 from app.services import llm
 from app.utils import logging
 from app.utils.topology import uniquify_ids, validate_subregions
+
+# The Phase-2 entry the walk hands each zone to — `generation.run` by default.
+# `divider_parallel` injects `generation.run_parallel` instead, which frames the
+# zone but defers its interior; nothing else about the walk changes, so the two
+# traversals stay identical by construction rather than by being kept in sync.
+# Resolved at call time (never as a default argument) so a variant entry that
+# rebinds the attribute is still honoured.
+GenRun = Callable[..., Awaitable[None]]
 
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
@@ -194,11 +203,12 @@ async def _encapsulate(
     runs_dir: Path,
     run_id: str,
     all_nodes: list[Node],
+    gen_run: GenRun | None = None,
 ) -> None:
     """Generate a zone's physical shell / ground (the encapsulating pass).
     Every zone is encapsulated exactly once per run."""
     logging.emit_step(zone.id, "generating_frame")
-    await generation.run(
+    await (gen_run or generation.run)(
         zone=zone,
         runs_dir=runs_dir,
         run_id=run_id,
@@ -214,8 +224,10 @@ async def _build(
     run_id: str,
     all_nodes: list[Node],
     is_atomic: bool,
+    gen_run: GenRun | None = None,
 ) -> None:
     assert node.plan is not None, "node.plan must be set by caller"
+    gen = gen_run or generation.run
 
     placed: list[Node] = []
     if not is_atomic:
@@ -288,11 +300,13 @@ async def _build(
     # ground author sees the subregions just placed inside it. Atomic zones
     # have no decomposition; this still frames them right before the anchor
     # pass below. Each zone is encapsulated exactly once, in its own pass.
-    await _encapsulate(node, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes)
+    await _encapsulate(
+        node, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes, gen_run=gen,
+    )
 
     if is_atomic:
         logging.emit_step(node.id, "generating_anchor")
-        await generation.run(
+        await gen(
             zone=node,
             runs_dir=runs_dir,
             run_id=run_id,
@@ -328,6 +342,7 @@ async def _build(
             run_id=run_id,
             all_nodes=all_nodes,
             is_atomic=plan_out.is_atomic,
+            gen_run=gen,
         )
 
     # Every NON-root non-atomic zone gets a negative-space pass once its whole
@@ -337,7 +352,7 @@ async def _build(
     # in `run()`, so it's excluded here to avoid running twice.
     if node.parent_id is not None:
         logging.emit_step(node.id, "generating_negative_space")
-        await generation.run(
+        await gen(
             zone=node,
             runs_dir=runs_dir,
             run_id=run_id,

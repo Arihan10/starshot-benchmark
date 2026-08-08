@@ -141,6 +141,17 @@ _OPTIMIZE_FANOUT = asyncio.Semaphore(4)
 SECONDARY_CALL_CONCURRENCY = 12
 _secondary_slot = asyncio.Semaphore(SECONDARY_CALL_CONCURRENCY)
 
+# Cap on how many ZONES the deferred interior pass (`run_deferred_interiors`)
+# builds at once. A zone issues its structural calls one after another, so this
+# is effectively the ceiling on concurrent STRUCTURAL calls — and those are the
+# heavy ones (a real modern-house run averaged ~190k input tokens per
+# `object_bbox_batch`). Fanning 20+ zones out unbounded would put millions of
+# tokens in flight at once, which single-key providers have no rotation to
+# absorb. 8 is high enough that the slowest single zone, not the cap, is what
+# bounds the pass.
+INTERIOR_ZONE_CONCURRENCY = 8
+_interior_zone_slot = asyncio.Semaphore(INTERIOR_ZONE_CONCURRENCY)
+
 # Versioned from-scratch generated builds (Nano-Banana + a mesh backend). A cell
 # can hold ANY number of independent generated versions of the SAME scene —
 # identical layout (ids / bboxes reconstructed from the library build), but freshly
@@ -2159,6 +2170,7 @@ def cancel_pending(run_id: str) -> None:
     task before it reaches `_spawn_meshes` also stops the meshes it would have
     queued."""
     _admitted_ids.pop(run_id, None)
+    _deferred_interiors.pop(run_id, None)
     while tasks := _pending.pop(run_id, []):
         for t in tasks:
             t.cancel()
@@ -2320,3 +2332,150 @@ async def run(
         )
         all_nodes.extend(new_nodes)
         rounds += 1
+
+
+# Interior passes `run_parallel` skipped, in the order the walk reached them.
+# The walk emits negative space post-order, so a zone's children always precede
+# it here — `run_deferred_interiors` relies on that to rebuild the dependency.
+_deferred_interiors: dict[str, list[tuple[Node, str]]] = {}
+
+
+async def run_parallel(
+    *,
+    zone: Node,
+    runs_dir: Path,
+    run_id: str,
+    scenario: Literal["anchor", "encapsulating", "negative-space"],
+    all_nodes: list[Node],
+) -> None:
+    """`run`, minus every interior-object scenario — the structural half of the
+    split pipeline.
+
+    Only `encapsulating` executes, and it does so by delegating to `run`, so a
+    zone's shell / ground is authored exactly as the serial pipeline authors it
+    (including under the `_spawn_meshes` rebinds the noframes / nomesh entries
+    install). `anchor` and `negative-space` are recorded and skipped: their
+    objects live inside a single zone whose envelope is already fixed by the
+    parent's `child_bbox_batch`, so they are handed to `run_deferred_interiors`
+    to fan out concurrently instead of being paid for one zone at a time.
+
+    Walking the whole tree with this leaves a scene that is fully planned, fully
+    decomposed and fully framed, with every zone's interior still empty. The
+    caller MUST then drain `run_deferred_interiors` or the scene stays empty.
+
+    Only replays onto a log written by this same walk: a cell part-built by
+    `run` has committed interior objects that this never reads back into
+    `all_nodes`, so later zones would be framed against a scene missing them.
+    """
+    if scenario != "encapsulating":
+        _deferred_interiors.setdefault(run_id, []).append((zone, scenario))
+        return
+    await run(
+        zone=zone,
+        runs_dir=runs_dir,
+        run_id=run_id,
+        scenario=scenario,
+        all_nodes=all_nodes,
+    )
+
+
+def _zone_depths(nodes: list[Node]) -> dict[str, int]:
+    """Every node's depth below the root, by walking `parent_id` up. Bounded by
+    membership in the map (the `util.adjacent_zones` idiom), so a node whose
+    parent isn't present stops there instead of running off the end."""
+    parent_of = {n.id: n.parent_id for n in nodes}
+    depths: dict[str, int] = {}
+    for nid in parent_of:
+        depth, cur = 0, parent_of[nid]
+        while cur is not None and cur in parent_of:
+            depth += 1
+            cur = parent_of[cur]
+        depths[nid] = depth
+    return depths
+
+
+async def _build_interiors(
+    *,
+    zones: list[Node],
+    scenario: Literal["anchor", "negative-space"],
+    runs_dir: Path,
+    run_id: str,
+    all_nodes: list[Node],
+) -> None:
+    """Build one wave of zones concurrently, then merge what they placed.
+
+    Every zone in a wave reads the SAME frozen snapshot of the scene, so what a
+    zone sees depends only on which wave it is in — never on how far its peers
+    happen to have got. That is what keeps each prompt, and therefore each
+    content-addressed cache key, reproducible from run to run; handing the zones
+    the live `all_nodes` would make their context race.
+
+    `run` only ever appends, so the tail past the snapshot is exactly this
+    zone's contribution.
+    """
+    if not zones:
+        return
+    base = list(all_nodes)
+
+    async def _one(zone: Node) -> list[Node]:
+        scene = list(base)
+        async with _interior_zone_slot:
+            await run(
+                zone=zone,
+                runs_dir=runs_dir,
+                run_id=run_id,
+                scenario=scenario,
+                all_nodes=scene,
+            )
+        return scene[len(base) :]
+
+    for placed in await asyncio.gather(*(_one(z) for z in zones)):
+        all_nodes.extend(placed)
+
+
+async def run_deferred_interiors(
+    *,
+    runs_dir: Path,
+    run_id: str,
+    all_nodes: list[Node],
+) -> None:
+    """Build every interior `run_parallel` deferred, fanning the zones out.
+
+    Two stages, because the scenarios differ in what they depend on:
+
+      * ANCHOR — every atomic zone in one wave. Each zone's envelope was fixed
+        by its parent's `child_bbox_batch` during the walk, so no two can
+        contend for space and none needs another's contents.
+      * NEGATIVE SPACE — deepest level first, one level per wave. A zone's fill
+        covers the gaps between its children and a parent's region physically
+        CONTAINS its children's, so a parent has to see their fill or the two
+        double-fill the same volume. Equal-depth zones are disjoint, so a level
+        goes out together.
+
+    Each zone's pass is `run` itself, so object decomposition, the capped
+    `next_object` loop (`STARSHOT_NEXT_OBJECT_CAP`), resume replay and every
+    event it writes behave exactly as in the serial pipeline. Only the
+    scheduling differs — and the loss of cross-zone visibility that buys.
+    """
+    deferred = _deferred_interiors.pop(run_id, [])
+    if not deferred:
+        return
+
+    await _build_interiors(
+        zones=[z for z, s in deferred if s == "anchor"],
+        scenario="anchor",
+        runs_dir=runs_dir,
+        run_id=run_id,
+        all_nodes=all_nodes,
+    )
+
+    negative = [z for z, s in deferred if s == "negative-space"]
+    depths = _zone_depths(all_nodes)
+    for depth in sorted({depths.get(z.id, 0) for z in negative}, reverse=True):
+        await _build_interiors(
+            zones=[z for z in negative if depths.get(z.id, 0) == depth],
+            scenario="negative-space",
+            runs_dir=runs_dir,
+            run_id=run_id,
+            all_nodes=all_nodes,
+        )
