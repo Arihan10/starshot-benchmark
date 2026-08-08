@@ -209,6 +209,7 @@ function createCellView(alias) {
   const grid = new THREE.GridHelper(300, 300, 0x44485a, 0x1c1f26);
   grid.material.transparent = true;
   grid.material.opacity = 0.4;
+  grid.visible = false;
   scene.add(grid);
 
   const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 5000);

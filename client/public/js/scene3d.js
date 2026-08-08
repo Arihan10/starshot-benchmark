@@ -436,8 +436,9 @@ export function createViewer(
 		meshes: true,
 		bboxes: true,
 		proxies: false,
-		grid: true,
+		grid: false,
 	};
+	grid.visible = show.grid;
 	// Zone-layers view (an alternative read of the scene): when on, only zone
 	// bboxes draw — each colored by its depth in the decomposition tree — and any
 	// combination of depths can be isolated for inspection/picking. Persists
