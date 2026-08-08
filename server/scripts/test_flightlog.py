@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -95,11 +96,12 @@ def bind(scene: str) -> None:
 
 
 def put(scene: str, t: float, *, status: int = 200, model: str = "m",
-        key: str = "key-zzzz", transport: str = "direct", node: str | None = None) -> None:
+        key: str = "key-zzzz", transport: str = "direct", node: str | None = None,
+        zone_id: str | None = None) -> None:
     """Record one attempt row directly (bypassing the transport) for the bulk
     pagination/facet/merge tests."""
     bind(scene)
-    flightlog.begin_call(node=node)
+    flightlog.begin_call(node=node, zone_id=zone_id)
     flightlog.record(
         transport=transport, model=model, t_request=t, t_response=t,
         base_url="https://api.example/v1", api_key=key, status=status,
@@ -107,12 +109,12 @@ def put(scene: str, t: float, *, status: int = 200, model: str = "m",
     )
 
 
-async def call_once(scene: str, step: str = "st") -> SimOut:
+async def call_once(scene: str, step: str = "st", zone_id: str | None = "zn") -> SimOut:
     bind(scene)
     llm.set_model(SIM_MODEL_ID)
     validated, *_ = await llm.call_llm_once(
         system="SYS-BYTES", user="USER-BYTES", output_schema=SimOut,
-        model=SIM_MODEL_ID, step=step, node_id="nd",
+        model=SIM_MODEL_ID, step=step, node_id="nd", zone_id=zone_id,
     )
     return validated
 
@@ -124,7 +126,11 @@ async def scenario_capture() -> None:
     res = flightlog.page("run1", cursor=None, limit=100, filters={})
     check("one row persisted", len(res["rows"]) == 1, str(len(res["rows"])))
     r = res["rows"][0]
-    check("row metadata", r["ok"] and r["model"] == "sim-flights" and r["step"] == "st" and r["node"] == "nd")
+    check(
+        "row metadata",
+        r["ok"] and r["model"] == "sim-flights" and r["step"] == "st"
+        and r["node"] == "nd" and r["zone_id"] == "zn",
+    )
     check("slot is the scene path", r["slot"] == "run1/slotA/modelX")
     check("has_prompt flagged", r["has_prompt"] is True)
     check("key masked", r["key"] == "...0000")
@@ -195,19 +201,68 @@ def scenario_facets() -> None:
     res2 = flightlog.facets("pg", filters={"status": ["429"]})
     check("filtered total", res2["total"] == 50, str(res2["total"]))
 
-    put("zones/s/m", 1.0, node="atrium")
-    put("zones/s/m", 2.0, node="gallery")
-    put("zones/s/m", 3.0, node="atrium")
-    zone_facets = flightlog.facets("zones", filters={})["facets"]["node"]
+    put("zones/s/m", 1.0, node="chair", zone_id="atrium")
+    put("zones/s/m", 2.0, node="painting", zone_id="gallery")
+    put("zones/s/m", 3.0, node="table", zone_id="atrium")
+    zone_facets = flightlog.facets("zones", filters={})["facets"]["zone_id"]
     zone_counts = {x["value"]: x["count"] for x in zone_facets}
     check("zone facet", zone_counts == {"atrium": 2, "gallery": 1}, str(zone_counts))
     zone_rows = flightlog.page(
-        "zones", cursor=None, limit=100, filters={"node": ["gallery"]},
+        "zones", cursor=None, limit=100, filters={"zone_id": ["gallery"]},
     )["rows"]
     check(
         "zone filter",
-        len(zone_rows) == 1 and zone_rows[0]["node"] == "gallery",
+        len(zone_rows) == 1
+        and zone_rows[0]["zone_id"] == "gallery"
+        and zone_rows[0]["node"] == "painting",
         str(zone_rows),
+    )
+
+    legacy_scene = "legacy/s/m"
+    put(legacy_scene, 4.0, node="chair")
+    legacy_db = _TMP / legacy_scene / "flights.db"
+    with sqlite3.connect(legacy_db) as con:
+        con.execute("UPDATE flights SET zone_id=NULL")
+        con.commit()
+    (_TMP / legacy_scene / "events.jsonl").write_text(
+        json.dumps({
+            "kind": "cache.llm", "node": "chair", "step": "image_prompt",
+            "zone_id": "atrium", "t_request": 4.0,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    flightlog._zone_ids_hydrated.discard(legacy_scene)
+    legacy_rows = flightlog.page("legacy", cursor=None, limit=100, filters={})["rows"]
+    check(
+        "legacy zone backfill",
+        len(legacy_rows) == 1 and legacy_rows[0]["zone_id"] == "atrium",
+        str(legacy_rows),
+    )
+
+    migration_scene = "migration/s/m"
+    put(migration_scene, 5.0)
+    migration_db = _TMP / migration_scene / "flights.db"
+    with sqlite3.connect(migration_db) as con:
+        con.execute("ALTER TABLE flights DROP COLUMN zone_id")
+        con.commit()
+    flightlog._columns_ensured.discard(migration_scene)
+    migration_rows = flightlog.page("migration", cursor=None, limit=100, filters={})["rows"]
+    check(
+        "zone column migration",
+        len(migration_rows) == 1 and migration_rows[0]["zone_id"] is None,
+        str(migration_rows),
+    )
+
+    generated_scene = "generated/s/m::generated::v2"
+    put(generated_scene, 6.0, node="lamp", zone_id="root")
+    generated_rows = flightlog.page("generated", cursor=None, limit=100, filters={})["rows"]
+    check(
+        "generated-version scene mapping",
+        len(generated_rows) == 1
+        and generated_rows[0]["slot"] == generated_scene
+        and generated_rows[0]["zone_id"] == "root"
+        and (_TMP / "generated/s/m/generated/2/flights.db").exists(),
+        str(generated_rows),
     )
 
 

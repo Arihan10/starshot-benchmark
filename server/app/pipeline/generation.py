@@ -380,6 +380,7 @@ async def _split_objects(
         user=ps.user("object_decomp", variables),
         output_schema=schemas.ObjectDecompOutput,
         node_id=zone.id,
+        zone_id=zone.id,
         step="object_decomp",
         template="object_decomp",
         variables=variables,
@@ -429,6 +430,7 @@ async def _decompose_objects(
         user=ps.user(step, variables),
         output_schema=decomp_schema,
         node_id=zone.id,
+        zone_id=zone.id,
         step=step,
         template=step,
         variables=variables,
@@ -487,6 +489,7 @@ async def _next_object_batch(
         user=ps.user("next_object", variables),
         output_schema=schemas.GatedObjectDecompOutput,
         node_id=zone.id,
+        zone_id=zone.id,
         step="next_object",
         template="next_object",
         variables=variables,
@@ -545,6 +548,7 @@ async def _resolve_object_bboxes_batch(
         user=ps.user("object_bbox_batch", variables),
         output_schema=schemas.ObjectBboxBatchOutput,
         node_id=zone.id,
+        zone_id=zone.id,
         step="object_bbox_batch",
         template="object_bbox_batch",
         variables=variables,
@@ -649,6 +653,7 @@ async def _resolve_and_generate(
             kind=_bbox_kind,
             proxy_shape=spec.proxy_shape,
             orientation=orientations[spec.id],
+            parent_region=zone.id,
         )
 
     # Everything the structural pipeline needs is now known: id, prompt, bbox,
@@ -751,6 +756,7 @@ async def _realize_assets(
                 cut_plane = await symmetry.resolve_cut_plane(
                     prompt=subject_prompt,
                     node_id=spec.id,
+                    zone_id=zone.id,
                     encapsulating=encapsulating,
                 )
             view = symmetry.image_view_for(
@@ -885,7 +891,7 @@ async def _match_library_assets(
         # prefab / Nano-Banana decisions.
         subject = subjects[spec.id]
         async with _secondary_slot:
-            match = await library.match(subject)
+            match = await library.match(subject, node_id=spec.id, zone_id=zone_id)
         asset = library.asset_path(match.library_id)
 
         logging.log(
@@ -1033,6 +1039,8 @@ async def _distill_subject(
                 output_schema=schemas.ImagePromptOutput,
                 model=llm.current_model(),
                 step="image_prompt",
+                node_id=spec_id,
+                zone_id=zone.id if zone is not None else None,
             )
             return validated.prompt
         out = await llm.call_llm(
@@ -1040,6 +1048,7 @@ async def _distill_subject(
             user=ps.user("image_prompt", variables),
             output_schema=schemas.ImagePromptOutput,
             node_id=spec_id,
+            zone_id=zone.id if zone is not None else None,
             step="image_prompt",
             template="image_prompt",
             variables=variables,
@@ -1102,7 +1111,9 @@ async def _refresh_node_image_prompt(
     `image` event with it (see `_generate_one(relog_image=...)`) so later
     regenerations, which read the `image` log, pick up the new phrase."""
     cut_plane = await symmetry.resolve_cut_plane(
-        prompt=node.prompt, node_id=node.id,
+        prompt=node.prompt,
+        node_id=node.id,
+        zone_id=zone.id if zone is not None else node.parent_region,
     )
     view = symmetry.image_view_for(cut_plane=cut_plane)
     if regen_noun_phrase:
@@ -1135,6 +1146,8 @@ async def _refresh_node_image_prompt(
             bbox=node.bbox,
             proxy_shape=node.proxy_shape,
             view=view,
+            zone=zone,
+            nodes=nodes,
         )
     return node.model_copy(
         update={
@@ -1446,6 +1459,7 @@ async def ensure_scene_prefab_groups(
                 seed_description=node.prompt,
                 seed_bbox=node.bbox,
                 candidates=candidates,
+                zone_id=node.parent_region,
             ):
                 decisions[dup_id] = node.id
                 logging.log(
@@ -1527,7 +1541,9 @@ async def generate_assets(
         # decision, so otherwise the gate leaves every generated mesh un-symmetrized).
         # Symmetric panels switch to a 3/4 view; the plane drives apply_symmetrize,
         # and reuse twins inherit it from this canonical's logged symmetry.applied.
-        cut_plane = await symmetry.resolve_cut_plane(prompt=node.prompt, node_id=node.id)
+        cut_plane = await symmetry.resolve_cut_plane(
+            prompt=node.prompt, node_id=node.id, zone_id=node.parent_region,
+        )
         if cut_plane != node.symmetry_cut_plane:
             view = symmetry.image_view_for(cut_plane=cut_plane)
             image_prompt = node.image_prompt

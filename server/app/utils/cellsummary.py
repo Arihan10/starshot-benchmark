@@ -29,8 +29,8 @@ from typing import Any
 # to a fixed slice regardless of line size.
 _KEEP = (
     "kind", "key", "model", "tokens_in", "tokens_out", "generation_id", "cost",
-    "cap", "node", "phase", "step", "prompt", "ts",
-    "t_request", "t_response", "flight_ms", "attempts",
+    "cap", "id", "node", "zone", "zone_id", "objects", "parent_region",
+    "phase", "step", "prompt", "ts", "t_request", "t_response", "flight_ms", "attempts",
 )
 _BIG_LINE = 256_000
 _TAIL = 2048
@@ -38,7 +38,11 @@ _RX_HEAD = {
     "kind": re.compile(r'"kind":\s*"([^"]+)"'),
     "key": re.compile(r'"key":\s*"([0-9a-f]{64})"'),
     "model": re.compile(r'"model":\s*"([^"]+)"'),
+    "id": re.compile(r'"id":\s*"([^"]*)"'),
     "node": re.compile(r'"node":\s*"([^"]*)"'),
+    "zone": re.compile(r'"zone":\s*"([^"]*)"'),
+    "zone_id": re.compile(r'"zone_id":\s*"([^"]*)"'),
+    "parent_region": re.compile(r'"parent_region":\s*"([^"]*)"'),
     "step": re.compile(r'"step":\s*"([^"]+)"'),
     "ts": re.compile(r'"ts":\s*([0-9.]+)'),
 }

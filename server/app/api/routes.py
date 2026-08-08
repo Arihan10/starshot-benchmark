@@ -9008,6 +9008,11 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
         image_prompt=image_prompt,
         symmetry_cut_plane=cut_plane,
         parent_id=str(parent_id) if isinstance(parent_id, str) else None,
+        parent_region=(
+            str(bbox_event["parent_region"])
+            if isinstance(bbox_event.get("parent_region"), str)
+            else None
+        ),
     )
 
 
@@ -9175,7 +9180,13 @@ def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) ->
             # parent_kind is rendered only for objects (from the spec); zones don't
             # surface it, so leaving it None there is harmless.
             parent_kind=(None if is_zone else getattr(spec, "parent_kind", None)),
-            parent_region=(None if is_zone else obj_region.get(nid)),
+            parent_region=(
+                None if is_zone else (
+                    be.get("parent_region")
+                    if isinstance(be.get("parent_region"), str)
+                    else obj_region.get(nid)
+                )
+            ),
             plan=(zone_plans.get(nid) if is_zone else None),
             is_zone=is_zone,
         ))
@@ -9615,6 +9626,7 @@ async def _fork_branch(
                 system=seed.system, user=seed.user, schema_name=str(event.get("schema") or ""),
             ),
             node=event.get("node"),
+            zone_id=event.get("zone_id"),
             step=event.get("step"),
             template=step,
             model=event.get("model"),

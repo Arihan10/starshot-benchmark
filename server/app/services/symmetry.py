@@ -108,7 +108,7 @@ class SymmetryDecisionOutput(BaseModel):
 
 
 async def decide_symmetry(
-    *, prompt: str, node_id: str, encapsulating: bool = False,
+    *, prompt: str, node_id: str, zone_id: str | None = None, encapsulating: bool = False,
 ) -> SymmetryDecisionOutput:
     """Lightweight LLM gate: should this object be symmetrized, and on which
     plane? Always runs on gemini-flash-lite (cheap retrieval, not the benchmark
@@ -132,6 +132,7 @@ async def decide_symmetry(
             user=user,
             output_schema=SymmetryDecisionOutput,
             node_id=node_id,
+            zone_id=zone_id,
             step="symmetry_decision",
         )
     finally:
@@ -139,7 +140,7 @@ async def decide_symmetry(
 
 
 async def resolve_cut_plane(
-    *, prompt: str, node_id: str, encapsulating: bool = False,
+    *, prompt: str, node_id: str, zone_id: str | None = None, encapsulating: bool = False,
 ) -> CutPlane:
     """The symmetry decision for `node_id`, made once and reused everywhere.
 
@@ -158,7 +159,7 @@ async def resolve_cut_plane(
 
     try:
         decision = await decide_symmetry(
-            prompt=prompt, node_id=node_id, encapsulating=encapsulating,
+            prompt=prompt, node_id=node_id, zone_id=zone_id, encapsulating=encapsulating,
         )
         cut_plane: CutPlane = decision.cut_plane
     except Exception as e:  # noqa: BLE001

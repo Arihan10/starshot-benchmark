@@ -70,7 +70,9 @@ PREFAB_MATCH_TIMEOUT_S = 60.0
 PREFAB_MATCH_ATTEMPTS = 3
 
 
-async def _match_call(*, user: str, seed_id: str) -> DuplicateMatchOutput | None:
+async def _match_call(
+    *, user: str, seed_id: str, zone_id: str | None,
+) -> DuplicateMatchOutput | None:
     """One prefab-match LLM call, capped at PREFAB_MATCH_TIMEOUT_S per attempt and
     retried up to PREFAB_MATCH_ATTEMPTS times. Returns the parsed output, or None
     when every attempt timed out / errored. Cancellation (build teardown) is a
@@ -83,6 +85,7 @@ async def _match_call(*, user: str, seed_id: str) -> DuplicateMatchOutput | None
                     user=user,
                     output_schema=DuplicateMatchOutput,
                     node_id=seed_id,
+                    zone_id=zone_id,
                     step="prefab_match",
                 ),
                 timeout=PREFAB_MATCH_TIMEOUT_S,
@@ -103,6 +106,7 @@ async def match_duplicates(
     seed_description: str,
     seed_bbox: BoundingBox,
     candidates: list[tuple[str, str, BoundingBox]],
+    zone_id: str | None = None,
 ) -> list[str]:
     """Name every candidate that is essentially the SAME object as the seed (and so
     can reuse the seed's mesh). `candidates` is a list of `(id, description, bbox)`;
@@ -122,7 +126,7 @@ async def match_duplicates(
     )
     token = llm._current_model.set(MODELS["gemini-flash-lite"])
     try:
-        out = await _match_call(user=user, seed_id=seed_id)
+        out = await _match_call(user=user, seed_id=seed_id, zone_id=zone_id)
     finally:
         llm._current_model.reset(token)
     if out is None:

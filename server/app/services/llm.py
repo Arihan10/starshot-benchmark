@@ -186,6 +186,7 @@ async def call_llm(
     user: str,
     output_schema: type[T],
     node_id: str | None = None,
+    zone_id: str | None = None,
     step: str | None = None,
     template: str | None = None,
     variables: dict[str, str] | None = None,
@@ -195,9 +196,12 @@ async def call_llm(
     logged verbatim so the event log stays ground truth for what the model
     saw. `template` is the prompt-template name that produced them (root and
     nested variants of a step differ here, while `step` stays the event-log
-    step id) and `variables` the resolved values that were substituted —
-    logged so the prompt lab can re-render a historical call against an
-    edited template."""
+    step id), `zone_id` is the owning/target region independent of `node_id`,
+    and `variables` are the resolved values that were substituted — logged so
+    the prompt lab can re-render a historical call against an edited template."""
+    if zone_id is None and variables is not None:
+        candidate = variables.get("ZONE_ID")
+        zone_id = candidate or None
     model = _current_model.get()
     if model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
@@ -290,6 +294,7 @@ async def call_llm(
             validate=validate,
             step=step,
             node_id=node_id,
+            zone_id=zone_id,
         )
         # cache.llm carries everything needed for the LLM-call cache (key +
         # output), the observability view (node + step + model + system + user +
@@ -319,6 +324,7 @@ async def call_llm(
                 system=system, user=user, schema_name=schema_name
             ),
             node=node_id,
+            zone_id=zone_id,
             step=step,
             template=template,
             model=model,
@@ -646,6 +652,7 @@ async def call_llm_once(
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
     node_id: str | None = None,
+    zone_id: str | None = None,
     log_retries: bool = True,
 ) -> tuple[T, str, object, object, list[str]]:
     """One structured-output call with the full resample/backoff budget,
@@ -669,7 +676,7 @@ async def call_llm_once(
     # Bind the flight-ledger context: every HTTP attempt below records a row
     # stamped with this logical call's id + step/node, so a retry storm groups
     # back to the one pipeline call that caused it.
-    flightlog.begin_call(step=step, node=node_id)
+    flightlog.begin_call(step=step, node=node_id, zone_id=zone_id)
 
     # Independent retry budgets, one per failure class:
     #   * `parse_attempt` — JSON-decode / Pydantic-validation failures.

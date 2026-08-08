@@ -626,6 +626,7 @@ def emit_bbox(
     kind: str,
     proxy_shape: ProxyShape | None = None,
     orientation: Orientation = 0,
+    parent_region: str | None = None,
 ) -> None:
     if find_event("bbox", id=node_id) is not None:
         return
@@ -639,6 +640,7 @@ def emit_bbox(
         node_kind=kind,
         proxy_shape=proxy_shape.value if proxy_shape is not None else None,
         orientation=orientation,
+        parent_region=parent_region,
     )
 
 

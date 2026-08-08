@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS flights (
   transport TEXT, provider TEXT, base_url TEXT, model TEXT, kind TEXT,
   status INTEGER, ok INTEGER, error TEXT, exc_type TEXT,
   api_key TEXT, tokens_in INTEGER, tokens_out INTEGER, generation_id TEXT,
-  slot TEXT, step TEXT, node TEXT, call INTEGER, attempt INTEGER,
+  slot TEXT, step TEXT, node TEXT, zone_id TEXT, call INTEGER, attempt INTEGER,
   system TEXT, user TEXT, output TEXT, reasoning TEXT, schema TEXT,
   cost REAL
 );
@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_flights_page ON flights (t_response DESC, id DESC
 _LIST_COLS = (
     "id, t_request, t_response, flight_ms, transport, provider, base_url, model, kind, "
     "status, ok, error, exc_type, api_key AS key, tokens_in, tokens_out, generation_id, "
-    "slot, step, node, call, attempt, cost, (system IS NOT NULL) AS has_prompt"
+    "slot, step, node, zone_id, call, attempt, cost, (system IS NOT NULL) AS has_prompt"
 )
 
 # Facet key -> the SQL expression its distinct values group on.
@@ -80,14 +80,14 @@ _FACET_EXPR: dict[str, str] = {
     "model": "model",
     "provider": "provider",
     "slot": "slot",
-    "node": "node",
+    "zone_id": "zone_id",
     "step": "step",
     "key": "api_key",
 }
 # Facet key -> the column a WHERE filter on it targets.
 _FILTER_COL: dict[str, str] = {
     "transport": "transport", "kind": "kind", "model": "model", "provider": "provider",
-    "slot": "slot", "node": "node", "step": "step", "key": "api_key",
+    "slot": "slot", "zone_id": "zone_id", "step": "step", "key": "api_key",
 }
 
 _call_counter = itertools.count(1)
@@ -100,8 +100,20 @@ def _runs_dir() -> Path:
     return Path(os.environ.get("STARSHOT_RUNS_DIR", _REPO_ROOT / "runs"))
 
 
+def _scene_root(scene: str) -> Path:
+    if "::generated::v" in scene:
+        base, version = scene.rsplit("::generated::v", 1)
+        return _runs_dir() / base / "generated" / version
+    return _runs_dir() / scene
+
+
 def _scene_db(scene: str) -> Path:
-    return _runs_dir() / scene / "flights.db"
+    return _scene_root(scene) / "flights.db"
+
+
+def _scene_events(scene: str) -> Path:
+    name = "events.generated.jsonl" if "::generated::v" in scene else "events.jsonl"
+    return _scene_root(scene) / name
 
 
 def _mask(key: str) -> str:
@@ -119,12 +131,17 @@ def _connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 # --- capture ------------------------------------------------------------------
 
 
-def begin_call(*, step: str | None = None, node: str | None = None, kind: str = "structured") -> None:
+def begin_call(
+    *, step: str | None = None, node: str | None = None,
+    zone_id: str | None = None, kind: str = "structured",
+) -> None:
     """Bind a fresh logical-call context to the current task. Every `record`
     issued while it's bound shares the call id and a 1-based attempt number, so a
     retry storm groups back to the one call that caused it."""
-    _call_ctx.set({"id": next(_call_counter), "step": step, "node": node, "kind": kind,
-                   "seq": 0, "last": None})
+    _call_ctx.set({
+        "id": next(_call_counter), "step": step, "node": node,
+        "zone_id": zone_id, "kind": kind, "seq": 0, "last": None,
+    })
 
 
 def last_flight() -> dict[str, Any] | None:
@@ -166,6 +183,7 @@ def record(
     kind = kind or (ctx["kind"] if ctx else "structured")
     step = ctx["step"] if ctx else None
     node = ctx["node"] if ctx else None
+    zone_id = ctx["zone_id"] if ctx else None
     call = ctx["id"] if ctx else None
     t_req, t_res = round(t_request, 3), round(t_response, 3)
     flight_ms = max(0, int((t_response - t_request) * 1000))
@@ -181,7 +199,7 @@ def record(
         row_id = _insert(scene, (
             t_req, t_res, flight_ms, transport, provider, base_url, model, kind,
             status, ok, err, exc_type, masked, tokens_in, tokens_out, generation_id,
-            scene, step, node, call, attempt, cost,
+            scene, step, node, zone_id, call, attempt, cost,
         ))
 
     event: dict[str, Any] = {
@@ -190,7 +208,8 @@ def record(
         "base_url": base_url, "model": model, "kind": kind, "status": status,
         "ok": bool(ok), "error": err, "exc_type": exc_type, "key": masked,
         "tokens_in": tokens_in, "tokens_out": tokens_out, "generation_id": generation_id,
-        "step": step, "node": node, "call": call, "attempt": attempt, "cost": cost,
+        "step": step, "node": node, "zone_id": zone_id,
+        "call": call, "attempt": attempt, "cost": cost,
         "has_prompt": False,
     }
     if ctx is not None:
@@ -201,15 +220,19 @@ def record(
     return event
 
 
-def _ensure_cost_column(con: sqlite3.Connection) -> None:
-    """Add the `cost` column to a pre-existing scene DB created before it was
-    part of the schema. `CREATE TABLE IF NOT EXISTS` never alters an existing
-    table, so a DB from an older build keeps the old shape until this ALTER runs
-    — idempotent (checked against `PRAGMA table_info`), so it fires at most once
-    per scene per process."""
+def _ensure_columns(con: sqlite3.Connection) -> None:
+    """Bring a pre-existing flight DB up to the current additive schema."""
     cols = {r[1] for r in con.execute("PRAGMA table_info(flights)")}
-    if "cost" not in cols:
-        con.execute("ALTER TABLE flights ADD COLUMN cost REAL")
+    additions = {
+        "cost": "ALTER TABLE flights ADD COLUMN cost REAL",
+        "zone_id": "ALTER TABLE flights ADD COLUMN zone_id TEXT",
+    }
+    changed = False
+    for name, sql in additions.items():
+        if name not in cols:
+            con.execute(sql)
+            changed = True
+    if changed:
         con.commit()
 
 
@@ -217,10 +240,10 @@ def _insert(scene: str, values: tuple[Any, ...]) -> int | None:
     path = _scene_db(scene)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        first = scene not in _initialized
-        con = _connect(path, create=first)
-        if first:
-            _ensure_cost_column(con)
+        initialize = scene not in _initialized or not path.exists()
+        con = _connect(path, create=initialize)
+        if initialize:
+            _ensure_columns(con)
     except (sqlite3.Error, OSError):
         return None  # a logging fault must never break the LLM call it describes
     try:
@@ -228,8 +251,8 @@ def _insert(scene: str, values: tuple[Any, ...]) -> int | None:
         cur = con.execute(
             "INSERT INTO flights (t_request, t_response, flight_ms, transport, provider, "
             "base_url, model, kind, status, ok, error, exc_type, api_key, tokens_in, "
-            "tokens_out, generation_id, slot, step, node, call, attempt, cost) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "tokens_out, generation_id, slot, step, node, zone_id, call, attempt, cost) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             values,
         )
         con.commit()
@@ -288,7 +311,7 @@ def unsubscribe(q: asyncio.Queue[dict[str, Any]]) -> None:
 _RECON_COLS = (
     "t_request, t_response, flight_ms, transport, provider, base_url, model, kind, "
     "status, ok, error, exc_type, api_key, tokens_in, tokens_out, generation_id, "
-    "slot, step, node, call, attempt, cost"
+    "slot, step, node, zone_id, call, attempt, cost"
 )
 
 
@@ -300,6 +323,26 @@ def _row_treq(e: dict[str, Any]) -> float | None:
     return t if t is not None else e.get("ts")
 
 
+def _event_zone_id(e: dict[str, Any]) -> str | None:
+    zone_id = e.get("zone_id")
+    if isinstance(zone_id, str) and zone_id:
+        return zone_id
+    variables = e.get("variables")
+    if isinstance(variables, dict):
+        zone_id = variables.get("ZONE_ID")
+        if isinstance(zone_id, str) and zone_id:
+            return zone_id
+    step = e.get("step")
+    node = e.get("node")
+    zone_steps = {
+        "zone_plan", "zone_plan_root", "overall_bbox", "zone_decompose",
+        "zone_decompose_root", "child_bbox_batch", "object_decomp",
+        "anchor_decompose", "encapsulating_decompose", "negative_space_decompose",
+        "next_object", "object_bbox_batch",
+    }
+    return node if step in zone_steps and isinstance(node, str) and node else None
+
+
 def _flight_row(e: dict[str, Any], scene: str) -> tuple:
     """Reconstruct one flight ledger row (metadata + compat cost) from a
     `cache.llm` event — the winning attempt. Transport/provider/model mirror what
@@ -308,7 +351,7 @@ def _flight_row(e: dict[str, Any], scene: str) -> tuple:
     OpenRouter. Prompt columns are left NULL (they remain in events.jsonl)."""
     model = e.get("model")
     gid = e.get("generation_id")
-    cfg = slots.OPENAI_COMPAT_MODELS.get(model)
+    cfg = slots.OPENAI_COMPAT_MODELS.get(model) if isinstance(model, str) else None
     if cfg is not None and not gid:
         transport = "direct"
         base_url = cfg.base_url
@@ -321,7 +364,8 @@ def _flight_row(e: dict[str, Any], scene: str) -> tuple:
     return (
         _row_treq(e), t_res, e.get("flight_ms"), transport, provider, base_url, model_col,
         "structured", 200, 1, None, None, None, e.get("tokens_in"), e.get("tokens_out"),
-        gid, scene, e.get("step"), e.get("node"), None, e.get("attempts"), cost,
+        gid, scene, e.get("step"), e.get("node"), _event_zone_id(e),
+        None, e.get("attempts"), cost,
     )
 
 
@@ -337,7 +381,7 @@ def reconstruct_flights(scene: str, events: list[dict[str, Any]], *, dry_run: bo
         try:
             con = _connect(db_path)
             try:
-                _ensure_cost_column(con)
+                _ensure_columns(con)
                 for gid, tr in con.execute("SELECT generation_id, t_request FROM flights"):
                     if isinstance(gid, str):
                         existing_gids.add(gid)
@@ -376,10 +420,10 @@ def reconstruct_flights(scene: str, events: list[dict[str, Any]], *, dry_run: bo
     except (sqlite3.Error, OSError):
         return 0, 0
     try:
-        _ensure_cost_column(con)
+        _ensure_columns(con)
         if new_rows:
             con.executemany(
-                f"INSERT INTO flights ({_RECON_COLS}) VALUES ({','.join('?' * 22)})", new_rows,
+                f"INSERT INTO flights ({_RECON_COLS}) VALUES ({','.join('?' * 23)})", new_rows,
             )
         for (m,) in con.execute(
             "SELECT DISTINCT model FROM flights WHERE model IS NOT NULL AND cost IS NULL"
@@ -406,20 +450,92 @@ def reconstruct_flights(scene: str, events: list[dict[str, Any]], *, dry_run: bo
 _ensure_lock = threading.Lock()
 
 
-def _ensure_ledger(scene: str) -> None:
-    """Legacy-scene fallback: if `scene` has an event log but no flights.db yet,
-    reconstruct the ledger from events.jsonl so the dashboard shows its calls.
-    Lock-guarded + idempotent, so concurrent dashboard reads never double-build."""
-    if _scene_db(scene).exists():
+def backfill_zone_ids(
+    scene: str, *, dry_run: bool = False,
+) -> dict[str, int]:
+    """Populate canonical zone IDs in one scene's existing flight ledger."""
+    path = _scene_db(scene)
+    events_path = _scene_events(scene)
+    if not path.exists() or not events_path.exists():
+        return {"rows": 0, "mapped": 0, "updated": 0, "unresolved": 0}
+    events_by_gid: dict[str, str] = {}
+    events_by_treq: dict[float, str] = {}
+    object_zones: dict[str, str] = {}
+    events = list(cellsummary.iter_events(events_path))
+    zone_events = events
+    if "::generated::v" in scene:
+        source_scene = scene.rsplit("::generated::v", 1)[0]
+        source_events = _scene_events(source_scene)
+        if source_events.exists():
+            zone_events = [*cellsummary.iter_events(source_events), *events]
+    for event in zone_events:
+        kind = event.get("kind")
+        if kind == "generation.decompose":
+            zone_id = event.get("zone")
+            objects = event.get("objects")
+            if isinstance(zone_id, str) and isinstance(objects, list):
+                for obj in objects:
+                    if isinstance(obj, dict) and isinstance(obj.get("id"), str):
+                        object_zones[obj["id"]] = zone_id
+        elif kind == "generation.next":
+            zone_id = event.get("zone")
+            node = event.get("id")
+            if isinstance(zone_id, str) and isinstance(node, str):
+                object_zones[node] = zone_id
+        elif kind == "bbox":
+            zone_id = event.get("parent_region")
+            node = event.get("id")
+            if isinstance(zone_id, str) and isinstance(node, str):
+                object_zones[node] = zone_id
+    for event in events:
+        if event.get("kind") != "cache.llm":
+            continue
+        zone_id = _event_zone_id(event)
+        if zone_id is None and event.get("step") in {
+            "image_prompt", "symmetry_decision", "library_match", "prefab_match",
+        }:
+            node = event.get("node")
+            zone_id = object_zones.get(node) if isinstance(node, str) else None
+        if zone_id is None:
+            continue
+        gid = event.get("generation_id")
+        if isinstance(gid, str):
+            events_by_gid[gid] = zone_id
+        else:
+            t_req = _row_treq(event)
+            if t_req is not None:
+                events_by_treq[round(float(t_req), 3)] = zone_id
+    if not events_by_gid and not events_by_treq:
         return
-    events_path = _runs_dir() / scene / "events.jsonl"
+    con = _connect(path)
+    try:
+        _ensure_columns(con)
+        con.executemany(
+            "UPDATE flights SET zone_id=? WHERE zone_id IS NULL AND generation_id=?",
+            ((zone_id, gid) for gid, zone_id in events_by_gid.items()),
+        )
+        con.executemany(
+            "UPDATE flights SET zone_id=? WHERE zone_id IS NULL AND t_request=?",
+            ((zone_id, t_req) for t_req, zone_id in events_by_treq.items()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _ensure_ledger(scene: str) -> None:
+    """Reconstruct missing ledgers and hydrate zone metadata from event history."""
+    events_path = _scene_events(scene)
     if not events_path.exists():
         return
     with _ensure_lock:
-        if _scene_db(scene).exists():  # built while we waited on the lock
-            return
-        with contextlib.suppress(OSError):
-            reconstruct_flights(scene, list(cellsummary.iter_events(events_path)))
+        if not _scene_db(scene).exists():
+            with contextlib.suppress(OSError):
+                reconstruct_flights(scene, list(cellsummary.iter_events(events_path)))
+        if scene not in _zone_ids_hydrated:
+            with contextlib.suppress(sqlite3.Error, OSError):
+                _backfill_zone_ids(scene, events_path)
+            _zone_ids_hydrated.add(scene)
 
 
 def _ensure_ledgers(run: str) -> None:
@@ -430,19 +546,20 @@ def _ensure_ledgers(run: str) -> None:
         return
     for events_path in base.glob("**/events.jsonl"):
         _ensure_ledger(events_path.parent.relative_to(_runs_dir()).as_posix())
+    for events_path in base.glob("**/generated/*/events.generated.jsonl"):
+        version = events_path.parent.name
+        cell = events_path.parents[2].relative_to(_runs_dir()).as_posix()
+        _ensure_ledger(f"{cell}::generated::v{version}")
 
 
-_cost_ensured: set[str] = set()
+_columns_ensured: set[str] = set()
+_zone_ids_hydrated: set[str] = set()
 
 
-def _ensure_cost_columns(scenes: list[str]) -> None:
-    """Add the `cost` column to any scene DB that predates it, so the reads can
-    project it uniformly — a DB created before the column existed and never
-    written to since still has the old shape, which would make the `cost`
-    projection raise "no such column". Once per scene per process: the check is a
-    cheap PRAGMA and the ALTER fires at most once."""
+def _ensure_scene_columns(scenes: list[str]) -> None:
+    """Bring every attached scene DB up to the additive metadata schema once."""
     for scene in scenes:
-        if scene in _cost_ensured:
+        if scene in _columns_ensured:
             continue
         path = _scene_db(scene)
         if not path.exists():
@@ -450,12 +567,12 @@ def _ensure_cost_columns(scenes: list[str]) -> None:
         try:
             con = _connect(path)
             try:
-                _ensure_cost_column(con)
+                _ensure_columns(con)
             finally:
                 con.close()
         except sqlite3.Error:
             continue
-        _cost_ensured.add(scene)
+        _columns_ensured.add(scene)
 
 
 # --- unified reads (ATTACH + batched merge) -----------------------------------
@@ -464,8 +581,16 @@ def _ensure_cost_columns(scenes: list[str]) -> None:
 def _scene_keys(run: str) -> list[str]:
     base = _runs_dir() / run
     if not run or not base.is_dir():
-        return []  # never fall back to globbing the entire runs dir
-    return sorted(p.parent.relative_to(_runs_dir()).as_posix() for p in base.glob("**/flights.db"))
+        return []
+    scenes: list[str] = []
+    for path in base.glob("**/flights.db"):
+        if path.parent.parent.name == "generated":
+            version = path.parent.name
+            cell = path.parent.parent.parent.relative_to(_runs_dir()).as_posix()
+            scenes.append(f"{cell}::generated::v{version}")
+            continue
+        scenes.append(path.parent.relative_to(_runs_dir()).as_posix())
+    return sorted(scenes)
 
 
 def _batches(scenes: list[str]) -> list[list[str]]:
@@ -514,7 +639,7 @@ def page(run: str, *, cursor: str | None, limit: int, filters: dict[str, list[st
     below the cursor, so the global top `limit` is always within their union."""
     _ensure_ledgers(run)  # legacy scenes with no flights.db → reconstruct from events
     scenes = _scene_keys(run)
-    _ensure_cost_columns(scenes)  # so every attached DB has `cost` for the projection
+    _ensure_scene_columns(scenes)
     where, wparams = _where(filters, _parse_cursor(cursor))
     sql = f"SELECT * FROM ({{union}}) WHERE 1=1{where} ORDER BY t_response DESC, id DESC LIMIT ?"
     merged: list[dict[str, Any]] = []
@@ -578,7 +703,7 @@ def locate(scene: str, *, generation_id: str | None = None, t_request: float | N
     con = _connect(path)
     row = None
     try:
-        _ensure_cost_column(con)  # old DB may predate `cost`; the projection selects it
+        _ensure_columns(con)
         if generation_id:
             row = con.execute(
                 f"SELECT {_LIST_COLS} FROM flights WHERE generation_id=? ORDER BY t_response DESC LIMIT 1",
@@ -607,9 +732,10 @@ def histogram(run: str, *, filters: dict[str, list[str]], buckets: int = 48) -> 
     `t_response` under the filters, then a GROUP BY on the bucket index."""
     _ensure_ledgers(run)
     scenes = _scene_keys(run)
+    _ensure_scene_columns(scenes)
     where, params = _where(filters, None)
     t0 = t1 = None
-    cols = "t_response, status, exc_type, transport, kind, model, provider, slot, step, node, api_key"
+    cols = "t_response, status, exc_type, transport, kind, model, provider, slot, step, zone_id, api_key"
     for batch in _batches(scenes):
         con = sqlite3.connect(":memory:")
         try:
@@ -648,9 +774,10 @@ def facets(run: str, *, filters: dict[str, list[str]]) -> dict[str, Any]:
     behavior). One attach per batch; every facet + the total run on it."""
     _ensure_ledgers(run)
     scenes = _scene_keys(run)
+    _ensure_scene_columns(scenes)
     acc: dict[str, dict[Any, int]] = {fk: {} for fk in _FACET_EXPR}
     total = 0
-    cols = "status, exc_type, transport, kind, model, provider, slot, step, node, api_key"
+    cols = "status, exc_type, transport, kind, model, provider, slot, step, zone_id, api_key"
     for batch in _batches(scenes):
         con = sqlite3.connect(":memory:")
         con.row_factory = sqlite3.Row
@@ -662,6 +789,8 @@ def facets(run: str, *, filters: dict[str, list[str]]) -> dict[str, Any]:
                 where, params = _where(sub, None)
                 q = f"SELECT {expr} AS v, COUNT(*) AS c FROM ({union}) WHERE 1=1{where} GROUP BY v"
                 for row in con.execute(q, params).fetchall():
+                    if row["v"] is None:
+                        continue
                     acc[fk][row["v"]] = acc[fk].get(row["v"], 0) + row["c"]
             where, params = _where(filters, None)
             total += con.execute(

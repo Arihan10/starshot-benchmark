@@ -969,7 +969,7 @@ async def _place_one(
     placement (v5 stands assets upright)."""
     try:
         path = objs_dir / f"{obj.id}.glb"
-        match = await library.match(obj.match_text)
+        match = await library.match(obj.match_text, node_id=obj.id, zone_id="root")
         logging.log(
             "library.match",
             id=obj.id,

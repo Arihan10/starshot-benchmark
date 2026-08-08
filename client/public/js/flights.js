@@ -67,7 +67,7 @@ const FACETS = [
 	{ key: "model", label: "Model" },
 	{ key: "provider", label: "Provider" },
 	{ key: "slot", label: "Scene", display: (v) => sceneName(v) },
-	{ key: "node", label: "Zone" },
+	{ key: "zone_id", label: "Zone" },
 	{ key: "step", label: "Step" },
 	{ key: "key", label: "Key" },
 ];
@@ -582,7 +582,8 @@ export function initFlights() {
 	// sits above it) and ask the app to open that request's cell, focusing the
 	// node the call produced. `r.slot` IS the cell/branch path.
 	function openScene(r, { focus = null } = {}) {
-		const parts = (r.slot || "").split("/");
+		const scene = (r.slot || "").split("::generated::", 1)[0];
+		const parts = scene.split("/");
 		const run = parts[0];
 		if (!run) return;
 		const payload =
@@ -713,8 +714,8 @@ export function initFlights() {
 			}),
 			el("div", {
 				class: "flog-zone",
-				text: r.node || "—",
-				title: r.node || "",
+				text: r.zone_id || "—",
+				title: r.zone_id || "",
 			}),
 			el("div", {
 				class: "flog-time",
@@ -952,6 +953,7 @@ export function initFlights() {
 			kv("API Key", r.key || "—", { mono: true }),
 			kv("Generation ID", r.generation_id || "—", { mono: true }),
 			kv("Scene", r.slot, { mono: true }),
+			r.zone_id ? kv("Zone", r.zone_id, { mono: true }) : null,
 			r.step ? kv("Step", r.step) : null,
 			r.node ? kv("Node", r.node) : null,
 			kv(
@@ -1221,8 +1223,12 @@ export function initFlights() {
 // The cell/branch name out of a "<run>/<slot>/<model>" path (the row's scene).
 function sceneName(slot) {
 	if (!slot) return "—";
-	const p = String(slot).split("/");
-	if (p.length >= 3 && p[1] === "_branches")
-		return `branch:${p.slice(2).join("/")}`;
-	return p.length >= 3 ? p[1] : String(slot);
+	const raw = String(slot);
+	const source = raw.split("::generated::", 1)[0];
+	const p = source.split("/");
+	const base = p.length >= 3 && p[1] === "_branches"
+		? `branch:${p.slice(2).join("/")}`
+		: p.length >= 3 ? p[1] : source;
+	const version = raw.match(/::generated::v(.+)$/)?.[1];
+	return version ? `${base} · generated v${version}` : base;
 }

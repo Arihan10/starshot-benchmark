@@ -98,7 +98,7 @@ best-matching library asset. No prose, no markdown, no code fences.\
 """
 
 
-async def match(prompt: str) -> LibraryMatchOutput:
+async def match(prompt: str, *, node_id: str | None = None, zone_id: str | None = None) -> LibraryMatchOutput:
     catalog = _load_catalog()
     by_cat: dict[str, list[LibraryItem]] = {}
     for item in catalog:
@@ -122,6 +122,8 @@ async def match(prompt: str) -> LibraryMatchOutput:
             system=SYSTEM_LIBRARY_MATCH,
             user=user,
             output_schema=LibraryMatchOutput,
+            node_id=node_id,
+            zone_id=zone_id,
             step="library_match",
         )
     finally:
