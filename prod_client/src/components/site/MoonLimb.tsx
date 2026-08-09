@@ -131,7 +131,7 @@ export default function MoonLimb({
 			style={veil ? { maskImage: veil, WebkitMaskImage: veil } : undefined}
 		>
 			<div
-				className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-full bg-paper"
+				className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-full bg-mark"
 				style={{
 					width: d,
 					height: d,

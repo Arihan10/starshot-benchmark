@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { RefObject } from "react";
+import ScrollBox from "@/components/site/ScrollBox";
 import type { OrbitEngine } from "@/lib/orbit/engine";
 import type { Chapter, OrbitState } from "@/lib/orbit/types";
 
@@ -41,7 +42,7 @@ export default function PlacesDrawer({
 				placeholder='take me to…'
 				className='mb-2 w-full rounded-md border border-mark-16 bg-ground/50 px-2.5 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink-40 focus:border-cyan-400'
 			/>
-			<div className='min-h-0 flex-1 overflow-y-auto'>
+			<ScrollBox className='min-h-0 flex-1'>
 				{query.trim() ? (
 					results.length ? (
 						results.map((n) => (
@@ -61,7 +62,7 @@ export default function PlacesDrawer({
 				) : (
 					<ChapterList chapters={state.chapters} onGo={go} />
 				)}
-			</div>
+			</ScrollBox>
 		</div>
 	);
 }

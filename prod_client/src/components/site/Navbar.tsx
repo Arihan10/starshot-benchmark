@@ -141,12 +141,29 @@ const NAV_LEFT: { label: string; href?: string }[] = [
 // The right is no longer a list at all: it is two controls, cut to interlock —
 // see the pair at the foot of this file.
 
+/** Three steps: short, tall, medium — revealed beside Leaderboard on hover. */
+function PodiumMark({ className }: { className?: string }) {
+	return (
+		<svg
+			aria-hidden
+			viewBox="0 0 24 24"
+			fill="currentColor"
+			className={className}
+		>
+			<rect x="1.5" y="13" width="6" height="9" rx="0.5" />
+			<rect x="9" y="4" width="6" height="18" rx="0.5" />
+			<rect x="16.5" y="9" width="6" height="13" rx="0.5" />
+		</svg>
+	);
+}
+
 /**
  * The site's navbar.
  *
  * THREE COLUMNS: reading group, open berth, offer. The berth is the gap between
- * the two clusters — Masthead hangs the moon from it so the curve only starts
- * once the buttons have ended, and the bar stays straight under every control.
+ * the two clusters — Masthead hangs the moon from it (inset toward the middle)
+ * so the curve only starts once the buttons have ended, and the bar stays
+ * straight under every control.
  *
  * `gap-lg` is the air between a cluster and the berth. At a narrow window the
  * berth collapses first; the groups keep their gap rather than colliding.
@@ -209,6 +226,8 @@ export default function Navbar({
 				</Button>
 			);
 		});
+
+	const onBoard = isHere("/leaderboard");
 
 	return (
 		<header
@@ -477,22 +496,41 @@ export default function Navbar({
 			<div ref={berthRef} aria-hidden className="min-w-0" />
 
 			{/* --- the offer ------------------------------------------------------
-			    Origin's interlocking pair. Hover is the mark's own glass — see
-			    Button's sweep. */}
+			    Origin's interlocking pair. Generate's hover is the mark's glass;
+			    Leaderboard scoots its label left and opens a podium beside it. */}
 			<div className="flex items-center gap-2xs">
-				<nav
-					aria-label="SceneBench standings"
-					className="group/nav flex items-center"
-				>
+				<nav aria-label="SceneBench standings">
 					<Button
 						href="/leaderboard"
-						aria-current={
-							isHere("/leaderboard") ? "page" : undefined
-						}
+						aria-current={onBoard ? "page" : undefined}
 						variant="outline"
 						shape="upright-start"
 					>
-						{ruled("Leaderboard", isHere("/leaderboard"))}
+						{/* No underline — the hover is a scoot + reveal. The
+						    podium is width-collapsed at rest so the slab does
+						    not reserve a dead gap; on hover (and while active)
+						    the label shifts left and the mark unfolds beside it. */}
+						<span className="inline-flex items-center">
+							<span
+								className={`transition-transform duration-settle ease-out ${
+									onBoard
+										? "-translate-x-1.5"
+										: "group-hover/btn:-translate-x-1.5"
+								}`}
+							>
+								Leaderboard
+							</span>
+							<span
+								aria-hidden
+								className={`inline-flex overflow-hidden transition-[max-width,margin,opacity] duration-settle ease-out ${
+									onBoard
+										? "ml-1.5 max-w-[1.1em] opacity-100"
+										: "ml-0 max-w-0 opacity-0 group-hover/btn:ml-1.5 group-hover/btn:max-w-[1.1em] group-hover/btn:opacity-100"
+								}`}
+							>
+								<PodiumMark className="size-[1.1em] shrink-0" />
+							</span>
+						</span>
 					</Button>
 				</nav>
 				<Button

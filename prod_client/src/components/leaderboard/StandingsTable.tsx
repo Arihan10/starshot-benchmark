@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Standing } from "@/lib/leaderboard";
+import ScrollBox from "@/components/site/ScrollBox";
 import BrandMark from "./BrandMark";
 
 type Key = "name" | "elo" | "winRate" | "votes";
@@ -49,6 +50,11 @@ const TAIL = 72;
 // constant, the bottom of the table stays permanently half-erased once you have
 // scrolled to it, which reads as the list still continuing — the exact thing a
 // scroll hint is supposed to tell you is no longer true.
+//
+// THE BAR IS NOT ON THIS ELEMENT. Masking a native scrollbar (or hoping Firefox
+// will honour `scrollbar-color` as a hard rectangle) is what kept drawing the OS
+// pill here. The geometric thumb lives on ScrollBox, as a sibling of the masked
+// viewport, so the fade can cover the full width of the rows without eating it.
 const TAIL_MASK = `linear-gradient(to bottom, #000 calc(100% - var(--tail, 0) * ${TAIL}px), transparent 100%)`;
 
 
@@ -244,19 +250,21 @@ export default function StandingsTable({
 			</div>
 			</div>
 
-			{/* THE WHOLE LIST IS HERE, and scrolling is how you reach it. It used to be
-			    cut to whatever fitted the viewport with a SHOW MORE under it, which
-			    made the board's own height a thing that had to be measured — row
-			    height, header height, search height, footer height, re-measured on
-			    every resize and after the webfont landed — to answer a question the
-			    scrollbar answers for free.
+			{/* THE LIST FILLS A PAGE, and SHOW MORE asks for the next. Overflow only
+			    appears once a second page has been pulled in — the first page is
+			    measured to fit — which is why the styled bar shows up on that click
+			    and not before.
 
 			    THE FOOT IS MASKED, NOT COVERED — see TAIL_MASK. Both properties are
-			    written because the prefixed one is still what older WebKit reads. */}
-			<div
-				ref={scroller}
-				className="min-h-0 overflow-y-auto"
-				style={{ maskImage: TAIL_MASK, WebkitMaskImage: TAIL_MASK }}
+			    written because the prefixed one is still what older WebKit reads.
+			    ScrollBox owns the thumb so Firefox gets the same hard rectangle. */}
+			<ScrollBox
+				className="min-h-0 flex-1"
+				viewportRef={scroller}
+				viewportStyle={{
+					maskImage: TAIL_MASK,
+					WebkitMaskImage: TAIL_MASK,
+				}}
 			>
 				<table
 					ref={sheet}
@@ -387,7 +395,7 @@ export default function StandingsTable({
 							// The spans carry the transition themselves: a transition on the
 							// row does not cascade, and without it the type would snap while
 							// the ground behind it faded.
-							className="lift-in group/row h-[clamp(56px,5.8vh,68px)] border-b border-mark-8 transition-colors duration-[160ms] hover:bg-paper hover:[--ink-rgb:var(--paper-ink-rgb)] hover:[--mark-rgb:var(--paper-ink-rgb)] [&_span]:transition-colors [&_span]:duration-[160ms]"
+							className="lift-in group/row h-[clamp(56px,5.8vh,68px)] cursor-pointer border-b border-mark-8 transition-colors duration-[160ms] hover:bg-paper hover:[--ink-rgb:var(--paper-ink-rgb)] hover:[--mark-rgb:var(--paper-ink-rgb)] [&_span]:transition-colors [&_span]:duration-[160ms]"
 							>
 								{/* THE EDGE MARKER, and it is written as the TRIPLET rather than
 								    as `var(--color-mark)` — which is what it was, and it was
@@ -498,7 +506,7 @@ export default function StandingsTable({
 						No model or lab matches “{query.trim()}”
 					</p>
 				)}
-			</div>
+			</ScrollBox>
 
 			{/* KEPT IN LAYOUT WHEN THERE IS NOTHING MORE TO SHOW. The footer's height
 			    is one of the four measurements the row budget is computed from, so a

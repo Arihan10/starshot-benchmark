@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import AboutStage from "@/components/about/AboutStage";
+import ScrollBox from "@/components/site/ScrollBox";
 import Button from "@/components/ui/Button";
 
 export const metadata: Metadata = {
@@ -19,7 +20,10 @@ const BODY =
 	"font-sans text-[clamp(13px,1.1vw,16.5px)] font-medium leading-[1.55] text-ink-64 text-pretty";
 
 const COLUMN =
-	"flex max-h-full min-h-0 w-[min(620px,54vw)] flex-col gap-[clamp(10px,2.6vh,30px)] overflow-y-auto max-md:w-auto";
+	"max-h-full min-h-0 w-[min(620px,54vw)] max-md:w-auto";
+
+const COLUMN_PORT =
+	"flex flex-col gap-[clamp(10px,2.6vh,30px)]";
 
 // The first screen rises on mount; the rest cannot, because they are a scroll
 // away and would have played to nobody. AboutStage marks a screen the first time
@@ -48,7 +52,7 @@ export default function AboutPage() {
 	return (
 		<AboutStage>
 			<section className="relative flex h-dvh snap-start snap-always items-center justify-end overflow-hidden px-[clamp(26px,3vw,58px)] pt-[68px] pb-[40px]">
-				<div className={COLUMN}>
+				<ScrollBox className={COLUMN} viewportClassName={COLUMN_PORT}>
 					<p
 						className={`${EYEBROW} animate-[about-rise_0.6s_cubic-bezier(0.16,1,0.3,1)_0.15s_both]`}
 					>
@@ -102,7 +106,7 @@ export default function AboutPage() {
 							</li>
 						))}
 					</ol>
-				</div>
+				</ScrollBox>
 
 				<div className="pointer-events-none absolute bottom-[22px] left-[clamp(26px,3vw,58px)] flex animate-[about-rise_0.6s_cubic-bezier(0.16,1,0.3,1)_0.8s_both] flex-col items-center gap-xs">
 					<span className="font-mono text-[9.5px] font-bold tracking-[0.26em] uppercase text-ink-40">
@@ -118,7 +122,7 @@ export default function AboutPage() {
 			</section>
 
 			<section className="relative flex h-dvh snap-start snap-always items-center justify-start overflow-hidden px-[clamp(26px,3vw,58px)] pt-[68px] pb-[40px]">
-				<div className={COLUMN}>
+				<ScrollBox className={COLUMN} viewportClassName={COLUMN_PORT}>
 					<p className={`${EYEBROW} ${ARRIVE}`}>Who we are</p>
 
 					<h2
@@ -164,7 +168,7 @@ export default function AboutPage() {
 							View the leaderboard
 						</Link>
 					</div>
-				</div>
+				</ScrollBox>
 			</section>
 
 			<section className="relative flex h-dvh snap-start snap-always flex-col items-center overflow-hidden px-[clamp(26px,3vw,58px)] pt-[clamp(120px,18vh,200px)]">

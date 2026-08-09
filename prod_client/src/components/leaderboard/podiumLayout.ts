@@ -439,26 +439,22 @@ export const FOOTINGS: { rank: number; from: number; count: number }[] = FOOT.ma
 // ---------------------------------------------------------------------------
 // ONE HEIGHT SCALE, FOR THE PODIUM AND FOR THE CHALLENGER ALIKE
 //
-// This is the part that makes the hover mean anything. The three podium pillars
-// used to be authored heights — 31 / 21 / 13, chosen because they looked like a
-// podium — and a fourth pillar raised beside them from a model's rating would
-// have been measured against nothing at all. Two models could not be compared by
-// looking, which is the only thing the picture is for.
+// IDLE — the whole board. An absolute scale from a board-wide floor up to first
+// place, bent by a power curve because the top of a rating list is crowded:
+// first and second are 25 points apart in a few hundred, and a straight line
+// draws the podium as three posts of the same height.
 //
-// So every pillar on the island, the three included, is now the same function of
-// the same number. The three come out at roughly 31 / 22 / 17, which is within a
-// couple of units of the authored figures — the podium looks the way it always
-// did — and rank four comes out at 9, visibly short of third, on a scale that
-// says so honestly rather than by decoration.
-//
-// WHY A POWER CURVE AND NOT A STRAIGHT LINE. Elo at the top is close: first and
-// second here are 25 points apart in 463, and a linear scale draws them within a
-// few percent of each other — a podium of three equal posts, which tells a
-// reader nothing. The exponent stretches the top of the range apart and packs
-// the bottom, so the differences that decide the podium are the ones you can
-// see. The floor sits below the lowest rating on the board so nothing lands at
-// zero: the tail of the standings raises a short tower in the city rather than
-// no tower at all.
+// COMPARING — this race only. The scale zooms to the four models on screen, and
+// THE FRAME AROUND THEM IS A FIXED NUMBER OF ELO POINTS rather than a share of
+// the gap. That last part is the whole trick. Fit a set exactly to its frame and
+// the extremes are pinned by construction — the top of the scale IS first place
+// and the bottom IS the challenger, so both stand at the same height for every
+// selection and only the middle two carry information. Anchor one end and fix
+// the slope instead, and the other end is the one that freezes. Pad in absolute
+// Elo and NO model sits on an edge: every height is a function of the gap, so
+// walking the standings moves all four posts. Inside the window the map is
+// straight, so the space between two roofs is the points between two models, at
+// one rate for the whole picture.
 const FLOOR = 1000;
 const STUB = 2.4;
 
@@ -466,9 +462,29 @@ export const TALL = 31;
 
 const CURVE = 7;
 
-export function pillarHeight(elo: number, best: number): number {
-	const u = Math.max(0, Math.min(1, (elo - FLOOR) / Math.max(1, best - FLOOR)));
-	return STUB + (TALL - STUB) * u ** CURVE;
+// The frame, in Elo: clear air above first place and below the challenger.
+const HEADROOM = 28;
+const FOOTROOM = 34;
+
+/**
+ * Pillar height as a function of Elo.
+ *
+ * `best` is first place. Pass the challenger's Elo while comparing to zoom onto
+ * that race; omit it for the idle board-wide scale.
+ */
+export function heightScale(
+	best: number,
+	challenger?: number,
+): (elo: number) => number {
+	const racing = challenger != null;
+	const lo = racing ? challenger - FOOTROOM : FLOOR;
+	const hi = racing ? best + HEADROOM : best;
+	const span = Math.max(1, hi - lo);
+
+	return (elo) => {
+		const u = Math.max(0, Math.min(1, (elo - lo) / span));
+		return STUB + (TALL - STUB) * (racing ? u : u ** CURVE);
+	};
 }
 
 export type PillarSpec = {

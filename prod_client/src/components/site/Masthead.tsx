@@ -2,7 +2,6 @@
 
 import type { ReactNode } from "react";
 import { useLayoutEffect, useRef, useState } from "react";
-import { useMastheadShape } from "@/lib/mastheadShape";
 import Fade from "./Fade";
 import MoonLimb from "./MoonLimb";
 import Navbar, { ON_PAPER } from "./Navbar";
@@ -27,9 +26,10 @@ const UNIT = "min(0.06vw, 0.975px)";
 // by different hands. The comp states a size for this slot; that is the size.
 const TITLE_SIZE = `calc(48 * ${UNIT})`;
 
-// THE PROTRUDING MOON — a shallow segment hung from the navbar's open berth.
-// Width is measured from that berth so the arch starts only after the left
-// cluster and ends before the right; sag is the visible foot below the bar.
+// THE PROTRUDING MOON — a shallow segment centred on the bar. Half-width is the
+// tighter clearance from midline to either cluster (inset a quarter toward the
+// centre), so +x and −x match and the longer side simply sits closer to its
+// buttons; sag is the visible foot.
 const MOON_SAG = "calc(var(--spacing-xl) * 0.62)";
 
 // HOW FAR THE MIDDLE BUMP HANGS BELOW THE BAR. Same token as the moon's sag.
@@ -66,50 +66,6 @@ const LABEL_TOP = "calc(var(--spacing-2xs) + 12px)";
  */
 export const ROLL_ORIGIN = "50% -9600px";
 
-// ---------------------------------------------------------------------------
-// THE FIVE FIGURES.
-//
-// The bar's contents are the same row of controls in every one of them, dead
-// straight, and that is the point: what is being compared is only ever what the
-// PAPER does around a layout that does not move. See `mastheadShape` for the
-// switch and the reasoning behind the set.
-// ---------------------------------------------------------------------------
-
-// How far the paper turns as it ends, for the one figure that ends full-bleed on a
-// level edge. The limb's own shading follows its circle; a straight edge has to be
-// given the same darkening by hand or the paper reads as a sheet of white cut with
-// scissors.
-//
-// NOT ON THE ISLAND, which is the same edge and a different object. A slab floating
-// clear of the page has nothing to turn away INTO — the shade there reads as what
-// the house style calls a component with an altered background inside it, and the
-// thing that separates a bright slab from a black page is that it is bright.
-//
-// NOR ON THE SPLIT'S BAR, where the edge is a lie: the paper does not end at the
-// bar's foot, it carries on down the tongue. Shading it drew a band across the
-// tongue's shoulders and stepped the tone at the join.
-const EDGE_TURN = "inset 0 -22px 40px -24px rgba(9,11,16,0.34)";
-
-// THE FEATHER, and it is deliberately shallower than it wants to be. The rim can
-// dissolve over any distance at all; what bounds it is the prompt, which sits in
-// the same paper and has to stay on stock that is still opaque. This is the depth
-// the belly below is opened up by, so the fade happens entirely under the type.
-const VEIL = 30;
-const VEIL_ROOM = "24px";
-
-// THE TONGUE: the arc, cut loose from the bar and given to the arena.
-//
-// NARROW ENOUGH TO READ AS AN OBJECT rather than as a second bar — at the full
-// window it would simply be the limb again with a seam above it. The overhang
-// comes down with the width for the reason given at MoonLimb: sixty pixels either
-// side of a chord this short flattens the arc out of existence.
-const TONGUE = {
-	width: "min(58vw, 780px)",
-	height: `calc(${TITLE_SIZE} + var(--text-2xs) + var(--spacing-xl) * 0.58)`,
-	sag: 18,
-	overhang: 16,
-} as const;
-
 function Caption({ children }: { children: ReactNode }) {
 	return (
 		<span className="font-mono text-2xs tracking-[0.24em] whitespace-nowrap uppercase text-ink-40">
@@ -127,13 +83,15 @@ export default function Masthead({
 	placement?: "overlay" | "flow";
 	children: ReactNode;
 }) {
-	const shape = useMastheadShape();
 	const shellRef = useRef<HTMLDivElement>(null);
 	const berthRef = useRef<HTMLDivElement>(null);
 	const [moon, setMoon] = useState({ left: 0, width: 0 });
 
-	// The moon's chord is the navbar berth — measured, not guessed, so it stays
-	// clear of every control as the lockup and offer change width.
+	// The moon's chord is centred on the bar, not on the berth. The lockup is
+	// wider than the offer, so a berth-relative chord would sit off-centre; both
+	// ends are instead the same distance from the midline. Width is capped by the
+	// tighter side (the longer cluster) so the arch stays clear of every control
+	// and simply lands closer to the longer side.
 	useLayoutEffect(() => {
 		const shell = shellRef.current;
 		const berth = berthRef.current;
@@ -142,8 +100,13 @@ export default function Masthead({
 		const sync = () => {
 			const s = shell.getBoundingClientRect();
 			const b = berth.getBoundingClientRect();
-			const left = b.left - s.left;
-			const width = b.width;
+			const mid = s.left + s.width / 2;
+			// 0 = flush with the nearer berth edge; 1 = collapsed to the midline.
+			const inset = 0.25;
+			const half =
+				(1 - inset) * Math.min(mid - b.left, b.right - mid);
+			const left = mid - half - s.left;
+			const width = 2 * half;
 			setMoon((prev) =>
 				prev.left === left && prev.width === width
 					? prev
@@ -156,7 +119,7 @@ export default function Masthead({
 		observer.observe(shell);
 		observer.observe(berth);
 		return () => observer.disconnect();
-	}, [shape]);
+	}, []);
 
 	const frame = `pointer-events-none [&_a]:pointer-events-auto [&_button]:pointer-events-auto ${
 		placement === "overlay"
@@ -164,106 +127,17 @@ export default function Masthead({
 			: "relative flex-none"
 	}`;
 
-	// THE SLAB FLOATS FREE OF ALL FOUR EDGES, which is the whole of this figure:
-	// with no edge to meet, there is no geometry for a straight row to disagree
-	// with. The prompt cannot follow it — a slab sized to the nav has no belly to
-	// hang a title in — so it goes on the page's own black, where it is the only
-	// bright thing below the bar.
-	if (shape === "island")
-		return (
-			<div className={frame}>
-				<div className="px-sm pt-sm">
-					<div className="relative overflow-hidden rounded-[14px] bg-paper">
-						<Navbar />
-						<div className="absolute inset-0" style={ON_PAPER}>
-							<Fade
-								enter={700}
-								delay={180}
-								leave={220}
-								className="absolute inset-0 flex items-center justify-center px-lg"
-							>
-								<Caption>{label}</Caption>
-							</Fade>
-						</div>
-					</div>
-				</div>
-
-				<Fade
-					enter={700}
-					delay={240}
-					leave={220}
-					className="flex justify-center px-lg pt-sm pb-2xs"
-				>
-					<div className="flex min-w-0 max-w-[64vw] justify-center">
-						{children}
-					</div>
-				</Fade>
-			</div>
-		);
-
-	// THE BAR STANDS UP AND THE ARC MOVES DOWN A ROW. Navigation is a straight
-	// object because it is a row of straight objects; the arena is not, and gets
-	// the curve to itself — so the two never have to be the same shape. They are
-	// the same paper and meet without a seam, which is what keeps it one masthead
-	// rather than two stacked bands.
-	if (shape === "split")
-		return (
-			<div className={frame}>
-				<div className="relative bg-paper">
-					<Navbar />
-				</div>
-
-				<div
-					className="relative mx-auto"
-					style={{ width: TONGUE.width, height: TONGUE.height }}
-				>
-					<MoonLimb
-						sag={TONGUE.sag}
-						chord={(width) => width + 2 * TONGUE.overhang}
-					/>
-					<div className="absolute inset-0" style={ON_PAPER}>
-						<Fade
-							enter={700}
-							delay={180}
-							leave={220}
-							className="absolute inset-0"
-						>
-							{/* Label at the top of the tongue; prompt centred in what
-							    remains so the gaps above and below it stay equal. */}
-							<div className="absolute inset-x-0 top-2xs bottom-0 flex flex-col px-md">
-								<div className="flex flex-none justify-center">
-									<Caption>{label}</Caption>
-								</div>
-								<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
-									<div className="flex min-w-0 max-w-[52vw] justify-center">
-										{children}
-									</div>
-								</div>
-							</div>
-						</Fade>
-					</div>
-				</div>
-			</div>
-		);
-
-	const veiled = shape === "veil";
-
-	// STRAIGHT BAR + BERTH-SIZED MOON LIP. The bump is only as wide as the open
-	// track between the nav clusters, so the bar's foot stays straight under
-	// every control and the arch begins only once the buttons have ended.
+	// STRAIGHT BAR + CENTRED MOON LIP. Fill is `mark` — the same ground the vote
+	// slabs use (`Button` solid). Paper aliases mark at :root, so ON_PAPER and
+	// the bar stay one light.
 	return (
 		<div data-masthead className={frame}>
 			<div ref={shellRef} className="relative">
-				<div
-					className="relative z-10 bg-paper"
-					style={
-						shape === "flat" ? { boxShadow: EDGE_TURN } : undefined
-					}
-				>
+				<div className="relative z-10 bg-mark">
 					<Navbar berthRef={berthRef} />
 				</div>
 
-				{shape !== "flat" && moon.width > 0 && (
+				{moon.width > 0 && (
 					<div
 						className="relative z-10 -mt-px"
 						style={{
@@ -273,59 +147,35 @@ export default function Masthead({
 						}}
 					>
 						<MoonLimb
-							// Chord = berth width, sag = host height → a shallow
-							// circular segment whose flat edge is the bar's foot.
 							sag="host"
 							chord={(width) => width}
-							fade={veiled ? VEIL : undefined}
-							// Same paper as the bar — no turn-away shade on a lip
-							// this shallow, or the bump reads as a second object.
 							shade={false}
 						/>
 					</div>
 				)}
 
-				{shape !== "flat" && (
-					<div className="absolute inset-0 z-20" style={ON_PAPER}>
-						<Fade
-							enter={700}
-							delay={180}
-							leave={220}
-							className="absolute inset-0"
+				<div className="absolute inset-0 z-20" style={ON_PAPER}>
+					<Fade
+						enter={700}
+						delay={180}
+						leave={220}
+						className="absolute inset-0"
+					>
+						<div
+							className="absolute inset-x-0 bottom-0 flex flex-col px-lg"
+							style={{ top: LABEL_TOP }}
 						>
-							{/* Label pinned; prompt centred in the room below it —
-							    origin's layout, so the stack sits in the well rather
-							    than hugging the moon's foot. */}
-							<div
-								className="absolute inset-x-0 flex flex-col px-lg"
-								style={{
-									top: LABEL_TOP,
-									bottom: veiled ? VEIL_ROOM : 0,
-								}}
-							>
-								<div className="flex flex-none justify-center">
-									<Caption>{label}</Caption>
-								</div>
-								<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
-									<div className="flex min-w-0 max-w-[64vw] justify-center">
-										{children}
-									</div>
-								</div>
-							</div>
-						</Fade>
-					</div>
-				)}
-
-				{shape === "flat" && (
-					<div className="relative flex justify-center px-lg pt-sm pb-2xs">
-						<Fade enter={700} delay={180} leave={220}>
-							<div className="flex min-w-0 max-w-[64vw] flex-col items-center gap-2xs">
+							<div className="flex flex-none justify-center">
 								<Caption>{label}</Caption>
-								{children}
 							</div>
-						</Fade>
-					</div>
-				)}
+							<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+								<div className="flex min-w-0 max-w-[64vw] justify-center">
+									{children}
+								</div>
+							</div>
+						</div>
+					</Fade>
+				</div>
 			</div>
 		</div>
 	);

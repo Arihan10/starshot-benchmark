@@ -14,15 +14,13 @@
   /* EVERY COLOUR IS A TRIPLET HERE, and the theme below only ever aliases these.
      A theme entry written as a literal gets INLINED into the utilities that use
      it — `.bg-surface { background-color: #131313 }` — and once inlined there is
-     no variable left to re-point, so scoped inversions and the dev tuner both
-     fail silently on it. Written as `rgb(var(--x-rgb))` the reference survives
-     into the utility and the colour can be swapped for any subtree. */
-  /* ONE LIGHT, AND EVERY LIGHT SURFACE IS IT. The paper was a warm cream against
-     the mark's neutral 237, so the navbar, the moon and the vote slabs were three
-     different whites on one screen. The vote buttons are the reference — they are
-     the brightest thing the page has and the one it is built around — so paper is
-     now the same value, and its surface a neutral step down from it. */
-  --paper-rgb: 237 237 237;
+     no variable left to re-point, so scoped inversions fail silently on it.
+     Written as `rgb(var(--x-rgb))` the reference survives into the utility and
+     the colour can be swapped for any subtree. */
+  /* ONE LIGHT. The vote slabs (`bg-mark`) are the reference; paper is the same
+     token so the masthead cannot drift from them. Paper-ink / paper-surface are
+     the dark type and hover step used when a subtree is drawn ON that light. */
+  --paper-rgb: var(--mark-rgb);
   --paper-ink-rgb: 17 17 17;
   --paper-surface-rgb: 221 221 221;
 
@@ -48,6 +46,9 @@
   --font-mono-src: var(--font-manrope);
 
   --seam-gap: var(--spacing-md);
+
+  /* Width of the geometric thumb — ScrollBox paints it; WebKit native bars match. */
+  --scroll-size: 6px;
 }
 
 @theme inline {
@@ -182,6 +183,41 @@
 body {
   background: var(--background);
   color: var(--foreground);
+}
+
+/* NATIVE BARS WHERE WE HAVE NOT MOUNTED ScrollBox. Chromium will honour these
+   pseudos as a hard-edged mark rectangle. Firefox will not — `scrollbar-color`
+   only tints the OS widget, which stays rounded on macOS — so any surface that
+   must match the geometric bar wraps in ScrollBox (see the standings list).
+
+   THE STANDARD PROPERTIES STAY OUT OF WEBKIT'S WAY. Since Chromium 121,
+   `scrollbar-width` / `scrollbar-color` win over `::-webkit-scrollbar` on the
+   same element and silently restore the OS thin bar. */
+*::-webkit-scrollbar {
+  width: var(--scroll-size);
+  height: var(--scroll-size);
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgb(var(--mark-rgb) / 0.4);
+  border-radius: 0;
+}
+
+*::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:active {
+  background: rgb(var(--mark-rgb));
+}
+
+*::-webkit-scrollbar-corner,
+*::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
 }
 
 /* THE GLEAM IS NO LONGER A KEYFRAME AT ALL — it is a transition on the mask's

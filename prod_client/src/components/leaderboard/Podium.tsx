@@ -24,9 +24,9 @@ import {
 	DEPTH,
 	FOOTINGS,
 	GROUP_Y,
+	heightScale,
 	LABELS,
 	PILLARS,
-	pillarHeight,
 	PLATE,
 	PLATE_H,
 	RISE,
@@ -227,20 +227,6 @@ const topPlate = (c: number, s: number): string =>
 const facing = (nx: number, nz: number, c: number, s: number): number =>
 	nx * (c - s) + nz * (c + s);
 
-// HOW FAR THE ISLAND TURNS PER PIXEL DRAGGED. A shade under half a degree, so a
-// full revolution is roughly the width of the column it sits in — the island keeps
-// up with the hand without spinning away from it.
-const YAW_PER_PX = 0.0075;
-
-// WHAT IS LEFT OF A THROW AFTER A SECOND. The island keeps turning when released
-// and slows on its own; there is no snap back to the isometric, so where you leave
-// it is where it stays.
-const SPIN_DECAY = 0.12;
-
-// Below this the island is not visibly moving and the residue is dropped, so a
-// finished throw stops asking for frames.
-const SPIN_STOP = 0.02;
-
 const ETCH = "rgb(0 0 0 / 0.42)";
 
 // HOW FAR THE RANK SITS FROM THE TOP OF ITS PILLAR, in world units — measured DOWN
@@ -351,23 +337,27 @@ function Stage({
 
 	const caster = useMemo(() => new THREE.Raycaster(), []);
 
-	// EVERY POST ON THE ISLAND IS THE SAME FUNCTION OF THE SAME NUMBER, which is
-	// what lets a challenger raised beside the podium mean anything at all. The
-	// best rating on the board anchors the top of the scale, so the winner's
-	// pillar is always full height and everything else is read against it.
+	// EVERY POST IS THE SAME FUNCTION OF THE SAME NUMBER — see `heightScale`. The
+	// scale zooms onto the model being pointed at, and because the frame it keeps
+	// around the four is a fixed span of Elo rather than a share of the gap, none
+	// of them is pinned to an edge: all four move as you walk the standings.
 	const best = useMemo(
 		() => rows.reduce((n, r) => Math.max(n, r.elo), 1),
 		[rows],
+	);
+	const scale = useMemo(
+		() => heightScale(best, compare?.elo),
+		[best, compare?.elo],
 	);
 	const heights = useMemo(
 		() =>
 			PILLARS.map((p) => {
 				const row = rows.find((r) => r.rank === p.rank);
-				return row ? pillarHeight(row.elo, best) : 0;
+				return row ? scale(row.elo) : 0;
 			}),
-		[rows, best],
+		[rows, scale],
 	);
-	const rival = compare ? pillarHeight(compare.elo, best) : 0;
+	const rival = compare ? scale(compare.elo) : 0;
 
 	// THE CANVAS IS THE COLUMN, so the viewport IS the room available and there is
 	// nothing left to measure — an orthographic camera's viewport is the element's
@@ -409,6 +399,9 @@ function Stage({
 	const pillars = useRef<(THREE.Mesh | null)[]>([]);
 	const over = useRef(PILLARS.map(() => false));
 	const swell = useRef(PILLARS.map(() => 0));
+	// Live podium heights, damped toward `heights` so a rescale eases with the
+	// challenger instead of snapping the top three while the fourth rises.
+	const risen = useRef(PILLARS.map(() => 0));
 	const labels = useRef<(HTMLDivElement | null)[]>([]);
 	const stones = useRef<(THREE.Group | null)[]>([]);
 	const frame = useRef<THREE.Group>(null);
@@ -425,25 +418,16 @@ function Stage({
 	const dragLast = useRef(new THREE.Vector3());
 	const dragTime = useRef(0);
 
-	// WHERE THE ISLAND IS FACING, and how fast it is still turning. Refs rather
-	// than state: this changes every frame while a hand is on it, and re-rendering
-	// three pillars and two thousand instanced boxes to move a rotation is work
-	// the render loop is already doing for free.
-	const yaw = useRef(0);
-	const spin = useRef(0);
-	// The x the orbit gesture is measuring from, or null when nothing is turning
-	// the island by hand.
-	const turn = useRef<number | null>(null);
 	// Which side face each pillar's rank is currently riding, and how far each of
-	// the four has faded. The chosen face holds until another is clearly better —
-	// see the frame loop.
+	// the four has faded. With the island fixed at rest the front face always
+	// wins; the pick still runs so the etch path stays one place.
 	const worn = useRef(PILLARS.map(() => 0));
 	const shownFace = useRef<number[][]>(
 		PILLARS.map(() => SIDES.map((_, k) => (k === 0 ? 1 : 0))),
 	);
 	// The fit in force this frame, as a multiple of the rest fit. Labels are sized
 	// in the render pass from the rest fit, so this is what keeps them in scale
-	// with an island that is resizing itself as it turns.
+	// if the column resizes.
 	const fitNow = useRef(1);
 
 	const drawn = useRef(-1);
@@ -567,62 +551,16 @@ function Stage({
 		mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), far + CUBE);
 	}, []);
 
+	// LOOSE-BLOCK DRAG ONLY. The island itself does not turn — grabbing empty
+	// ground used to orbit it, and that gesture is gone. R3F owns the press on a
+	// block; these listeners only follow the pointer while one is held.
 	useEffect(() => {
 		const el = gl.domElement;
 		const ndc = new THREE.Vector2();
 		const at = new THREE.Vector3();
 		const flick = new THREE.Vector3();
 
-		// THE ISLAND TURNS WHEN THE GRAB MISSED A BLOCK — but the press alone does not
-		// decide that, and cannot.
-		//
-		// A block answers R3F's own pointer events, which are bound to this very same
-		// canvas, so both handlers are listening for one `pointerdown` and which of
-		// them runs first is a question about effect ordering inside the renderer
-		// rather than about anything this file controls. Ask `dragging` here and the
-		// answer is right only if R3F happened to register first.
-		//
-		// So the press only ARMS the gesture. By the time the pointer has actually
-		// moved, the press is over and every handler that was going to claim it has
-		// run — `dragging` is then a settled fact rather than a race. It also reads
-		// better: a click that never travels no longer takes hold of the island.
-		// Plain locals: the effect runs once and these listeners close over them for
-		// as long as they are attached, which is exactly the lifetime wanted.
-		const armed = { x: 0, id: -1, live: false };
-		const down = (ev: PointerEvent) => {
-			if (!settled.current) return;
-			armed.x = ev.clientX;
-			armed.id = ev.pointerId;
-			armed.live = true;
-		};
-
 		const move = (ev: PointerEvent) => {
-			if (armed.live) {
-				armed.live = false;
-				// A block took the press: this is a throw, not a turn.
-				if (!dragging.current) {
-					turn.current = armed.x;
-					spin.current = 0;
-					dragTime.current = ev.timeStamp;
-					el.setPointerCapture(armed.id);
-					el.style.cursor = "grabbing";
-				}
-			}
-
-			const from = turn.current;
-			if (from !== null) {
-				const by = (ev.clientX - from) * YAW_PER_PX;
-				turn.current = ev.clientX;
-				yaw.current += by;
-				// THE THROW IS THE LAST MOVEMENT, not an average of the drag. A
-				// pointer that travelled a long way and stopped before letting go
-				// should leave the island still, and a running mean says otherwise.
-				const gap = Math.max(4, ev.timeStamp - dragTime.current) / 1000;
-				dragTime.current = ev.timeStamp;
-				spin.current = by / gap;
-				return;
-			}
-
 			const b = dragging.current;
 			const group = model.current;
 			if (!b || !group) return;
@@ -646,12 +584,6 @@ function Stage({
 		};
 
 		const release = () => {
-			armed.live = false;
-			if (turn.current !== null) {
-				turn.current = null;
-				el.style.cursor = "";
-				return;
-			}
 			const b = dragging.current;
 			dragging.current = null;
 			el.style.cursor = "";
@@ -664,12 +596,10 @@ function Stage({
 				.multiplyScalar(speed * 0.5 + 1);
 		};
 
-		el.addEventListener("pointerdown", down);
 		el.addEventListener("pointermove", move);
 		el.addEventListener("pointerup", release);
 		el.addEventListener("pointercancel", release);
 		return () => {
-			el.removeEventListener("pointerdown", down);
 			el.removeEventListener("pointermove", move);
 			el.removeEventListener("pointerup", release);
 			el.removeEventListener("pointercancel", release);
@@ -684,27 +614,11 @@ function Stage({
 		const t = intro.current;
 		settled.current = t > 0.999;
 
-		// --- the island's heading, and everything that hangs off it -------------
-		if (turn.current === null && spin.current !== 0) {
-			yaw.current += spin.current * dt;
-			spin.current *= SPIN_DECAY ** dt;
-			if (Math.abs(spin.current) < SPIN_STOP) spin.current = 0;
-		}
-		const cos = Math.cos(yaw.current);
-		const sin = Math.sin(yaw.current);
-
-		// THE FIT IS RE-SOLVED EVERY FRAME, because turning the island changes how
-		// much room it needs. It draws up to 18% taller at three-quarters on than it
-		// does at rest, which a fit solved once for the rest pose would simply push
-		// through the top and bottom of the column — and the crown and the sole are
-		// reserved for the name plates and the exit bar, so what it would push
-		// through is the two things that must not be covered.
-		//
-		// The vertical CENTRE moves with it and is taken from the same table: the
-		// near and far coasts trade places as the island comes round, and fitting
-		// the height alone would keep it inside the column while sliding it up and
-		// down inside it.
-		const span = viewAt(yaw.current);
+		// Rest pose only — the island does not turn. Fit is still re-solved each
+		// frame so a column resize keeps the object inside the crown and sole.
+		const cos = 1;
+		const sin = 0;
+		const span = viewAt(0);
 		const solved = Math.max(
 			1e-4,
 			Math.min(
@@ -715,7 +629,7 @@ function Stage({
 		fitNow.current = solved;
 		frame.current?.scale.setScalar(solved);
 		if (model.current) {
-			model.current.rotation.y = yaw.current;
+			model.current.rotation.y = 0;
 			model.current.position.y = -span.mid / RISE;
 		}
 		// Labels are sized in the render pass against the REST fit, so this is the
@@ -756,9 +670,29 @@ function Stage({
 			const wide = 1 + (SWELL - 1) * s;
 			const tall = 1 + (LIFT - 1) * s;
 			const rise = Math.max(1e-3, easeOutBack(u) * tall);
-			mesh.scale.set(p.width * wide, heights[i] * rise, p.depth * wide);
+			risen.current[i] = THREE.MathUtils.damp(
+				risen.current[i] || heights[i],
+				heights[i],
+				9,
+				dt,
+			);
+			mesh.scale.set(
+				p.width * wide,
+				risen.current[i] * rise,
+				p.depth * wide,
+			);
 
-			stones.current[i]?.scale.set(wide, rise, wide);
+			// THE LABEL RIG SITS ON THE ROOF AND RIDES THE DAMPED HEIGHT. Anchoring
+			// it to the target instead put the rank, the mark and the name plate at
+			// the new height on the frame the pointer moved, while the post they
+			// belong to was still easing there — the caption arriving before its
+			// building. Now that a selection moves all four posts, that is every
+			// label on the island.
+			const rig = stones.current[i];
+			if (rig) {
+				rig.position.y = p.base + risen.current[i] * rise;
+				rig.scale.set(wide, rise, wide);
+			}
 
 			// WHICH SIDE THE RANK IS ON. The best-presented face wins, but only once
 			// it is clearly better than the one already carrying the number — see
@@ -868,11 +802,10 @@ function Stage({
 
 	return (
 		<group position={[0, lift, 0]}>
-		{/* THE FIT IS DRIVEN FROM THE FRAME LOOP, not from this render. It changes
-		    with the island's heading, and re-rendering the scene sixty times a second
-		    to write one scalar would cost more than the whole rotation does. The
-		    value here is the rest fit, which is what it holds until something turns
-		    it — and the number every label is sized against. */}
+		{/* THE FIT IS DRIVEN FROM THE FRAME LOOP, not from this render — so a
+		    column resize can rewrite the scale without a React pass. The value
+		    here is the rest fit, which is also the number every label is sized
+		    against. */}
 		<group ref={frame} scale={fit}>
 			<group ref={model} position={[0, GROUP_Y, 0]}>
 				<instancedMesh
@@ -1024,6 +957,10 @@ function Stage({
 					const row = rows.find((r) => r.rank === p.rank);
 					if (!row) return null;
 					const px = fit * ZOOM;
+					// THE LABEL RIG, ANCHORED ON THE PILLAR'S ROOF — everything inside is
+					// placed relative to the top face, and the frame loop rides the group
+					// up and down with the damped height. Only `x`/`z` below are final;
+					// `y` is a starting value the loop overwrites.
 					return (
 						<group
 							key={p.rank}
@@ -1042,7 +979,7 @@ function Stage({
 									key={`${nx},${nz}`}
 									position={[
 										(nx * p.width) / 2,
-										heights[i] - ETCH_INSET,
+										-ETCH_INSET,
 										(nz * p.depth) / 2,
 									]}
 									center
@@ -1070,7 +1007,7 @@ function Stage({
 							))}
 
 							<Html
-								position={[0, heights[i], 0]}
+								position={[0, 0, 0]}
 								center
 								zIndexRange={[7, 0]}
 								style={{ pointerEvents: "none" }}
@@ -1111,7 +1048,7 @@ function Stage({
 							    it up on a short window, which is exactly where the
 							    clearance is tightest. */}
 							<Html
-								position={[0, heights[i], 0]}
+								position={[0, 0, 0]}
 								center
 								zIndexRange={[7, 0]}
 								style={{ pointerEvents: "none" }}

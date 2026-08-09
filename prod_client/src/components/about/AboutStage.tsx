@@ -3,6 +3,7 @@
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
 import Fade from "@/components/site/Fade";
 import MoonAnchor from "@/components/site/MoonAnchor";
+import ScrollBox from "@/components/site/ScrollBox";
 import { VoxelDrift } from "@/components/site/VoxelSky";
 import Navbar from "@/components/site/Navbar";
 
@@ -131,18 +132,19 @@ export default function AboutStage({ children }: { children: ReactNode }) {
 				className="absolute top-0 left-0"
 			/>
 
-			<div
-				ref={scroller}
-				className="relative z-30 h-full snap-y snap-mandatory overflow-y-auto overscroll-contain"
+			<ScrollBox
+				className="relative z-30 h-full"
+				viewportRef={scroller}
+				viewportClassName="snap-y snap-mandatory overscroll-contain"
 			>
 				<Fade enter={null}>{children}</Fade>
-			</div>
+			</ScrollBox>
 
 			{/* The paper the bar runs on. Masthead supplies its own; this page mounts
 			    the bar directly, and the inverted palette is unreadable without it. */}
 			<div
 				ref={bar}
-				className="pointer-events-none absolute inset-x-0 top-0 z-30 bg-paper [&_a]:pointer-events-auto [&_button]:pointer-events-auto"
+				className="pointer-events-none absolute inset-x-0 top-0 z-30 bg-mark [&_a]:pointer-events-auto [&_button]:pointer-events-auto"
 			>
 				<Navbar />
 			</div>
