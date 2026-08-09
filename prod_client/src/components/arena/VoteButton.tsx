@@ -36,6 +36,7 @@ export default function VoteButton({
 	return (
 		<Button
 			variant="solid"
+			edge={false}
 			sweep
 			shape={side === "a" ? "start" : "end"}
 			onClick={onVote}

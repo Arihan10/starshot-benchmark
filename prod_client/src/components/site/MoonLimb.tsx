@@ -127,7 +127,7 @@ export default function MoonLimb({
         <div
             ref={hostRef}
             aria-hidden
-            className="absolute inset-0 overflow-hidden"
+            className="absolute inset-0 overflow-hidden bg-transparent"
             style={
                 veil ? { maskImage: veil, WebkitMaskImage: veil } : undefined
             }

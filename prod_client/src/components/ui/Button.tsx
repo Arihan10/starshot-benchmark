@@ -107,6 +107,13 @@ const RAKE_VAR = { "--rake": RAKE } as React.CSSProperties;
  */
 const SWEEP_MS = "420ms";
 
+// Edge width as a length the inset polygons can name. Axis-aligned `inset` on the
+// INNER layer was wrong for every raked shape: the same polygon on a smaller box
+// does not track the outer slants, so the border fattened at the tips and the
+// corners refused to meet under zoom. Both layers share the button's box; only
+// the clip vertices move in by `--btn-edge`.
+const E = "var(--btn-edge)";
+
 const SHAPE: Record<Shape, string | undefined> = {
 	square: undefined,
 	// Both edges raked the same way: a true parallelogram, leaning right.
@@ -149,6 +156,19 @@ const SHAPE: Record<Shape, string | undefined> = {
 	// Use these when the group should read as ONE shape rather than as segments.
 	"cap-start": `polygon(0 0, 100% 0, 100% 100%, ${RAKE} 100%)`,
 	"cap-end": `polygon(0 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
+};
+
+/** Same silhouettes as SHAPE with every vertex pulled in by `--btn-edge`. */
+const SHAPE_INSET: Record<Shape, string | undefined> = {
+	square: undefined,
+	standalone: `polygon(calc(${RAKE} + ${E}) ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
+	"upright-start": `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
+	"upright-end": `polygon(calc(${RAKE} + ${E}) ${E}, calc(100% - ${E}) ${E}, calc(100% - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
+	start: `polygon(${E} ${E}, calc(100% - ${RAKE} - ${E}) ${E}, calc(100% - ${E}) calc(100% - ${E}), calc(${RAKE} + ${E}) calc(100% - ${E}))`,
+	middle: `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), calc(${RAKE} + ${E}) calc(100% - ${E}))`,
+	end: `polygon(calc(${RAKE} + ${E}) ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
+	"cap-start": `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${E}) calc(100% - ${E}), calc(${RAKE} + ${E}) calc(100% - ${E}))`,
+	"cap-end": `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
 };
 
 const GROUND: Record<Variant, string> = {
@@ -194,11 +214,12 @@ const GROUND: Record<Variant, string> = {
 // like the outline had simply failed on those corners, which is exactly what had
 // happened.
 //
-// Drawn instead as a filled layer BEHIND an inset copy of the same shape: the outer
-// layer takes the border colour, the inner sits `--btn-edge` in and takes the
-// ground, and what shows between them is an edge that follows the polygon all the
-// way round, slants included. Most controls keep the 1px default; SKIP matches the
-// arena seam at `--seam-width` so its outline and the middle divider are one rule.
+// Drawn instead as a filled layer BEHIND an inset polygon on the SAME box: the
+// outer layer takes the border colour and the outer clip, the inner takes the
+// ground and SHAPE_INSET (vertices pulled in by `--btn-edge`). Shrinking the box
+// with `top/right/bottom/left` and reusing the outer clip was the bug — that is
+// not an inset shape, and the slants stopped meeting at the tips. Most controls
+// keep the 1px default; SKIP matches the arena seam at `--seam-width`.
 const EDGE: Record<Variant, string> = {
 	solid: "bg-mark",
 	ghost: "bg-mark group-hover/btn:bg-mark",
@@ -420,41 +441,36 @@ export default function Button({
 		className,
 	].join(" ");
 
+	const outerClip = SHAPE[shape];
+	// Squares have no polygon — the old axis-aligned inset is correct for them.
+	// Everything raked uses SHAPE_INSET on the shared box (see SHAPE_INSET).
+	const squareEdge = edge && shape === "square";
+	const innerClip = edge && !squareEdge ? SHAPE_INSET[shape] : outerClip;
+	const innerBox = squareEdge
+		? {
+				top: E,
+				right: E,
+				bottom: E,
+				left: E,
+			}
+		: { inset: 0 as const };
+
 	const layers = (
 		<>
-			{/* The edge, then the ground inside it. Both carry the SAME clip, so the
-			    gap between them is even all the way round — including along the
-			    slants, which is the whole reason this is two layers and not a ring.
-			    Corners stay sharp; the silhouette is the polygon alone. */}
+			{/* The edge, then the ground inside it. Both fill the same box; the inner
+			    clip is the inset polygon so the band between them follows every slant
+			    and the tips still meet. */}
 			{edge && (
 				<span
 					aria-hidden
 					className={`absolute inset-0 transition-colors duration-quick ${EDGE[variant]}`}
-					style={{ clipPath: SHAPE[shape] }}
+					style={{ clipPath: outerClip }}
 				/>
 			)}
-			{/* Sits `--btn-edge` inside the edge so the edge shows round the whole
-			    polygon — or fills the box outright when there is no edge to leave
-			    room for. Not one layer with a border: see EDGE.
-
-			    Written as four sides rather than `inset`, and as a style rather than
-			    a utility: a missing `inset-(--btn-edge)` class left this layer with
-			    no box, so only the mark edge behind it showed and SKIP went solid
-			    white. */}
 			<span
 				aria-hidden
 				className={`absolute transition-colors duration-quick ${GROUND[variant]}`}
-				style={{
-					clipPath: SHAPE[shape],
-					...(edge
-						? {
-								top: "var(--btn-edge)",
-								right: "var(--btn-edge)",
-								bottom: "var(--btn-edge)",
-								left: "var(--btn-edge)",
-							}
-						: { inset: 0 }),
-				}}
+				style={{ clipPath: innerClip, ...innerBox }}
 			/>
 			{sweep && (
 				// A LAYER, not a background swap: `background-image` does not
@@ -465,16 +481,9 @@ export default function Button({
 					aria-hidden
 					className="absolute opacity-0 transition-opacity duration-(--sweep-ms) ease-out group-hover/btn:opacity-100"
 					style={{
-						clipPath: SHAPE[shape],
+						clipPath: innerClip,
 						backgroundImage: "var(--accent-sweep)",
-						...(edge
-							? {
-									top: "var(--btn-edge)",
-									right: "var(--btn-edge)",
-									bottom: "var(--btn-edge)",
-									left: "var(--btn-edge)",
-								}
-							: { inset: 0 }),
+						...innerBox,
 					}}
 				/>
 			)}

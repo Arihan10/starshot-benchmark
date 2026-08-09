@@ -130,8 +130,14 @@ export default function Masthead({
 	// STRAIGHT BAR + CENTRED MOON LIP. Fill is `mark` — the same ground the vote
 	// slabs use (`Button` solid). Paper aliases mark at :root, so ON_PAPER and
 	// the bar stay one light.
+	//
+	// THE LIP HANGS; IT DOES NOT PUSH. In flow it added MOON_SAG to the masthead's
+	// height and the arena started below that — so left and right of the disc the
+	// page ground showed as a black bar between the white navbar and the scene.
+	// Absolute under the bar, the limb paints over the arena and the empty berth
+	// stays clear.
 	return (
-		<div data-masthead className={frame}>
+		<div data-masthead className={`${frame} z-20`}>
 			<div ref={shellRef} className="relative">
 				<div className="relative z-10 bg-mark">
 					<Navbar berthRef={berthRef} />
@@ -139,11 +145,11 @@ export default function Masthead({
 
 				{moon.width > 0 && (
 					<div
-						className="relative z-10 -mt-px"
+						className="absolute top-full -mt-px bg-transparent"
 						style={{
 							width: moon.width,
 							height: MOON_SAG,
-							marginLeft: moon.left,
+							left: moon.left,
 						}}
 					>
 						<MoonLimb
@@ -154,7 +160,15 @@ export default function Masthead({
 					</div>
 				)}
 
-				<div className="absolute inset-0 z-20" style={ON_PAPER}>
+				{/* Extends into the belly so the prompt still centres against the
+				    moon's foot, even though the lip no longer stretches the shell. */}
+				<div
+					className="absolute inset-x-0 top-0 z-20"
+					style={{
+						...ON_PAPER,
+						bottom: `calc(-1 * ${MOON_SAG})`,
+					}}
+				>
 					<Fade
 						enter={700}
 						delay={180}

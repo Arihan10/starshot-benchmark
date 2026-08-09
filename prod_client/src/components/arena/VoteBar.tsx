@@ -5,7 +5,12 @@ import type { LocalCell } from "@/lib/localScenes";
 import NextTimer from "./NextTimer";
 import RevealCard, { RISE_MS } from "./RevealCard";
 import VoteButton from "./VoteButton";
-import Button from "@/components/ui/Button";
+import Button, { RAKE_PX } from "@/components/ui/Button";
+
+// Pull each member over its neighbour by MORE than the rake. Exact rake makes the
+// shared diagonals kiss — under zoom the two antialiased edges leave a dark
+// hairline. One extra pixel lets the fills overlap and the seam disappears.
+const SEAM_PULL = RAKE_PX + 1;
 
 const SIDE_VOTING = "calc(var(--spacing-xl) * 4.3)";
 const SIDE_SKIP_HOVER = "calc(var(--spacing-xl) * 4.04375)";
@@ -34,7 +39,10 @@ function Side({
 }) {
 	return (
 		<div
-			className={`flex overflow-hidden ${
+			// Only clip once the reveal cards are in — while voting, `overflow:
+			// hidden` shears the clip-path AA off every outer vertex (the tips sit
+			// on the box edge), so the parallelogram corners look open when zoomed.
+			className={`flex ${expanded ? "overflow-hidden" : ""} ${
 				align === "right" ? "justify-end" : ""
 			}`}
 			style={{
@@ -95,9 +103,8 @@ export default function VoteBar({
 
 	return (
 		<div
-			className={`flex items-stretch ${
-				voted ? "" : "[&>*+*]:-ml-[13px]"
-			}`}
+			className={`flex items-stretch ${voted ? "" : "[&>*+*]:ml-(--vote-seam)"}`}
+			style={voted ? undefined : { ["--vote-seam" as string]: `-${SEAM_PULL}px` }}
 		>
 			<Side
 				expanded={voted}
