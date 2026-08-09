@@ -87,7 +87,7 @@ function Panel({
 						aria-label='Select scene for this panel'
 						value={sceneId(scene)}
 						onChange={(e) => onSelect(e.target.value)}
-						className='max-w-[40vw] rounded-md border border-mark-16 bg-ground/60 px-2 py-1 text-xs text-ink outline-none backdrop-blur transition hover:border-mark-40 focus:border-cyan-400'
+						className='max-w-[40vw] rounded-md border border-mark-16 bg-ground/60 px-2 py-1 text-xs text-ink outline-none backdrop-blur transition hover:border-mark-40 focus:border-accent'
 					>
 						{scenes.map((s) => (
 							<option key={sceneId(s)} value={sceneId(s)}>

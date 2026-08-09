@@ -45,11 +45,11 @@ const CRATER_LAYERS = [
 	),
 	...CRATERS.map(
 		(c) =>
-			`radial-gradient(circle ${c.size}px at ${place(c.deg, c.dist)}, rgba(9,11,16,${c.alpha}) 0%, rgba(9,11,16,${(c.alpha * 0.5).toFixed(3)}) 60%, transparent 100%)`,
+			`radial-gradient(circle ${c.size}px at ${place(c.deg, c.dist)}, rgb(var(--ground-rgb) / ${c.alpha}) 0%, rgb(var(--ground-rgb) / ${(c.alpha * 0.5).toFixed(3)}) 60%, transparent 100%)`,
 	),
 	...MARIA.map(
 		(m) =>
-			`radial-gradient(ellipse ${m.rx}px ${m.ry}px at ${place(m.deg, m.dist)}, rgba(11,14,20,${m.alpha}) 0%, rgba(11,14,20,${(m.alpha * 0.55).toFixed(3)}) 52%, transparent 100%)`,
+			`radial-gradient(ellipse ${m.rx}px ${m.ry}px at ${place(m.deg, m.dist)}, rgb(var(--ground-rgb) / ${m.alpha}) 0%, rgb(var(--ground-rgb) / ${(m.alpha * 0.55).toFixed(3)}) 52%, transparent 100%)`,
 	),
 ].join(", ");
 

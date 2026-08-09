@@ -23,17 +23,24 @@
  * actually meet it.
  */
 
-// The paper the row turns to — `--paper-rgb` in globals.css. A literal here on
-// purpose: this module runs before it has anything to read the token off, and the
-// number it needs is the one constant in the question being asked. KEEP IT IN STEP
-// with the token; it was the old warm cream for a while after the light system was
-// unified, which is a silent 0.5% error in every contrast reading taken here.
-const PAPER: [number, number, number] = [237, 237, 237];
-
 // Big enough that a thin monogram survives rasterising, small enough that reading
 // it back is free. The measurement is a weighted average over the whole mark, so
 // resolution buys nothing past the point where strokes stop dropping out.
 const RASTER = 48;
+
+/** The paper the row turns to — `--paper-rgb` / `--mark-rgb` from globals.css. */
+function paperTriplet(): [number, number, number] {
+	if (typeof window === "undefined") return [237, 237, 237];
+	// `--paper-rgb` is an alias (`var(--mark-rgb)`); read the resolved channels.
+	const raw = getComputedStyle(document.documentElement)
+		.getPropertyValue("--mark-rgb")
+		.trim();
+	const parts = raw.split(/\s+/).map(Number);
+	if (parts.length >= 3 && parts.every((n) => Number.isFinite(n))) {
+		return [parts[0], parts[1], parts[2]];
+	}
+	return [237, 237, 237];
+}
 
 // Below alpha this, a pixel is the antialiased edge of the mark rather than the
 // mark, and edge pixels are half background — they drag every average toward the
@@ -78,8 +85,6 @@ const srgbToLinear = (u: number) => {
 
 const luminance = (r: number, g: number, b: number) =>
 	0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b);
-
-const PAPER_L = luminance(...PAPER);
 
 /** Answers already paid for. The board repeats a lab across rows and re-renders on
  *  every sort and keystroke; the artwork does not change between any of those. */
@@ -210,8 +215,9 @@ async function measure(svg: SVGSVGElement): Promise<boolean> {
 	if (!weight) return false;
 
 	const L = lum / weight;
+	const paperL = luminance(...paperTriplet());
 	const contrast =
-		(Math.max(L, PAPER_L) + 0.05) / (Math.min(L, PAPER_L) + 0.05);
+		(Math.max(L, paperL) + 0.05) / (Math.min(L, paperL) + 0.05);
 
 	return contrast < MIN_CONTRAST && chroma / weight < MAX_CHROMA;
 }

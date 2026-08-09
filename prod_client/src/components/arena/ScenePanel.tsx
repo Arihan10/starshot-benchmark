@@ -1,9 +1,8 @@
 "use client";
 
-import { Fragment, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import OrbitViewer, { type OrbitViewerHandle } from "@/components/OrbitViewer";
 import type { LocalCell } from "@/lib/localScenes";
-import { buildStep } from "./buildSequence";
 import PctReadout from "./PctReadout";
 import { shatter } from "./shatter";
 
@@ -18,12 +17,8 @@ export default function ScenePanel({
 	outcome,
 	share,
 	align,
-	dividerRight,
 	role = "paired",
 	onFocusedChange,
-	built = true,
-	untuck = false,
-	roundKey,
 	warm = null,
 	commitVia,
 }: {
@@ -33,18 +28,15 @@ export default function ScenePanel({
 	outcome: Outcome;
 	share: number;
 	align: "left" | "right";
-	dividerRight?: boolean;
 	role?: "paired" | "expanded" | "pushed";
 	onFocusedChange?: (focused: boolean) => void;
-	built?: boolean;
-	untuck?: boolean;
-	roundKey?: string;
 }) {
 	const stageRef = useRef<HTMLDivElement>(null);
 	const fxRef = useRef<HTMLDivElement>(null);
 	const viewerRef = useRef<OrbitViewerHandle>(null);
 	const voted = outcome !== null;
-	const skipped = outcome === "skipped";
+	const keepSeam =
+		role === "paired" && (outcome === null || outcome === "skipped");
 
 	useEffect(() => {
 		if (outcome !== "lost") return;
@@ -79,34 +71,19 @@ export default function ScenePanel({
 			}}
 		>
 			<div ref={stageRef} className="relative isolate min-h-0 flex-1">
-				{dividerRight && role === "paired" && (outcome === null || skipped) && (
-					// eslint-disable-next-line react/jsx-key
-					<Fragment key={roundKey}>
-						<div
-							aria-hidden
-							className="pointer-events-none absolute right-0 z-10 hidden w-[3px] origin-top translate-x-1/2 bg-mark transition-[scale] md:block"
-							style={{
-								willChange: "scale",
-								// The masthead's belly bottoms out on this panel's top edge, so
-								// the seam picks up exactly where the moon's limb leaves off.
-								top: 0,
-								// Lands on the bar's top edge. The panel now runs to the foot
-								// of the page, so that is the bar's drop from the bottom plus
-								// the half-height its centre line sits above.
-								bottom:
-									"calc(var(--seam-drop, 0px) + var(--seam-break, 0px))",
-								scale: built ? "1 1" : "1 0",
-								...buildStep("ray", built),
-								...(untuck
-									? {
-											animation: `seam-untuck ${buildStep("ray", true).transitionDuration} cubic-bezier(0.16,0.84,0.28,1) ${buildStep("ray", true).transitionDelay} backwards`,
-										}
-									: null),
-							}}
-						/>
-					</Fragment>
-				)}
-				<div className="absolute inset-0">
+				{/* Keep the canvas off the centred seam. Half the rule sits in each
+				    panel; without this the WebGL layer composites through those
+				    pixels and the join reads thinner than `--seam-width`. */}
+				<div
+					className="absolute inset-0"
+					style={
+						keepSeam
+							? align === "left"
+								? { right: "calc(var(--seam-width, 3px) / 2)" }
+								: { left: "calc(var(--seam-width, 3px) / 2)" }
+							: undefined
+					}
+				>
 					<OrbitViewer
 						ref={viewerRef}
 						source={cell.source}
@@ -123,7 +100,9 @@ export default function ScenePanel({
 					className="pointer-events-none absolute inset-0 z-4 duration-540"
 					style={{
 						backgroundColor:
-							outcome === "lost" ? "rgb(0 0 0 / 0.62)" : "rgb(0 0 0 / 0)",
+							outcome === "lost"
+								? "rgb(var(--ground-rgb) / 0.62)"
+								: "rgb(var(--ground-rgb) / 0)",
 						transitionProperty: "background-color",
 					}}
 				/>

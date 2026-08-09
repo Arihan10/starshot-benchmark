@@ -7,6 +7,7 @@ import {
     useRef,
     useState,
 } from "react";
+import ArenaSeam from "@/components/arena/ArenaSeam";
 import ScenePanel, {
     SOLO_EASING,
     SOLO_TRANSITION_MS,
@@ -208,50 +209,66 @@ export default function Page() {
                         transitionTimingFunction: SOLO_EASING,
                     }}
                 >
-                    {round.cells.map((cell, i) => {
-                            const side: Side = i === 0 ? "a" : "b";
-                            return (
-                                <ScenePanel
-                                    key={side}
-                                    cell={cell}
-                                    outcome={
-                                        vote === null
-                                            ? null
-                                            : vote === "skip"
-                                                ? "skipped"
-                                                : vote === side
-                                                    ? "won"
-                                                    : "lost"
-                                    }
-                                    share={
-                                        side === "a"
-                                            ? round.leftShare
-                                            : 100 - round.leftShare
-                                    }
-                                    align={side === "a" ? "left" : "right"}
-                                    dividerRight={i === 0}
-                                    built={built}
-                                    untuck={shown > 0}
-                                    roundKey={String(shown)}
-                                    warm={side === "a" ? warmA : warmB}
-                                    commitVia={side === "a" ? commitA : commitB}
-                                    role={
-                                        toured === null
-                                            ? "paired"
-                                            : toured === side
-                                                ? "expanded"
-                                                : "pushed"
-                                    }
-                                    onFocusedChange={
-                                        true
-                                            ? side === "a"
-                                                ? onTourA
-                                                : onTourB
-                                            : undefined
-                                    }
-                                />
-                            );
-                        })}
+                    <ScenePanel
+                        cell={round.cells[0]}
+                        outcome={
+                            vote === null
+                                ? null
+                                : vote === "skip"
+                                    ? "skipped"
+                                    : vote === "a"
+                                        ? "won"
+                                        : "lost"
+                        }
+                        share={round.leftShare}
+                        align="left"
+                        warm={warmA}
+                        commitVia={commitA}
+                        role={
+                            toured === null
+                                ? "paired"
+                                : toured === "a"
+                                    ? "expanded"
+                                    : "pushed"
+                        }
+                        onFocusedChange={onTourA}
+                    />
+                    <ScenePanel
+                        cell={round.cells[1]}
+                        outcome={
+                            vote === null
+                                ? null
+                                : vote === "skip"
+                                    ? "skipped"
+                                    : vote === "b"
+                                        ? "won"
+                                        : "lost"
+                        }
+                        share={100 - round.leftShare}
+                        align="right"
+                        warm={warmB}
+                        commitVia={commitB}
+                        role={
+                            toured === null
+                                ? "paired"
+                                : toured === "b"
+                                    ? "expanded"
+                                    : "pushed"
+                        }
+                        onFocusedChange={onTourB}
+                    />
+                    {/* After both panels so it paints above their canvases. Absolute
+                        top/bottom — not a stretched empty flex column, which had no
+                        height and was why the join stayed missing. */}
+                    <ArenaSeam
+                        built={built}
+                        untuck={shown > 0}
+                        roundKey={String(shown)}
+                        shown={
+                            toured === null &&
+                            (vote === null || vote === "skip")
+                        }
+                    />
                 </div>
 
             </div>
@@ -266,7 +283,7 @@ export default function Page() {
                     <span
                         aria-hidden
                         key={built ? "build" : "collapse"}
-                        className="absolute inset-x-0 top-0 z-20 h-[3px] origin-center bg-mark"
+                        className="absolute inset-x-0 top-0 z-20 h-(--seam-width) origin-center bg-mark"
                         style={{
                             scale: "0 1",
                             animationName: ready

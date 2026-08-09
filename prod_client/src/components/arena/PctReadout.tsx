@@ -30,7 +30,7 @@ export default function PctReadout({
 				className="font-sans font-black leading-[0.86] tracking-[-0.045em] text-foreground tabular-nums"
 				style={{
 					fontSize: "var(--arena-pct, 64px)",
-					textShadow: "0 4px 26px rgba(0,0,0,0.55)",
+					textShadow: "0 4px 26px rgb(var(--ground-rgb) / 0.55)",
 				}}
 			>
 				{Math.round(share * t)}%

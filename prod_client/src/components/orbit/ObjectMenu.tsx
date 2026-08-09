@@ -41,7 +41,7 @@ export default function ObjectMenu({
 		>
 			{menu.label && (
 				<>
-					<div className='mb-1 max-w-60 truncate border-b border-mark-8 px-2 py-1.5 font-semibold text-cyan-200'>
+					<div className='mb-1 max-w-60 truncate border-b border-mark-8 px-2 py-1.5 font-semibold text-accent'>
 						{menu.label}
 					</div>
 					<MenuButton onClick={() => engine.current?.toggleMenuTargetHidden()}>
@@ -72,7 +72,7 @@ function MenuButton({ onClick, children }: { onClick: () => void; children: Reac
 		<button
 			type='button'
 			onClick={onClick}
-			className='block w-full rounded px-2 py-1.5 text-left text-ink transition hover:bg-cyan-500/20 hover:text-ink'
+			className='block w-full rounded px-2 py-1.5 text-left text-ink transition hover:bg-accent/20 hover:text-ink'
 		>
 			{children}
 		</button>

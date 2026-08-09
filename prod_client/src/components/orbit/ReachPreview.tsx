@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState, type CSSProperties } from "react";
+import { signalVar } from "@/lib/ink";
 import type { ReachPreview as ReachPreviewState } from "@/lib/orbit/types";
 import { storey } from "./labels";
 
-const REACH_ACCENT = "#ffc46b";
+const REACH_ACCENT = signalVar();
 const FLOOR_ACCENT = "#7ef2c2";
 
 const PANO_SCREEN_W = "clamp(420px, 36vw, 760px)";

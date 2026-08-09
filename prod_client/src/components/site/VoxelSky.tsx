@@ -18,7 +18,7 @@ const CUBE = {
 	box: "-0.72 -0.83 1.44 1.66",
 	faces: [
 		{
-			fill: "#e8e8e8",
+			fill: "rgb(var(--mark-rgb))",
 			points: poly([
 				[0, 1, 0],
 				[1, 1, 0],
@@ -27,7 +27,7 @@ const CUBE = {
 			]),
 		},
 		{
-			fill: "#b9b9b9",
+			fill: "rgb(var(--mark-rgb) / 0.72)",
 			points: poly([
 				[0, 0, 1],
 				[0, 1, 1],
@@ -36,7 +36,7 @@ const CUBE = {
 			]),
 		},
 		{
-			fill: "#8c8c8c",
+			fill: "rgb(var(--mark-rgb) / 0.55)",
 			points: poly([
 				[1, 0, 0],
 				[1, 1, 0],
@@ -148,7 +148,7 @@ export function Voxel({
 
 const BAR_REACH = "calc(var(--text-xs) * 5 + var(--spacing-sm) * 2)";
 
-const BELOW_BAR = `linear-gradient(to bottom, transparent 0, transparent ${BAR_REACH}, #000 calc(${BAR_REACH} + var(--spacing-lg)))`;
+const BELOW_BAR = `linear-gradient(to bottom, transparent 0, transparent ${BAR_REACH}, rgb(var(--ground-rgb)) calc(${BAR_REACH} + var(--spacing-lg)))`;
 
 // The podium and the standings hold a fixed measure down the middle. The city
 // is laid out in the gutters either side of it rather than across the window,

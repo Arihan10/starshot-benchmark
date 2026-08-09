@@ -20,7 +20,7 @@ export default function ScenePicker() {
 			aria-label="Select scene"
 			value={selected ? sceneId(selected) : ""}
 			onChange={(e) => select(e.target.value)}
-			className="max-w-[60vw] rounded-md border border-mark-16 bg-ground/40 px-2 py-1 text-xs text-ink outline-none transition hover:border-mark-40 focus:border-cyan-400"
+			className="max-w-[60vw] rounded-md border border-mark-16 bg-ground/40 px-2 py-1 text-xs text-ink outline-none transition hover:border-mark-40 focus:border-accent"
 		>
 			{groups.map(([run, runScenes]) => (
 				<optgroup key={run} label={run} className="bg-surface">

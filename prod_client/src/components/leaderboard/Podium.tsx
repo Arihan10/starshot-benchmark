@@ -10,7 +10,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import * as THREE from "three";
-import { inkColor } from "@/lib/ink";
+import { groundVar, inkColor, markColor } from "@/lib/ink";
 import BrandMark, { brandTone } from "./BrandMark";
 import { type Loose, MAX_THROW, step } from "./loose";
 import { paintSweep, PLINTH_ATTRIBUTE, sweepStops } from "./sweep";
@@ -227,7 +227,7 @@ const topPlate = (c: number, s: number): string =>
 const facing = (nx: number, nz: number, c: number, s: number): number =>
 	nx * (c - s) + nz * (c + s);
 
-const ETCH = "rgb(0 0 0 / 0.42)";
+const ETCH = groundVar(0.42);
 
 // HOW FAR THE RANK SITS FROM THE TOP OF ITS PILLAR, in world units — measured DOWN
 // from the top face rather than up from the base, which is the whole change.
@@ -504,7 +504,7 @@ function Stage({
 	const rivalTone = useMemo(
 		() =>
 			new THREE.MeshStandardMaterial({
-				color: compare ? brandTone(compare.lab) : "#ededed",
+				color: compare ? brandTone(compare.lab) : markColor(),
 				roughness: 0.68,
 				metalness: 0,
 			}),
@@ -517,7 +517,7 @@ function Stage({
 			PILLARS.map((p) => {
 				const row = rows.find((r) => r.rank === p.rank);
 				return new THREE.MeshStandardMaterial({
-					color: row ? brandTone(row.lab) : "#ededed",
+					color: row ? brandTone(row.lab) : markColor(),
 					roughness: 0.68,
 					metalness: 0,
 				});

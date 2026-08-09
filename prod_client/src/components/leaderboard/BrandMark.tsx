@@ -22,6 +22,7 @@ import {
 	Zhipu,
 } from "@lobehub/icons";
 import { useEffect, useRef, useState } from "react";
+import { inkVar, markColor } from "@/lib/ink";
 import { needsInvertOnPaper } from "./markContrast";
 
 type Mark = {
@@ -52,7 +53,7 @@ type Mark = {
  * globals.css covers the literal-vs-reference half of this, and this is the other
  * half — a reference is only live if it is resolved where it is USED.
  */
-const INK = "rgb(var(--ink-rgb))";
+const INK = inkVar();
 
 const MARKS: Record<string, Mark> = {
 	Anthropic: { Icon: Anthropic, tint: "#d97757", tone: "#d97757" },
@@ -77,7 +78,8 @@ const MARKS: Record<string, Mark> = {
 };
 
 export function brandTone(lab: string): string {
-	return MARKS[lab]?.tone ?? "#ededed";
+	// Resolved mark, not a literal — Three.js materials cannot consume `var()`.
+	return MARKS[lab]?.tone ?? markColor();
 }
 
 export default function BrandMark({

@@ -71,15 +71,15 @@ export default function FloorRail({
 							onClick={() => engine.current?.jumpToLevel(lv.level)}
 							className={`flex items-center gap-2.5 overflow-hidden whitespace-nowrap rounded-md p-1.5 text-left transition ${
 								isUnvisited
-									? "animate-[floor-unvisited_2s_ease-in-out_infinite] text-amber-100"
+									? "animate-[floor-unvisited_2s_ease-in-out_infinite] text-signal"
 									: isCurrent
-										? "bg-cyan-500/20 text-cyan-100"
+										? "bg-accent/20 text-accent"
 										: "text-ink-64 hover:bg-mark-8 hover:text-ink"
 							} ${isViewed && !isCurrent ? "ring-1 ring-inset ring-mark-16" : ""}`}
 						>
 							<span
 								className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[13px] font-semibold tabular-nums ${
-									isCurrent ? "bg-cyan-400 text-ground" : "bg-mark-8"
+									isCurrent ? "bg-accent text-ground" : "bg-mark-8"
 								}`}
 							>
 								{lv.level + 1}
@@ -93,7 +93,7 @@ export default function FloorRail({
 							</span>
 							{isCurrent && (
 								<span
-									className={`shrink-0 text-[9px] uppercase tracking-wider text-cyan-300/80 transition-opacity duration-150 ${
+									className={`shrink-0 text-[9px] uppercase tracking-wider text-accent/80 transition-opacity duration-150 ${
 										open ? "opacity-100" : "opacity-0"
 									}`}
 								>

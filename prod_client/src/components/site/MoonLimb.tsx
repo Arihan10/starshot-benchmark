@@ -36,8 +36,8 @@ const OVERHANG = 60;
 // ellipse's 0.237. Small numbers, but they are the difference between a limb that
 // curves evenly across the frame and one that turns down as it reaches the corners.
 const diameter = (chord: number, sag: number) => {
-	const hw = chord / 2;
-	return Math.round((hw * hw + sag * sag) / sag);
+    const hw = chord / 2;
+    return Math.round((hw * hw + sag * sag) / sag);
 };
 
 // THE FEATHER'S OWN CURVE, and it cannot be a straight ramp. Alpha interpolates
@@ -65,86 +65,88 @@ const FEATHER = [1, 0.52, 0.22, 0.055, 0];
  * ResizeObserver on this element is the only thing that sees them.
  */
 export default function MoonLimb({
-	sag = SAG,
-	chord = (width) => width + 2 * OVERHANG,
-	fade,
-	shade = true,
+    sag = SAG,
+    chord = (width) => width + 2 * OVERHANG,
+    fade,
+    shade = true,
 }: {
-	/**
-	 * How far the arc falls below its chord.
-	 *
-	 * `"host"` makes it the host's full height, which lands the chord's ENDS on the
-	 * host's top edge. Pair that with a chord equal to the host and the limb is a
-	 * moon segment from corner to corner; pair it with a narrower chord and the
-	 * same construction draws a body bulging out of whatever sits above it. Same
-	 * circle either way — the only difference is where the chord is.
-	 */
-	sag?: number | "host";
-	/** The chord's width, given the host's. */
-	chord?: (hostWidth: number) => number;
-	/**
-	 * Feather the rim over this many pixels instead of ending it on a line.
-	 *
-	 * STRUCK ON THE CIRCLE ITSELF — same centre, same radius, so what softens is
-	 * the limb rather than a horizontal band laid across it. A linear fade would
-	 * be level while the edge it is supposed to be dissolving is not, and would
-	 * therefore be widest at the window's edges and narrowest in the middle.
-	 */
-	fade?: number;
-	shade?: boolean;
+    /**
+     * How far the arc falls below its chord.
+     *
+     * `"host"` makes it the host's full height, which lands the chord's ENDS on the
+     * host's top edge. Pair that with a chord equal to the host and the limb is a
+     * moon segment from corner to corner; pair it with a narrower chord and the
+     * same construction draws a body bulging out of whatever sits above it. Same
+     * circle either way — the only difference is where the chord is.
+     */
+    sag?: number | "host";
+    /** The chord's width, given the host's. */
+    chord?: (hostWidth: number) => number;
+    /**
+     * Feather the rim over this many pixels instead of ending it on a line.
+     *
+     * STRUCK ON THE CIRCLE ITSELF — same centre, same radius, so what softens is
+     * the limb rather than a horizontal band laid across it. A linear fade would
+     * be level while the edge it is supposed to be dissolving is not, and would
+     * therefore be widest at the window's edges and narrowest in the middle.
+     */
+    fade?: number;
+    shade?: boolean;
 }) {
-	const hostRef = useRef<HTMLDivElement>(null);
-	const [box, setBox] = useState({ w: 1440, h: 112 });
+    const hostRef = useRef<HTMLDivElement>(null);
+    const [box, setBox] = useState({ w: 1440, h: 112 });
 
-	useEffect(() => {
-		const host = hostRef.current;
-		if (!host) return;
-		const sync = () => {
-			const w = host.offsetWidth;
-			const h = host.offsetHeight;
-			setBox((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
-		};
-		sync();
-		const observer = new ResizeObserver(sync);
-		observer.observe(host);
-		return () => observer.disconnect();
-	}, []);
+    useEffect(() => {
+        const host = hostRef.current;
+        if (!host) return;
+        const sync = () => {
+            const w = host.offsetWidth;
+            const h = host.offsetHeight;
+            setBox((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
+        };
+        sync();
+        const observer = new ResizeObserver(sync);
+        observer.observe(host);
+        return () => observer.disconnect();
+    }, []);
 
-	const d = diameter(chord(box.w), sag === "host" ? box.h : sag);
-	const r = d / 2;
+    const d = diameter(chord(box.w), sag === "host" ? box.h : sag);
+    const r = d / 2;
 
-	// The centre sits a radius above the foot of the host, which is where the disc
-	// is anchored. Absolute stops are lengths along the ray, so they describe the
-	// ring in the circle's own terms and owe nothing to the gradient's box.
-	const veil = fade
-		? `radial-gradient(circle at 50% ${Math.round(box.h - r)}px, ${FEATHER.map(
-				(alpha, i) =>
-					`rgba(0,0,0,${alpha}) ${Math.round(r - fade + (fade * i) / (FEATHER.length - 1))}px`,
-			).join(", ")})`
-		: undefined;
+    // The centre sits a radius above the foot of the host, which is where the disc
+    // is anchored. Absolute stops are lengths along the ray, so they describe the
+    // ring in the circle's own terms and owe nothing to the gradient's box.
+    const veil = fade
+        ? `radial-gradient(circle at 50% ${Math.round(box.h - r)}px, ${FEATHER.map(
+              (alpha, i) =>
+                  `rgb(var(--ground-rgb) / ${alpha}) ${Math.round(r - fade + (fade * i) / (FEATHER.length - 1))}px`,
+          ).join(", ")})`
+        : undefined;
 
-	return (
-		<div
-			ref={hostRef}
-			aria-hidden
-			className="absolute inset-0 overflow-hidden"
-			style={veil ? { maskImage: veil, WebkitMaskImage: veil } : undefined}
-		>
-			<div
-				className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-full bg-mark"
-				style={{
-					width: d,
-					height: d,
-					// THE LIMB IS SHADED, not just cut. An inset shadow hugging the bottom
-					// edge follows the circle all the way round, so the paper darkens as it
-					// turns away — which is what stops a very shallow arc reading as a flat
-					// band that happens to have a curved bottom. A feathered rim has no
-					// edge to turn on and takes none of it.
-					boxShadow: shade
-						? "inset 0 -26px 48px -22px rgba(9,11,16,0.32)"
-						: undefined,
-				}}
-			/>
-		</div>
-	);
+    return (
+        <div
+            ref={hostRef}
+            aria-hidden
+            className="absolute inset-0 overflow-hidden"
+            style={
+                veil ? { maskImage: veil, WebkitMaskImage: veil } : undefined
+            }
+        >
+            <div
+                className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-full bg-mark"
+                style={{
+                    width: d,
+                    height: d,
+                    // THE LIMB IS SHADED, not just cut. An inset shadow hugging the bottom
+                    // edge follows the circle all the way round, so the paper darkens as it
+                    // turns away — which is what stops a very shallow arc reading as a flat
+                    // band that happens to have a curved bottom. A feathered rim has no
+                    // edge to turn on and takes none of it.
+                    boxShadow: shade
+                        ? "inset 0 -26px 48px -22px rgb(var(--ground-rgb) / 0.32)"
+                        : undefined,
+                }}
+            />
+        </div>
+    );
 }

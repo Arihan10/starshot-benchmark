@@ -141,6 +141,14 @@ export default function VoteBar({
 							onFocus={() => setSkipHovered(true)}
 							onBlur={() => setSkipHovered(false)}
 							className="w-full px-xs"
+							style={
+								{
+									// Same weight as the vertical join between the two scenes —
+									// a 1px hairline here read as a different rule from the
+									// divider it sits under.
+									["--btn-edge" as string]: "var(--seam-width, 3px)",
+								}
+							}
 						>
 							Skip
 						</Button>

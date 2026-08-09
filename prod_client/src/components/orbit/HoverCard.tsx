@@ -1,11 +1,12 @@
 "use client";
 
+import { groundVar, signalVar } from "@/lib/ink";
 import type { EdgeType } from "@/lib/orbit/navGraph";
 import type { HoverPreview } from "@/lib/orbit/types";
 
 export const EDGE_META: Record<EdgeType, { label: string; verb: string; color: string }> = {
 	walk: { label: "Walk", verb: "walk over", color: "#8fd0ff" },
-	portal: { label: "Doorway", verb: "step through", color: "#ffc46b" },
+	portal: { label: "Doorway", verb: "step through", color: signalVar() },
 	vertical: { label: "Level", verb: "change level", color: "#7ef2c2" },
 	phase: { label: "Phase", verb: "phase through wall", color: "#c9a6ff" },
 	far: { label: "Travel", verb: "travel across", color: "#9aa7b4" },
@@ -19,7 +20,7 @@ export default function HoverCard({ preview }: { preview: HoverPreview }) {
 			style={{
 				left: preview.screenX,
 				top: preview.screenY,
-				borderColor: `${meta.color}66`,
+				borderColor: `color-mix(in srgb, ${meta.color} 40%, transparent)`,
 			}}
 		>
 			<div className='relative h-26 w-full bg-surface-lit'>
@@ -33,7 +34,7 @@ export default function HoverCard({ preview }: { preview: HoverPreview }) {
 				/>
 				<span
 					className='absolute left-2 top-2 rounded px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wider'
-					style={{ color: "#0b0d12", background: meta.color }}
+					style={{ color: groundVar(), background: meta.color }}
 				>
 					{meta.label}
 				</span>

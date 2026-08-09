@@ -10,11 +10,12 @@ import Link from "next/link";
  * things as the same kind of control and then finds they are not quite the same
  * shape. A component makes that impossible rather than merely discouraged.
  *
- * THE FORM IS SQUARE, SLIGHTLY SOFTENED, AND SOMETIMES LEANING. It has been a
- * chamfer and it has been a pill; both were one shape applied everywhere, which is
- * why neither said anything about the control it was on. This one carries
- * information: a button's silhouette tells you whether it stands alone or belongs
- * to a group, and where in that group it sits.
+ * THE FORM IS SHARP, AND SOMETIMES LEANING. It has been a chamfer and it has been
+ * a pill; both were one shape applied everywhere, which is why neither said
+ * anything about the control it was on. This one carries information: a button's
+ * silhouette tells you whether it stands alone or belongs to a group, and where
+ * in that group it sits. Corners stay square — a radius on a tessellated row puts
+ * a notch at every seam.
  *
  * `shape` is that. A standalone control leans — a parallelogram, both edges raked
  * the same way, which reads as a single object with a direction. A control with
@@ -194,9 +195,10 @@ const GROUND: Record<Variant, string> = {
 // happened.
 //
 // Drawn instead as a filled layer BEHIND an inset copy of the same shape: the outer
-// layer takes the border colour, the inner sits a pixel in and takes the ground, and
-// what shows between them is a one-pixel edge that follows the polygon all the way
-// round, slants included.
+// layer takes the border colour, the inner sits `--btn-edge` in and takes the
+// ground, and what shows between them is an edge that follows the polygon all the
+// way round, slants included. Most controls keep the 1px default; SKIP matches the
+// arena seam at `--seam-width` so its outline and the middle divider are one rule.
 const EDGE: Record<Variant, string> = {
 	solid: "bg-mark",
 	ghost: "bg-mark group-hover/btn:bg-mark",
@@ -284,26 +286,6 @@ const NUDGE: Partial<Record<Shape, string>> = {
 	"upright-end": "pl-[calc(var(--btn-px)+var(--rake)/2)]",
 };
 
-// WHICH CORNERS GET SOFTENED, and it is only ever the ones on the OUTSIDE of a
-// row. A radius on a seam puts a notch between two buttons that are meant to read
-// as one cut object — the join has to be a join. Standalone and square controls
-// round all four; a group rounds its two outer ends and nothing else.
-const ROUND: Record<Shape, string> = {
-	square: "rounded-[3px]",
-	standalone: "rounded-[3px]",
-	// ALL FOUR, like the parallelogram they are a variant of — a cap rounds only its
-	// outer end because its upright edge is a SEAM with the button next to it, and
-	// these have no button next to them. Rounding follows what an edge abuts, not
-	// whether it happens to be vertical.
-	"upright-start": "rounded-[3px]",
-	"upright-end": "rounded-[3px]",
-	start: "rounded-l-[3px]",
-	middle: "",
-	end: "rounded-r-[3px]",
-	"cap-start": "rounded-l-[3px]",
-	"cap-end": "rounded-r-[3px]",
-};
-
 const SIZING: Record<Variant, string> = {
 	solid: "text-sm px-[var(--btn-px)] py-sm",
 	ghost: "text-sm px-[var(--btn-px)] py-sm",
@@ -346,6 +328,7 @@ export default function Button({
 	href,
 	className = "",
 	children,
+	style: styleProp,
 	...rest
 }: {
 	variant?: Variant;
@@ -439,30 +422,39 @@ export default function Button({
 
 	const layers = (
 		<>
-			{/* The edge, then the ground a pixel inside it. Both carry the SAME clip,
-			    so the gap between them is even all the way round — including along the
+			{/* The edge, then the ground inside it. Both carry the SAME clip, so the
+			    gap between them is even all the way round — including along the
 			    slants, which is the whole reason this is two layers and not a ring.
-
-			    A HAIR OF ROUNDING on each, which survives the clip only at the corners
-			    the polygon actually passes through: the outer corners of a row, never
-			    its interior seams. That is the right place for it — the outside of a
-			    group is an edge and wants softening, the joins inside it are joins. */}
+			    Corners stay sharp; the silhouette is the polygon alone. */}
 			{edge && (
 				<span
 					aria-hidden
-					className={`absolute inset-0 transition-colors duration-quick ${ROUND[shape]} ${EDGE[variant]}`}
+					className={`absolute inset-0 transition-colors duration-quick ${EDGE[variant]}`}
 					style={{ clipPath: SHAPE[shape] }}
 				/>
 			)}
-			{/* Sits a pixel inside the edge so the edge shows as a hairline round the
-			    whole polygon — or fills the box outright when there is no edge to
-			    leave room for. Not one layer with a border: see EDGE. */}
+			{/* Sits `--btn-edge` inside the edge so the edge shows round the whole
+			    polygon — or fills the box outright when there is no edge to leave
+			    room for. Not one layer with a border: see EDGE.
+
+			    Written as four sides rather than `inset`, and as a style rather than
+			    a utility: a missing `inset-(--btn-edge)` class left this layer with
+			    no box, so only the mark edge behind it showed and SKIP went solid
+			    white. */}
 			<span
 				aria-hidden
-				className={`absolute transition-colors duration-quick ${
-					edge ? "inset-[1px]" : "inset-0"
-				} ${ROUND[shape]} ${GROUND[variant]}`}
-				style={{ clipPath: SHAPE[shape] }}
+				className={`absolute transition-colors duration-quick ${GROUND[variant]}`}
+				style={{
+					clipPath: SHAPE[shape],
+					...(edge
+						? {
+								top: "var(--btn-edge)",
+								right: "var(--btn-edge)",
+								bottom: "var(--btn-edge)",
+								left: "var(--btn-edge)",
+							}
+						: { inset: 0 }),
+				}}
 			/>
 			{sweep && (
 				// A LAYER, not a background swap: `background-image` does not
@@ -471,12 +463,18 @@ export default function Button({
 				// only way the two arrive together.
 				<span
 					aria-hidden
-					className={`absolute opacity-0 transition-opacity duration-(--sweep-ms) ease-out group-hover/btn:opacity-100 ${
-						edge ? "inset-[1px]" : "inset-0"
-					}`}
+					className="absolute opacity-0 transition-opacity duration-(--sweep-ms) ease-out group-hover/btn:opacity-100"
 					style={{
 						clipPath: SHAPE[shape],
 						backgroundImage: "var(--accent-sweep)",
+						...(edge
+							? {
+									top: "var(--btn-edge)",
+									right: "var(--btn-edge)",
+									bottom: "var(--btn-edge)",
+									left: "var(--btn-edge)",
+								}
+							: { inset: 0 }),
 					}}
 				/>
 			)}
@@ -484,15 +482,18 @@ export default function Button({
 		</>
 	);
 
+	// `--btn-edge` defaults here; callers (SKIP) override via `style`. `style` is
+	// pulled out of `rest` above so a spread cannot clobber the merged object.
 	const style = {
 		...RAKE_VAR,
 		"--sweep-ms": SWEEP_MS,
 		"--btn-px": PAD[variant],
-		...rest.style,
+		"--btn-edge": "1px",
+		...styleProp,
 	} as React.CSSProperties;
 
 	return href ? (
-		<Link href={href} className={shell} style={style} {...(rest as object)}>
+		<Link href={href} className={shell} {...(rest as object)} style={style}>
 			{layers}
 		</Link>
 	) : (

@@ -9,6 +9,11 @@
 
   --mark-rgb: 237 237 237;
 
+  /* THE LIGHT THAT MUST NOT INVERT. The masthead re-points `--ink-rgb` /
+     `--mark-rgb` for type on paper; the wordmark gleam has to stay the page's
+     bright highlight through that swap, so it reads its own triplet. */
+  --gleam-rgb: 237 237 237;
+
   --moon-rgb: var(--mark-rgb);
 
   /* EVERY COLOUR IS A TRIPLET HERE, and the theme below only ever aliases these.
@@ -33,6 +38,16 @@
   --rise-rgb: 53 196 106;
   --fall-rgb: 229 52 43;
 
+  /* Warm attention cue — unvisited floors, portal-adjacent chrome. Kept off the
+     edge-type hex table so UI can re-point it without touching WebGL markers. */
+  --signal-rgb: 255 196 107;
+
+  /* Accent-sweep mid stops — tinted off mark so the button glass has chroma. */
+  --sweep-1-rgb: 230 240 255;
+  --sweep-2-rgb: 216 220 245;
+  --sweep-3-rgb: 230 213 230;
+  --sweep-4-rgb: 251 220 210;
+
   /* THE FACE IS LIT, NOT TINTED. These were a cool blue, a mid violet and a warm
      salmon, which made the moon the one large light shape on the page that was not
      the page's light colour. All three now read the mark, so the disc keeps its
@@ -46,6 +61,11 @@
   --font-mono-src: var(--font-manrope);
 
   --seam-gap: var(--spacing-md);
+
+  /* THE ARENA'S RULE WEIGHT — the vertical join between the two scenes, the
+     hairline that draws across the vote bar, and SKIP's outline all share it so
+     none of them can drift from the others. */
+  --seam-width: 3px;
 
   /* Width of the geometric thumb — ScrollBox paints it; WebKit native bars match. */
   --scroll-size: 6px;
@@ -74,21 +94,22 @@
 
   --color-rise: rgb(var(--rise-rgb));
   --color-fall: rgb(var(--fall-rgb));
+  --color-signal: rgb(var(--signal-rgb));
 
   --color-accent-deep: rgb(var(--accent-deep-rgb));
 
   --moon-surface:
     radial-gradient(
       circle at 40% 30%,
-      rgb(255 255 255 / 0.4) 0%,
-      rgb(255 255 255 / 0.12) 36%,
+      rgb(var(--mark-rgb) / 0.4) 0%,
+      rgb(var(--mark-rgb) / 0.12) 36%,
       transparent 64%
     ),
     radial-gradient(
       circle at 50% 48%,
       transparent 50%,
-      rgb(38 38 38 / 0.15) 80%,
-      rgb(38 38 38 / 0.36) 100%
+      rgb(var(--surface-lit-rgb) / 0.15) 80%,
+      rgb(var(--surface-lit-rgb) / 0.36) 100%
     ),
     linear-gradient(
       104deg,
@@ -123,10 +144,10 @@
   );
 
   --sweep-0: rgb(var(--mark-rgb));
-  --sweep-1: #e6f0ff;
-  --sweep-2: #d8dcf5;
-  --sweep-3: #e6d5e6;
-  --sweep-4: #fbdcd2;
+  --sweep-1: rgb(var(--sweep-1-rgb));
+  --sweep-2: rgb(var(--sweep-2-rgb));
+  --sweep-3: rgb(var(--sweep-3-rgb));
+  --sweep-4: rgb(var(--sweep-4-rgb));
   --accent-sweep: linear-gradient(
     104deg,
     var(--sweep-0) 0%,
@@ -369,12 +390,12 @@ body {
 @keyframes floor-unvisited {
   0%,
   100% {
-    background-color: rgb(255 196 107 / 0.1);
-    box-shadow: 0 0 0 0 rgb(255 196 107 / 0);
+    background-color: rgb(var(--signal-rgb) / 0.1);
+    box-shadow: 0 0 0 0 rgb(var(--signal-rgb) / 0);
   }
   50% {
-    background-color: rgb(255 196 107 / 0.26);
-    box-shadow: 0 0 9px 2px rgb(255 196 107 / 0.5);
+    background-color: rgb(var(--signal-rgb) / 0.26);
+    box-shadow: 0 0 9px 2px rgb(var(--signal-rgb) / 0.5);
   }
 }
 

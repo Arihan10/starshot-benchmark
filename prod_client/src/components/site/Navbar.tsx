@@ -358,18 +358,12 @@ export default function Navbar({
 									// in this bar — and would have surfaced as an intermittent
 									// dead animation the moment they differed, which is exactly
 									// what lighting the pass requires.
-									color: "#ffffff",
-									// THE BLOOM, as the comp sets it. Written as literals rather
-									// than as `rgb(var(--ink-rgb) / 0.9)`, which is what the comp
-									// says: the comp's masthead is cream drawn with LITERAL dark
-									// type on a page whose ink token is still the black page's
-									// near-white, so that token reads 237 there. This bar gets
-									// its cream by re-pointing the token instead, so the same
-									// expression here would resolve to 17 and paint a black halo
-									// round a white gleam. Same intent, and the literal is the
-									// only form of it that survives the inversion.
+									// `--gleam-rgb`, not `--ink-rgb` / `--mark-rgb`: this bar
+									// re-points those two for dark type on paper, and a gleam
+									// that followed them would bloom black around white letters.
+									color: "rgb(var(--gleam-rgb))",
 									textShadow:
-										"0 0 5px rgba(237,237,237,0.9), 0 0 13px rgba(195,205,255,0.55), 0 0 26px rgba(122,104,178,0.4)",
+										"0 0 5px rgb(var(--gleam-rgb) / 0.9), 0 0 13px rgb(var(--accent-rgb) / 0.55), 0 0 26px rgb(var(--accent-deep-rgb) / 0.4)",
 									maskImage: GLOW_WINDOW,
 									WebkitMaskImage: GLOW_WINDOW,
 									// TALLER THAN THE TEXT, on purpose. The bloom spills well

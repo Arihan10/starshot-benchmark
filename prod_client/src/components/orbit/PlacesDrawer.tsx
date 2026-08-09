@@ -40,7 +40,7 @@ export default function PlacesDrawer({
 				value={query}
 				onChange={(e) => setQuery(e.target.value)}
 				placeholder='take me to…'
-				className='mb-2 w-full rounded-md border border-mark-16 bg-ground/50 px-2.5 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink-40 focus:border-cyan-400'
+				className='mb-2 w-full rounded-md border border-mark-16 bg-ground/50 px-2.5 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink-40 focus:border-accent'
 			/>
 			<ScrollBox className='min-h-0 flex-1'>
 				{query.trim() ? (
@@ -50,7 +50,7 @@ export default function PlacesDrawer({
 								key={n.index}
 								type='button'
 								onClick={() => go(n.index)}
-								className='block w-full truncate rounded px-2 py-1.5 text-left text-xs text-ink transition hover:bg-cyan-500/20 hover:text-ink'
+								className='block w-full truncate rounded px-2 py-1.5 text-left text-xs text-ink transition hover:bg-accent/20 hover:text-ink'
 							>
 								{n.name ?? `node ${n.index + 1}`}
 								{n.zone ? <span className='text-ink-40'> · {n.zone}</span> : null}
@@ -86,7 +86,7 @@ function ChapterList({
 					key={c.zone || c.firstIndex}
 					type='button'
 					onClick={() => onGo(c.firstIndex)}
-					className='flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs text-ink transition hover:bg-cyan-500/20 hover:text-ink'
+					className='flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs text-ink transition hover:bg-accent/20 hover:text-ink'
 				>
 					<span className='min-w-0 truncate'>{c.zone || "unzoned"}</span>
 					<span className='shrink-0 text-[9px] tabular-nums text-ink-40'>{c.count}</span>

@@ -166,7 +166,9 @@ export function shatter(
 				backgroundImage: src ? `url("${src}")` : "none",
 				backgroundSize: `${width}px ${height}px`,
 				backgroundPosition: `${(-(x0 / 100) * width).toFixed(2)}px ${(-(y0 / 100) * height).toFixed(2)}px`,
-				backgroundColor: src ? "transparent" : "rgba(150,155,170,0.22)",
+				backgroundColor: src
+					? "transparent"
+					: "rgb(var(--mark-rgb) / 0.22)",
 				clipPath: `polygon(${tri
 					.map(
 						(p) =>

@@ -28,6 +28,7 @@ import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 import { CopyShader } from "three/examples/jsm/shaders/CopyShader.js";
+import { groundColor } from "@/lib/ink";
 import { loadGLB } from "./loaders";
 import {
 	DUMMY_TEX,
@@ -204,7 +205,7 @@ function buildReticle(): HTMLDivElement {
 		pointerEvents: "none",
 		zIndex: "4",
 		opacity: "0",
-		filter: "drop-shadow(0 0 1px rgba(0,0,0,0.9))",
+		filter: "drop-shadow(0 0 1px rgb(var(--ground-rgb) / 0.9))",
 		transition: "opacity 120ms linear",
 	});
 	const off = RETICLE_GAP + RETICLE_ARM / 2;
@@ -220,7 +221,7 @@ function buildReticle(): HTMLDivElement {
 			position: "absolute",
 			width: `${w}px`,
 			height: `${h}px`,
-			background: "#fff",
+			background: "rgb(var(--mark-rgb))",
 			transform: `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`,
 		});
 		el.appendChild(tick);
@@ -721,7 +722,7 @@ export class OrbitEngine {
 		Object.assign(this.travelFade.style, {
 			position: "absolute",
 			inset: "0",
-			background: "#0e0f12",
+			background: "rgb(var(--ground-rgb))",
 			opacity: "0",
 			pointerEvents: "none",
 			zIndex: "1",
@@ -1126,7 +1127,7 @@ export class OrbitEngine {
 		const m = Math.sin(Math.PI * MathUtils.clamp(t, 0, 1));
 		if (this.reducedMotion) {
 			this.canvas.style.filter = "none";
-			this.travelFade.style.background = "#0e0f12";
+			this.travelFade.style.background = "rgb(var(--ground-rgb))";
 			this.travelFade.style.opacity = (m * 0.55).toFixed(3);
 			this.iris.style.opacity = "0";
 			return;
@@ -1141,12 +1142,11 @@ export class OrbitEngine {
 						: m * 7;
 		this.canvas.style.filter =
 			blurPx > 0.002 ? `blur(${blurPx.toFixed(2)}px)` : "none";
+		// Phase keeps a cool wash; everything else is the page ground.
 		const tint =
 			type === "phase"
-				? "#0b2a44"
-				: type === "far"
-					? "#0a0c14"
-					: "#0e0f12";
+				? "color-mix(in srgb, rgb(var(--accent-deep-rgb)) 55%, rgb(var(--ground-rgb)))"
+				: "rgb(var(--ground-rgb))";
 		this.travelFade.style.background = tint;
 		const fadeAmp =
 			type === "phase"
@@ -1160,7 +1160,7 @@ export class OrbitEngine {
 		if (type === "vertical") {
 			const gap =
 				Math.abs(Math.cos(Math.PI * MathUtils.clamp(t, 0, 1))) * 130;
-			this.iris.style.background = `radial-gradient(circle at 50% 50%, transparent ${gap.toFixed(1)}%, #05070d ${(gap + 7).toFixed(1)}%)`;
+			this.iris.style.background = `radial-gradient(circle at 50% 50%, transparent ${gap.toFixed(1)}%, rgb(var(--ground-rgb)) ${(gap + 7).toFixed(1)}%)`;
 			this.iris.style.opacity = "1";
 		} else {
 			this.iris.style.opacity = "0";
@@ -3714,7 +3714,7 @@ export class OrbitEngine {
 		this.renderer.setScissorTest(true);
 		this.renderer.setViewport(x, y, ins.w, ins.h);
 		this.renderer.setScissor(x, y, ins.w, ins.h);
-		this.renderer.setClearColor(0x000000, 1);
+		this.renderer.setClearColor(new Color(groundColor()), 1);
 		this.renderer.clear(true, true, false);
 		this.renderer.render(this.inspectScene, this.inspectCam);
 		this.renderer.setScissorTest(false);
@@ -4251,8 +4251,8 @@ export class OrbitEngine {
 				transform: "translate(-50%, -140%)",
 				padding: "1px 6px",
 				borderRadius: "5px",
-				background: "rgba(10,12,20,0.82)",
-				color: "#cfe6ff",
+				background: "rgb(var(--ground-rgb) / 0.82)",
+				color: "rgb(var(--accent-rgb))",
 				font: "600 10px ui-sans-serif, system-ui, sans-serif",
 				whiteSpace: "nowrap",
 				pointerEvents: "none",

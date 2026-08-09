@@ -143,7 +143,7 @@ export default function Minimap({
 							aspectRatio: 1,
 							clipPath: CONE_CLIP,
 							background:
-								"radial-gradient(circle at 50% 50%, rgba(214,222,232,0.50) 0%, rgba(214,222,232,0.28) 18%, rgba(214,222,232,0.10) 42%, rgba(214,222,232,0) 72%)",
+								"radial-gradient(circle at 50% 50%, rgb(var(--mark-rgb) / 0.50) 0%, rgb(var(--mark-rgb) / 0.28) 18%, rgb(var(--mark-rgb) / 0.10) 42%, rgb(var(--mark-rgb) / 0) 72%)",
 							mixBlendMode: "screen",
 							transform: "translate(-50%, -50%)",
 						}}
@@ -162,9 +162,10 @@ export default function Minimap({
 							left: `${lab.leftPct}%`,
 							top: `${lab.topPct}%`,
 							fontSize: "var(--text-xs)",
-							textShadow: "0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.8)",
+							textShadow:
+								"0 1px 3px rgb(var(--ground-rgb) / 0.95), 0 0 8px rgb(var(--ground-rgb) / 0.8)",
 						}}
-						className='absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded px-1 py-0.5 text-center font-medium leading-tight text-ink transition hover:bg-cyan-400/25 hover:text-ink'
+						className='absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded px-1 py-0.5 text-center font-medium leading-tight text-ink transition hover:bg-accent/25 hover:text-ink'
 					>
 						{lab.label}
 					</button>
@@ -174,18 +175,20 @@ export default function Minimap({
 					.map((pt) => (
 						<span
 							key={pt.index}
-							style={{ left: `${pt.leftPct}%`, top: `${pt.topPct}%` }}
-							className={`pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-mark bg-cyan-400 ${
+							style={{
+								left: `${pt.leftPct}%`,
+								top: `${pt.topPct}%`,
+								boxShadow: flash
+									? "0 0 10px 4px rgb(var(--accent-rgb) / 0.95)"
+									: "0 0 6px 2px rgb(var(--accent-rgb) / 0.7)",
+							}}
+							className={`pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-mark bg-accent ${
 								expanded ? "h-3.5 w-3.5" : "h-2.5 w-2.5"
-							} ${
-								flash
-									? "shadow-[0_0_10px_4px_rgba(34,211,238,0.95)]"
-									: "shadow-[0_0_6px_2px_rgba(34,211,238,0.7)]"
 							}`}
 						/>
 					))}
 				{!onCurrentFloor && (
-					<div className='pointer-events-none absolute bottom-1 left-1 rounded bg-ground/65 px-1 py-0.5 text-[8px] uppercase tracking-wider text-cyan-200'>
+					<div className='pointer-events-none absolute bottom-1 left-1 rounded bg-ground/65 px-1 py-0.5 text-[8px] uppercase tracking-wider text-accent'>
 						{storey(levelWord, view.level)} · you are on {currentLevel + 1}
 					</div>
 				)}
