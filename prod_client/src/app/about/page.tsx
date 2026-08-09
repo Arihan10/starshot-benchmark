@@ -155,7 +155,7 @@ export default function AboutPage() {
 						style={{ ["--lift-delay" as string]: "240ms" }}
 					>
 						{/* #TODO: no destination yet — link to Starshot's site when ready. */}
-						<Button variant="solid" sweep shape="standalone" href="/">
+						<Button variant="cta" sweep shape="standalone" href="/">
 							Starshot Labs
 							<span aria-hidden className="ml-xs text-[13px]">
 								↗

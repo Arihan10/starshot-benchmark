@@ -1,4 +1,7 @@
+"use client";
+
 import Link from "next/link";
+import { useLayoutEffect, useRef, useState } from "react";
 
 /**
  * The button. There is one, and everything pressable is it.
@@ -51,8 +54,16 @@ import Link from "next/link";
  * control appear beside the only one meant to be solid; the flood is gone and the
  * name went with it, because a variant named for a fill it no longer performs is
  * worse than no name at all.
+ *
+ * `solid` IS THE VOTE SLAB — white on the black page, no obligation to carry an
+ * edge. `cta` IS THE OFFER (Generate, and the same shape on about/faq): filled,
+ * edged, and allowed to sweep without the glass erasing its border. Sharing one
+ * variant made every solid tweak to the arena silently rewrite the masthead CTA.
  */
-type Variant = "solid" | "ghost" | "outline" | "quiet";
+type Variant = "solid" | "cta" | "ghost" | "outline" | "quiet";
+
+/** `true` = full perimeter; `"y"` = top and bottom only (SKIP); `false` = none. */
+type Edge = boolean | "y";
 
 /**
  * Where this control sits, which decides its silhouette.
@@ -114,66 +125,257 @@ const SWEEP_MS = "420ms";
 // the clip vertices move in by `--btn-edge`.
 const E = "var(--btn-edge)";
 
-const SHAPE: Record<Shape, string | undefined> = {
-	square: undefined,
-	// Both edges raked the same way: a true parallelogram, leaning right.
-	standalone: `polygon(${RAKE} 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
+/**
+ * HOW FAR A FILL IS PAINTED PAST THE CLIP THAT SHAPES IT, in px.
+ *
+ * A layer whose paint ENDS where its clip does is antialiased twice at that
+ * boundary — once for the fill's own edge, once for the clip — and the two
+ * coverages MULTIPLY. Along a flat edge both are 1 and nothing shows. At a tip
+ * they are both fractional: a vertex sitting on the box corner came out at
+ * roughly a third of the coverage it should have, and the point read as bitten
+ * off. Painting from a box this much larger keeps the fill's own edge out of
+ * the way, so the clip is the only thing drawing the silhouette.
+ *
+ * Any value past a pixel works; this is comfortably clear of the AA footprint
+ * at every zoom and is cut away regardless.
+ */
+const BLEED = 8;
+const BLEED_BOX = { inset: -BLEED } as const;
 
-	// STANDALONE, BUT WITH ONE EDGE STOOD UP. The parallelogram above leans at both
-	// ends, which is right for a control floating in the middle of a page and wrong
-	// for one that TERMINATES something — the navbar's pair ends the bar, and a slant
-	// on its outermost edge reads as the bar having been cut short rather than
-	// finished. The suffix names WHICH END IS UPRIGHT, so it reads at the call site:
-	// `upright-end` stands its right edge up, `upright-start` its left.
-	//
-	// THE RAKED EDGE KEEPS THE PARALLELOGRAM'S LEAN, top vertex outboard of bottom —
-	// which is why these are their own entries and not the caps below. A cap rakes
-	// the OTHER way (bottom outboard), so `cap-start` would have stood the CTA's
-	// right edge up correctly and then leaned its left edge against the Leaderboard's
-	// right instead of alongside it: the gap between the two would have opened into a
-	// V rather than staying the constant slanted seam it is. Same figure, mirrored
-	// rake, and only one of the two keeps the pair parallel.
-	"upright-start": `polygon(0 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
-	"upright-end": `polygon(${RAKE} 0, 100% 0, 100% 100%, 0 100%)`,
-	// THE ROW WIDENS UPWARD. Each shape's protruding vertex is at the TOP, so the
-	// group's outline is an inverted trapezoid — broad along its top edge, drawn in
-	// underneath. The other way round it sat like a plinth, which is a shape that
-	// wants something standing ON it; inverted it reads as a panel the page is
-	// looking down at, which is what a control bar under two scenes should be.
-	//
-	// `start` leans left and `end` leans right, so the pair opens away from the
-	// middle and the whole row is symmetric about its centre.
-	start: `polygon(0 0, calc(100% - ${RAKE}) 0, 100% 100%, ${RAKE} 100%)`,
-	// The inverted trapezoid: the shape left between two parallelograms leaning
-	// away from each other, wider along the top than the bottom.
-	middle: `polygon(0 0, 100% 0, calc(100% - ${RAKE}) 100%, ${RAKE} 100%)`,
-	end: `polygon(${RAKE} 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
+/**
+ * THE INNER SILHOUETTE — the same figure held in by `--btn-edge`, drawn all in
+ * CSS.
+ *
+ * A UNIFORM BAND CANNOT BE MADE BY PULLING VERTICES IN BY `(e, e)`: on a slant
+ * the perpendicular is shorter than the horizontal by the rake angle, so that
+ * band thins along the rake and the tips miss. The correct horizontal offset for
+ * a raked vertex is `e·√(r² + h²)/h` give or take `e·r/h` — larger at the
+ * PROTRUDING end of the edge, smaller at the recessed one.
+ *
+ * NEITHER TERM MENTIONS THE WIDTH. That is the whole reason this can be CSS: the
+ * only measured quantity is the control's HEIGHT, which the Leaderboard's unfold
+ * does not change, so `%` carries the width and nothing has to be rewritten as
+ * the slab grows. Measuring the width instead is what made that edge shimmer —
+ * the outer silhouette was `%` and the inner was pixels, and a fraction of a
+ * pixel between them is a border of visibly different weights.
+ *
+ * `--edge-k` and `--edge-t` are those two ratios, published by useRakeGeometry.
+ */
+const IN_BIG = `calc(${E} * (var(--edge-k) + var(--edge-t)))`;
+const IN_SMALL = `calc(${E} * (var(--edge-k) - var(--edge-t)))`;
 
-	// THE CAPS: only the OUTER edge is raked, the inner one left vertical. A row of
-	// cap-start, squares, cap-end has one continuous trapezoid for a silhouette —
-	// the ends slope away and everything between them is a plain rectangle — which
-	// is a different figure from a row of parallelograms, where every seam leans.
-	// Use these when the group should read as ONE shape rather than as segments.
-	"cap-start": `polygon(0 0, 100% 0, 100% 100%, ${RAKE} 100%)`,
-	"cap-end": `polygon(0 0, 100% 0, calc(100% - ${RAKE}) 100%, 0 100%)`,
+/**
+ * A vertex, named rather than measured: which of the four x positions it sits
+ * at, and whether it is on the top or the bottom edge.
+ *
+ * x — 0: left, 1: left + rake, 2: right − rake, 3: right.
+ * y — 0: top, 1: bottom.
+ *
+ * ONE TABLE, TWO POLYGONS. The outer figure and its inset were separate literal
+ * lists and drifted apart every time a shape was touched; both are now read off
+ * this.
+ */
+type Anchor = readonly [0 | 1 | 2 | 3, 0 | 1];
+
+const FIGURE: Record<Shape, readonly Anchor[] | null> = {
+	square: null,
+	standalone: [
+		[1, 0],
+		[3, 0],
+		[2, 1],
+		[0, 1],
+	],
+	"upright-start": [
+		[0, 0],
+		[3, 0],
+		[2, 1],
+		[0, 1],
+	],
+	"upright-end": [
+		[1, 0],
+		[3, 0],
+		[3, 1],
+		[0, 1],
+	],
+	start: [
+		[0, 0],
+		[2, 0],
+		[3, 1],
+		[1, 1],
+	],
+	middle: [
+		[0, 0],
+		[3, 0],
+		[2, 1],
+		[1, 1],
+	],
+	end: [
+		[1, 0],
+		[3, 0],
+		[2, 1],
+		[0, 1],
+	],
+	"cap-start": [
+		[0, 0],
+		[3, 0],
+		[3, 1],
+		[1, 1],
+	],
+	"cap-end": [
+		[0, 0],
+		[3, 0],
+		[2, 1],
+		[0, 1],
+	],
 };
 
-/** Same silhouettes as SHAPE with every vertex pulled in by `--btn-edge`. */
-const SHAPE_INSET: Record<Shape, string | undefined> = {
-	square: undefined,
-	standalone: `polygon(calc(${RAKE} + ${E}) ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
-	"upright-start": `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
-	"upright-end": `polygon(calc(${RAKE} + ${E}) ${E}, calc(100% - ${E}) ${E}, calc(100% - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
-	start: `polygon(${E} ${E}, calc(100% - ${RAKE} - ${E}) ${E}, calc(100% - ${E}) calc(100% - ${E}), calc(${RAKE} + ${E}) calc(100% - ${E}))`,
-	middle: `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), calc(${RAKE} + ${E}) calc(100% - ${E}))`,
-	end: `polygon(calc(${RAKE} + ${E}) ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
-	"cap-start": `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${E}) calc(100% - ${E}), calc(${RAKE} + ${E}) calc(100% - ${E}))`,
-	"cap-end": `polygon(${E} ${E}, calc(100% - ${E}) ${E}, calc(100% - ${RAKE} - ${E}) calc(100% - ${E}), ${E} calc(100% - ${E}))`,
-};
+/** `polygon()` for a figure, either on the silhouette or held in by the edge. */
+function figureClip(shape: Shape, inner: boolean): string | undefined {
+	const figure = FIGURE[shape];
+	if (!figure) return undefined;
+
+	const points = figure.map(([ax, ay], i) => {
+		const onLeft = ax < 2;
+		const base = ax === 0 ? "0px" : ax === 1 ? RAKE : ax === 2 ? `calc(100% - ${RAKE})` : "100%";
+		const y = ay === 0 ? "0px" : "100%";
+		if (!inner) return `${base} ${y}`;
+
+		// The other end of this vertex's SIDE edge — the neighbour at the other
+		// y. Vertical side (same x) insets by the edge width; a raked one insets
+		// by more at whichever end protrudes.
+		const [px, py] = figure[(i + 1) % figure.length];
+		const partner = py === ay ? figure[(i + figure.length - 1) % figure.length] : ([px, py] as Anchor);
+		const dx =
+			partner[0] === ax
+				? E
+				: (onLeft ? ax < partner[0] : ax > partner[0])
+					? IN_BIG
+					: IN_SMALL;
+
+		const x = onLeft
+			? ax === 0
+				? dx
+				: `calc(${base} + ${dx})`
+			: `calc(${base} - ${dx})`;
+		return `${x} ${ay === 0 ? E : `calc(100% - ${E})`}`;
+	});
+
+	return `polygon(${points.join(", ")})`;
+}
+
+/**
+ * The two clips, read off the one table.
+ *
+ * `standalone` rakes both edges the same way: a true parallelogram, leaning
+ * right.
+ *
+ * STANDALONE, BUT WITH ONE EDGE STOOD UP. The parallelogram leans at both ends,
+ * which is right for a control floating in the middle of a page and wrong for
+ * one that TERMINATES something — the navbar's pair ends the bar, and a slant on
+ * its outermost edge reads as the bar having been cut short rather than
+ * finished. The suffix names WHICH END IS UPRIGHT: `upright-end` stands its
+ * right edge up, `upright-start` its left.
+ *
+ * THE RAKED EDGE KEEPS THE PARALLELOGRAM'S LEAN, top vertex outboard of bottom —
+ * which is why these are their own entries and not the caps. A cap rakes the
+ * OTHER way (bottom outboard), so `cap-start` would have stood the CTA's right
+ * edge up correctly and then leaned its left edge against the Leaderboard's
+ * right instead of alongside it: the gap between the two would have opened into
+ * a V rather than staying the constant slanted seam it is.
+ *
+ * THE ROW WIDENS UPWARD. `start` / `middle` / `end` each put their protruding
+ * vertex at the TOP, so the group's outline is an inverted trapezoid — broad
+ * along its top edge, drawn in underneath. The other way round it sat like a
+ * plinth, which is a shape that wants something standing ON it. `start` leans
+ * left and `end` leans right, so the pair opens away from the middle and the row
+ * is symmetric about its centre.
+ *
+ * THE CAPS rake only their OUTER edge and leave the inner one vertical, so a row
+ * of cap-start, squares, cap-end has ONE continuous trapezoid for a silhouette
+ * rather than a seam at every join.
+ *
+ * THE TIPS SIT ON THE BOX, and they have to. A clip-path can only take paint
+ * away — pushing a vertex past `100%` does not extend the fill, it moves the cut
+ * outside it, and what is left is the element's own square edge with no
+ * antialiasing at all. Fills are bled past the clip instead; see BLEED.
+ */
+const SHAPE = Object.fromEntries(
+	(Object.keys(FIGURE) as Shape[]).map((s) => [s, figureClip(s, false)]),
+) as Record<Shape, string | undefined>;
+
+const SHAPE_INNER = Object.fromEntries(
+	(Object.keys(FIGURE) as Shape[]).map((s) => [s, figureClip(s, true)]),
+) as Record<Shape, string | undefined>;
+
+/**
+ * Publishes the two slant ratios the inner clip is written in terms of.
+ *
+ * THIS IS THE WHOLE OF THE JAVASCRIPT NOW. Both silhouettes are CSS, so nothing
+ * has to be rewritten as a control resizes — which is what the Leaderboard's
+ * shimmering right edge was. Its slab widens as the podium mark unfolds; with
+ * the outer figure in `%` and the inner one in measured pixels, the two
+ * disagreed by whatever the observer was behind by, and the band between them
+ * breathed. `--edge-k` and `--edge-t` depend only on the rake and the HEIGHT,
+ * and the unfold does not change the height, so they are written once and stay
+ * true for every frame of it.
+ *
+ * MEASURED OFF THE LAYER, NOT THE CONTROL. `ResizeObserver` skips non-replaced
+ * inline elements, and an `<a>` — every `href` button, the Leaderboard included
+ * — is one. Observing the host silently never called back. The paint host is
+ * absolutely positioned, so it is blockified and reports real sizes.
+ *
+ * `borderBoxSize` is fractional and untransformed; `offsetWidth` rounds, and a
+ * rounded height put the ratios slightly off on tall controls.
+ */
+function useRakeGeometry(shape: Shape, active: boolean) {
+	const boxRef = useRef<HTMLSpanElement>(null);
+	// THE HEIGHT, ROUNDED TO THE PIXEL — and the rounding is the whole point.
+	//
+	// State is only safe here because the ratios move with the HEIGHT, so a
+	// width animation can observe, compare, and return without touching the
+	// tree. Kept RAW that comparison is far too sensitive to hold: `--edge-t`
+	// shifts by about 6e-3 per pixel of height, so a hundredth of a pixel of
+	// wobble — which a hover transition on a neighbouring box is more than
+	// capable of producing — already reads as a change and re-renders. The inner
+	// clip then re-derives mid-hover, and because the flat edges inset by a
+	// plain `--btn-edge` and only the RAKED one is written in terms of these
+	// ratios, the slant is the one edge that visibly shifts. That was the
+	// Leaderboard's jitter.
+	//
+	// Half a pixel of height moves the inset by under a thousandth of one, so
+	// rounding costs nothing and makes the value stable. Re-setting the same
+	// number is a no-op in React, so hovering re-renders nothing at all.
+	const [height, setHeight] = useState(0);
+
+	useLayoutEffect(() => {
+		const box = boxRef.current;
+		if (!active || shape === "square" || !box) return;
+
+		const read = (h: number) => {
+			if (h >= 1) setHeight(Math.round(h));
+		};
+
+		read(box.offsetHeight);
+		const ro = new ResizeObserver(([entry]) => {
+			const size = entry.borderBoxSize?.[0];
+			read(size ? size.blockSize : box.offsetHeight);
+		});
+		ro.observe(box);
+		return () => ro.disconnect();
+	}, [active, shape]);
+
+	// Unmeasured, the ratios describe a square corner — which makes the inner
+	// clip the plain `(e, e)` pull. Wrong on a slant by a fraction of a pixel,
+	// right everywhere else, and correct the moment the height is known.
+	return {
+		boxRef,
+		k: height ? Math.hypot(RAKE_PX, height) / height : 1,
+		t: height ? RAKE_PX / height : 0,
+	};
+}
 
 const GROUND: Record<Variant, string> = {
-	// Ink ground, ground-coloured text — the one thing on the page brighter than the
-	// moon.
+	// Vote slab on the black page — the one thing brighter than the moon.
 	//
 	// NO HOVER GROUND HERE, deliberately. Every solid button on the site lights up
 	// by fading a copy of the mark's sweep over itself, and this used to ALSO swap
@@ -182,6 +384,10 @@ const GROUND: Record<Variant, string> = {
 	// gradient over the next 260, which reads as the hover landing twice. The sweep
 	// is the hover; a solid button that wants one supplies the layer.
 	solid: "bg-mark",
+	// The offer (Generate). Same paint tokens as solid so ON_PAPER still inverts it
+	// to a dark slab on the masthead, but a separate rank so arena tweaks cannot
+	// silently rewrite it — and so its edge can stay visible under the sweep.
+	cta: "bg-mark",
 	// BLACK, and it STAYS black. SKIP sits between two white slabs and a grey ground
 	// between them reads as a third, muddier state; pure black with a white edge
 	// reads as the absence of a choice, which is what it means. It used to lift to
@@ -205,23 +411,19 @@ const GROUND: Record<Variant, string> = {
 	quiet: "bg-transparent",
 };
 
-// THE BORDER IS A LAYER, NOT A RING — and it has to be.
+// THE BORDER IS A STROKE, NOT A RING — and for raked shapes it has to be.
 //
-// `inset-ring` and `border` are both drawn against the BOX, and every one of these
-// controls is clipped to a polygon that leaves the box at its raked edges. So the
-// ring rendered along four sides the shape does not have, and the two slanted edges
-// — the ones that make the shape recognisable — had no border at all. It looked
-// like the outline had simply failed on those corners, which is exactly what had
-// happened.
+// `inset-ring` and `border` are drawn against the BOX, and every raked control is
+// clipped to a polygon that leaves the box at its slanted edges. The ring ran
+// along four sides the shape does not have; the slants had no border at all.
 //
-// Drawn instead as a filled layer BEHIND an inset polygon on the SAME box: the
-// outer layer takes the border colour and the outer clip, the inner takes the
-// ground and SHAPE_INSET (vertices pulled in by `--btn-edge`). Shrinking the box
-// with `top/right/bottom/left` and reusing the outer clip was the bug — that is
-// not an inset shape, and the slants stopped meeting at the tips. Most controls
-// keep the 1px default; SKIP matches the arena seam at `--seam-width`.
+// Square controls still use a ground layer inset by `--btn-edge`. Raked controls
+// paint an SVG polygon with a centred stroke and clip the host to the silhouette,
+// so the visible hairline is uniform on every side — see useRakeGeometry. Most
+// controls keep the 1px default; SKIP matches the arena seam at `--seam-width`.
 const EDGE: Record<Variant, string> = {
 	solid: "bg-mark",
+	cta: "bg-mark",
 	ghost: "bg-mark group-hover/btn:bg-mark",
 	// The hairline is the whole of this control's edge and it is never anything
 	// else — the shape it draws is what the hover moves, not the colour.
@@ -245,6 +447,7 @@ const TEXT: Record<Variant, string> = {
 	// #ffff00 measures ~1.07:1 and simply vanished — worth measuring any pairing
 	// before committing to it rather than judging by eye on one background.
 	solid: "font-sans text-ground font-black",
+	cta: "font-sans text-ground font-black",
 	ghost: "font-sans text-ink font-black",
 	// GHOST'S TYPE, TO THE LETTER, because the two are one object at rest and the
 	// navbar's board has to measure against the offer beside it. It used to cross to
@@ -309,8 +512,9 @@ const NUDGE: Partial<Record<Shape, string>> = {
 
 const SIZING: Record<Variant, string> = {
 	solid: "text-sm px-[var(--btn-px)] py-sm",
+	cta: "text-sm px-[var(--btn-px)] py-sm",
 	ghost: "text-sm px-[var(--btn-px)] py-sm",
-	// The navbar pair has to measure as a pair, so this is solid's sizing to the
+	// The navbar pair has to measure as a pair, so this is the CTA's sizing to the
 	// letter rather than a copy of ghost's that happens to match today.
 	outline: "text-sm px-[var(--btn-px)] py-sm",
 	// TIGHT, because the navbar's width is the moon's width. The disc has to fit the
@@ -336,6 +540,7 @@ const SIZING: Record<Variant, string> = {
 // add to it rather than restate it.
 const PAD: Record<Variant, string> = {
 	solid: "var(--spacing-md)",
+	cta: "var(--spacing-md)",
 	ghost: "var(--spacing-md)",
 	outline: "var(--spacing-md)",
 	quiet: "var(--spacing-xs)",
@@ -354,13 +559,14 @@ export default function Button({
 }: {
 	variant?: Variant;
 	/**
-	 * Whether to draw the hairline edge.
+	 * How to draw the hairline edge.
 	 *
-	 * On by default, because a control needs an outline to read as one. SKIP turns it
-	 * off: it is the black cut between two white slabs, and the slabs' own edges
-	 * already describe it — an outline there drew a box around the gap.
+	 * On by default (full perimeter), because a control needs an outline to read as
+	 * one. `"y"` is top and bottom only — SKIP sits between two white slabs, so a
+	 * left/right edge would draw a second seam on top of theirs; the horizontal
+	 * rules are what mark it as a cut. `false` draws none.
 	 */
-	edge?: boolean;
+	edge?: Edge;
 	shape?: Shape;
 	/**
 	 * Light up in the mark's own gradient on hover.
@@ -387,6 +593,23 @@ export default function Button({
 	 */
 	href?: string;
 } & Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, "href">) {
+	const edgeAll = edge === true;
+	const edgeY = edge === "y";
+	// NO PERIMETER EDGE (A/B wins), or rules only (SKIP): the SHELL is the shape.
+	// Ground and clip both sit on it, so the silhouette is one paint under one
+	// antialiased cover, and the hit area is the polygon rather than the box.
+	// A second clipped child over the same tip is what stepped the vote corners.
+	const shellFill = (edge === false || edgeY) && shape !== "square";
+
+	const outerClip = SHAPE[shape];
+	const squareEdge = edgeAll && shape === "square";
+	const rakedEdge = edgeAll && shape !== "square";
+	const { boxRef, k, t } = useRakeGeometry(shape, rakedEdge);
+	const insetBox = { top: E, right: E, bottom: E, left: E };
+	// The figure held in by one edge width. Raked controls clip their ground to
+	// it; every sweep insets to it so the border stands under the glass.
+	const innerClip = squareEdge ? undefined : SHAPE_INNER[shape];
+
 	const shell = [
 				// The type is part of the control, not a choice at the call site: heavy,
 				// tracked, capitals.
@@ -395,7 +618,11 @@ export default function Button({
 				// a text link: ABOUT, FAQ and ARENA are words in a row, not buttons, and
 				// at 900 they shouted over the wordmark beside them. See TEXT.
 				"tracking-[0.05em] whitespace-nowrap uppercase",
-				"group/btn relative cursor-pointer border-0 bg-transparent",
+				// NEVER THE SHELL'S OWN BACKGROUND on a clipped control. A
+				// background paints to the border box, and the box edge is exactly
+				// where the tips are — see BLEED. Shell-filled controls paint from
+				// an oversized child instead.
+				"group/btn relative cursor-pointer appearance-none rounded-none border-0 bg-transparent",
 				SIZING[variant],
 				NUDGE[shape] ?? "",
 				TEXT[variant],
@@ -441,49 +668,109 @@ export default function Button({
 		className,
 	].join(" ");
 
-	const outerClip = SHAPE[shape];
-	// Squares have no polygon — the old axis-aligned inset is correct for them.
-	// Everything raked uses SHAPE_INSET on the shared box (see SHAPE_INSET).
-	const squareEdge = edge && shape === "square";
-	const innerClip = edge && !squareEdge ? SHAPE_INSET[shape] : outerClip;
-	const innerBox = squareEdge
-		? {
-				top: E,
-				right: E,
-				bottom: E,
-				left: E,
-			}
-		: { inset: 0 as const };
-
 	const layers = (
 		<>
-			{/* The edge, then the ground inside it. Both fill the same box; the inner
-			    clip is the inset polygon so the band between them follows every slant
-			    and the tips still meet. */}
-			{edge && (
+			{/* Square: axis-aligned edge ring via an inset ground box. */}
+			{squareEdge && (
+				<>
+					<span
+						aria-hidden
+						className={`absolute inset-0 transition-colors duration-quick ${EDGE[variant]}`}
+					/>
+					<span
+						aria-hidden
+						className={`absolute transition-colors duration-quick ${GROUND[variant]}`}
+						style={insetBox}
+					/>
+				</>
+			)}
+			{/* RAKED: TWO CLIPS OFF ONE REFERENCE BOX. The host takes the `%`
+			    silhouette and holds the edge colour, bled past it so the clip is
+			    the only edge drawn (see BLEED); the ground sits inside on the
+			    same figure held in by `--btn-edge`. Both are CSS against the same
+			    box, so no width can arrive at one of them before the other — the
+			    band between them is the border, and it cannot breathe. */}
+			{rakedEdge && (
+				<span
+					ref={boxRef}
+					aria-hidden
+					className="absolute inset-0"
+					style={{ clipPath: outerClip }}
+				>
+					<span
+						className={`absolute transition-colors duration-quick ${EDGE[variant]}`}
+						style={BLEED_BOX}
+					/>
+					<span
+						className={`absolute inset-0 transition-colors duration-quick ${GROUND[variant]}`}
+						style={{ clipPath: innerClip }}
+					/>
+				</span>
+			)}
+			{/* THE GROUND OF A SHELL-FILLED CONTROL, painted past the silhouette
+			    on every side so the shell's clip is the only edge drawn at the
+			    tips. See BLEED. */}
+			{shellFill && (
 				<span
 					aria-hidden
-					className={`absolute inset-0 transition-colors duration-quick ${EDGE[variant]}`}
-					style={{ clipPath: outerClip }}
+					className={`absolute ${GROUND[variant]}`}
+					style={BLEED_BOX}
 				/>
 			)}
-			<span
-				aria-hidden
-				className={`absolute transition-colors duration-quick ${GROUND[variant]}`}
-				style={{ clipPath: innerClip, ...innerBox }}
-			/>
+			{/* Top/bottom only — children of a clipped shell, so the rules stop at
+			    the slants and never stroke the left/right edges. Bled sideways and
+			    outward for the same reason as the ground; the overhang is clipped. */}
+			{edgeY && (
+				<>
+					<span
+						aria-hidden
+						className={`absolute ${EDGE[variant]}`}
+						style={
+							shellFill
+								? {
+										top: -BLEED,
+										left: -BLEED,
+										right: -BLEED,
+										height: `calc(${E} + ${BLEED}px)`,
+									}
+								: { top: 0, left: 0, right: 0, height: E }
+						}
+					/>
+					<span
+						aria-hidden
+						className={`absolute ${EDGE[variant]}`}
+						style={
+							shellFill
+								? {
+										bottom: -BLEED,
+										left: -BLEED,
+										right: -BLEED,
+										height: `calc(${E} + ${BLEED}px)`,
+									}
+								: { bottom: 0, left: 0, right: 0, height: E }
+						}
+					/>
+				</>
+			)}
 			{sweep && (
 				// A LAYER, not a background swap: `background-image` does not
 				// interpolate, so a gradient set on hover would snap in while
 				// everything around it eased. Fading a copy over the ground is the
 				// only way the two arrive together.
+				//
+				// Edged: held in to the inner figure so the border stands under the
+				// glass. Shell-filled (A/B wins): no clip and bled past the
+				// silhouette — the shell is the shape, and a glass edge that
+				// stopped ON it would put a second antialiased cover on the tips.
 				<span
 					aria-hidden
-					className="absolute opacity-0 transition-opacity duration-(--sweep-ms) ease-out group-hover/btn:opacity-100"
+					className={`absolute opacity-0 transition-opacity duration-(--sweep-ms) ease-out group-hover/btn:opacity-100 ${
+						squareEdge || shellFill ? "" : "inset-0"
+					}`}
 					style={{
-						clipPath: innerClip,
 						backgroundImage: "var(--accent-sweep)",
-						...innerBox,
+						...(squareEdge ? insetBox : null),
+						...(shellFill ? BLEED_BOX : { clipPath: innerClip }),
 					}}
 				/>
 			)}
@@ -498,6 +785,13 @@ export default function Button({
 		"--sweep-ms": SWEEP_MS,
 		"--btn-px": PAD[variant],
 		"--btn-edge": "1px",
+		// The slant ratios the inner figure is written in terms of, inherited by
+		// every layer below. See useRakeGeometry.
+		"--edge-k": k,
+		"--edge-t": t,
+		// A/B wins and SKIP: the shell IS the shape. One clip, one cover, and a
+		// hit area that stops at the slant instead of at the box.
+		...(shellFill ? { clipPath: outerClip } : null),
 		...styleProp,
 	} as React.CSSProperties;
 

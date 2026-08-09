@@ -30,11 +30,11 @@ import Image from "next/image";
  * the second copy is the same decoded image.
  */
 export default function LogoMark({ className }: { className?: string }) {
-	return (
-		// `aria-hidden`: the wordmark beside it already says SceneBench, and a
-		// screen reader does not need to be told twice.
-		<span aria-hidden className={`relative block ${className ?? ""}`}>
-			{/* THE FLAT STATE, AND IT IS A FILL RATHER THAN A FILTER.
+    return (
+        // `aria-hidden`: the wordmark beside it already says SceneBench, and a
+        // screen reader does not need to be told twice.
+        <span aria-hidden className={`relative block ${className ?? ""}`}>
+            {/* THE FLAT STATE, AND IT IS A FILL RATHER THAN A FILTER.
 
 			    This was the artwork under `brightness(0) invert(1)` — a filter chain
 			    whose only possible output is white, so the mark was the last thing on
@@ -42,11 +42,11 @@ export default function LogoMark({ className }: { className?: string }) {
 			    instead (the glint below already works this way), it is a `bg-mark`
 			    rectangle showing through the logo's own alpha, so it takes whatever the
 			    mark currently is and needs no second artwork. */}
-			<span className="absolute inset-0 [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain]">
-				<span className="absolute inset-0 bg-mark transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:linear-gradient(#000_0_0),radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:center,130%_50%] [mask-repeat:no-repeat] [mask-size:100%_100%,215%_100%] [mask-composite:subtract] group-hover/mark:[mask-position:center,0%_50%]" />
-			</span>
+            <span className="absolute inset-0 [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain]">
+                <span className="absolute inset-0 bg-mark transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:linear-gradient(#000_0_0),radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:center,130%_50%] [mask-repeat:no-repeat] [mask-size:100%_100%,215%_100%] [mask-composite:subtract] group-hover/mark:[mask-position:center,0%_50%]" />
+            </span>
 
-			{/* THE COLOUR, uncovered by the terminator. The mask is twice the width of
+            {/* THE COLOUR, uncovered by the terminator. The mask is twice the width of
 			    the mark and slides from one end to the other, so what crosses the face
 			    is the ellipse's soft edge — and because the mask keeps travelling past
 			    the far limb, the colour is left fully lit rather than half-covered.
@@ -73,16 +73,16 @@ export default function LogoMark({ className }: { className?: string }) {
 			    transparent boundary clears the left edge once the position passes
 			    126.4%, and 130% takes that with a little room. Same trap as the
 			    wordmark's gleam, which is solved the same way in Navbar. */}
-			<Image
-				src="/logo.png"
-				alt=""
-				fill
-				sizes="86px"
-				priority
-				className="object-contain transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:130%_50%] [mask-repeat:no-repeat] [mask-size:215%_100%] group-hover/mark:[mask-position:0%_50%]"
-			/>
+            <Image
+                src="/logo.png"
+                alt=""
+                fill
+                sizes="86px"
+                priority
+                className="object-contain transition-[mask-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [mask-image:radial-gradient(72%_150%_at_10%_50%,#000_0_58%,transparent_80%)] [mask-position:130%_50%] [mask-repeat:no-repeat] [mask-size:215%_100%] group-hover/mark:[mask-position:0%_50%]"
+            />
 
-			{/* THE GLINT. Masked to the artwork's own silhouette so the highlight stays
+            {/* THE GLINT. Masked to the artwork's own silhouette so the highlight stays
 			    on the glass instead of sweeping a rectangle across the header, and
 			    positioned so that at both ends of its travel the bright band sits off
 			    the mark entirely — it exists only in passing, which is what a specular
@@ -99,9 +99,7 @@ export default function LogoMark({ className }: { className?: string }) {
 			    and never re-pointed, so it stays light in every subtree — which is what
 			    a highlight has to be. It is 236 against ink's 237, so this is invisibly
 			    different on the black pages and correct on this one. */}
-			<span
-				className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgb(var(--paper-rgb)_/_0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]"
-			/>
-		</span>
-	);
+            <span className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgb(var(--paper-rgb)_/_0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]" />
+        </span>
+    );
 }

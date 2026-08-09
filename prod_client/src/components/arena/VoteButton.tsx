@@ -41,7 +41,9 @@ export default function VoteButton({
 			shape={side === "a" ? "start" : "end"}
 			onClick={onVote}
 			disabled={disabled}
-			className="group/vote relative flex w-full items-center justify-center disabled:cursor-default disabled:opacity-40"
+			// `z-10` puts both slabs above SKIP so its diagonal cannot paint over
+			// their tips — and both, so the bar stays symmetric. See VoteBar.
+			className="group/vote relative z-10 flex w-full items-center justify-center disabled:cursor-default disabled:opacity-40"
 			style={{ animation: "content-swap 400ms ease both" }}
 		>
 			<span className="relative flex items-center gap-sm">

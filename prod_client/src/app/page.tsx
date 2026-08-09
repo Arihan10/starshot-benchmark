@@ -16,7 +16,8 @@ import { PairGate } from "@/components/arena/pairGate";
 import { buildStep } from "@/components/arena/buildSequence";
 import Composer from "@/components/arena/Composer";
 import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
-import Masthead, { ROLL_ORIGIN, Title } from "@/components/site/Masthead";
+import CurvedPrompt, { usePromptChord } from "@/components/CurvedPrompt";
+import Masthead from "@/components/site/Masthead";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
 type Side = "a" | "b";
@@ -30,6 +31,9 @@ export default function Page() {
     const [{ shown, target }, setRound] = useState({ shown: 0, target: 0 });
     const round = LOCAL_ROUNDS[shown % LOCAL_ROUNDS.length];
     const turning = shown !== target;
+    const promptText = "\u201c" + round.prompt + "\u201d";
+    // Moon chord tracks the prompt; Masthead clamps to the navbar max.
+    const promptChord = usePromptChord(promptText);
 
     useEffect(() => {
         if (!turning) return;
@@ -169,21 +173,28 @@ export default function Page() {
             <Masthead
                 label="Who built it better?"
                 placement="flow"
+                chord={promptChord}
             >
-                {/* THE PIVOT HAS TO BE ON THIS ELEMENT, not on anything around it:
-                    `transform-origin` applies to the box being transformed and is
-                    not inherited, so it belongs wherever the animation does. */}
-                <h1
-                    key={round.id}
-                    style={{ transformOrigin: ROLL_ORIGIN }}
-                    className={`${
-                        turning
-                            ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
-                            : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
-                    }`}
-                >
-                    <Title>{'\u201c' + round.prompt + '\u201d'}</Title>
-                </h1>
+                {({ moonRadius, rollOrigin, rollDeg }) => (
+                    // THE PIVOT HAS TO BE ON THIS ELEMENT, not on anything around
+                    // it: `transform-origin` applies to the box being transformed
+                    // and is not inherited. Origin is the moon disc's centre so
+                    // the caption rolls along the limb instead of sliding flat.
+                    <h1
+                        key={round.id}
+                        style={{
+                            transformOrigin: rollOrigin,
+                            ["--prompt-roll-deg" as string]: rollDeg,
+                        }}
+                        className={`m-0 w-full min-w-0 ${
+                            turning
+                                ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
+                                : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
+                        }`}
+                    >
+                        <CurvedPrompt text={promptText} radius={moonRadius} />
+                    </h1>
+                )}
             </Masthead>
             </div>
 
@@ -308,7 +319,16 @@ export default function Page() {
                             transitionDelay: buildStep("wipe", built).transitionDelay,
                             transitionTimingFunction: buildStep("wipe", built)
                                 .transitionTimingFunction,
-                            clipPath: built ? "inset(0 0 0 0)" : "inset(0 0 100% 0)",
+                            // THE WIPE ONLY EVER MOVES THE BOTTOM EDGE, so the other
+                            // three are held OUTSIDE the box. On `inset(0)` the rect's
+                            // top and sides land exactly on the slabs' outer tips —
+                            // those vertices sit on the box corners — and a rectangular
+                            // clip shears the antialiasing off them, which is what
+                            // turned each point into a short vertical stub. Held out at
+                            // -8px the reveal is identical and the tips are interior.
+                            clipPath: built
+                                ? "inset(-8px -8px -8px -8px)"
+                                : "inset(-8px -8px 100% -8px)",
                             pointerEvents: composing ? "none" : "auto",
                         }}
                     >

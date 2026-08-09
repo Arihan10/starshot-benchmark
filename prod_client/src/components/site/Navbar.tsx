@@ -46,14 +46,14 @@ import Button from "@/components/ui/Button";
 // to `--text-sm` instead — a different clamp with different breakpoints — they
 // agreed at 1440 and were 8% out at either end of the range.
 const WORDMARK_TYPE =
-	"font-display font-extrabold text-[length:calc(var(--lockup)*2.05)] leading-none tracking-[0.015em] whitespace-nowrap text-mark";
+    "font-display font-extrabold text-[length:calc(var(--lockup)*2.05)] leading-none tracking-[0.015em] whitespace-nowrap text-mark";
 
 // The travelling window, in mask terms: opaque at its centre, feathered to nothing
 // well before either end. Everything inside it is lit, so the softness of these
 // edges IS the softness of the glow — a hard-edged window would switch letters on
 // and off as it passed.
 const GLOW_WINDOW =
-	"linear-gradient(100deg, transparent 26%, rgba(0,0,0,0.55) 40%, #000 50%, rgba(0,0,0,0.55) 60%, transparent 74%)";
+    "linear-gradient(100deg, transparent 26%, rgba(0,0,0,0.55) 40%, #000 50%, rgba(0,0,0,0.55) 60%, transparent 74%)";
 
 // WHERE THE LIGHT WAITS, AND WHERE IT ENDS UP — and both are well outside the
 // word, which is the change that lets the whole effect be a transition.
@@ -127,116 +127,137 @@ const GLEAM_EASE = "cubic-bezier(0.4,0,0.55,1)";
 // built from the rgb triplets, so they have to be named here too: quiet's hover
 // ground and the active underline would otherwise stay tuned for a black bar.
 export const ON_PAPER = {
-	"--ground-rgb": "var(--paper-rgb)",
-	"--ink-rgb": "var(--paper-ink-rgb)",
-	"--mark-rgb": "var(--paper-ink-rgb)",
-	"--surface-rgb": "var(--paper-surface-rgb)",
-	"--accent-rgb": "var(--accent-deep-rgb)",
+    "--ground-rgb": "var(--paper-rgb)",
+    "--ink-rgb": "var(--paper-ink-rgb)",
+    "--mark-rgb": "var(--paper-ink-rgb)",
+    "--surface-rgb": "var(--paper-surface-rgb)",
+    "--accent-rgb": "var(--accent-deep-rgb)",
 } as React.CSSProperties;
 
 const NAV_LEFT: { label: string; href?: string }[] = [
-	{ label: "About", href: "/about" },
-	{ label: "FAQ", href: "/faq" },
+    { label: "About", href: "/about" },
+    { label: "FAQ", href: "/faq" },
 ];
 // The right is no longer a list at all: it is two controls, cut to interlock —
 // see the pair at the foot of this file.
 
 /** Three steps: short, tall, medium — revealed beside Leaderboard on hover. */
 function PodiumMark({ className }: { className?: string }) {
-	return (
-		<svg
-			aria-hidden
-			viewBox="0 0 24 24"
-			fill="currentColor"
-			className={className}
-		>
-			<rect x="1.5" y="13" width="6" height="9" rx="0.5" />
-			<rect x="9" y="4" width="6" height="18" rx="0.5" />
-			<rect x="16.5" y="9" width="6" height="13" rx="0.5" />
-		</svg>
-	);
+    return (
+        <svg
+            aria-hidden
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            className={className}
+        >
+            <rect x="1.5" y="13" width="6" height="9" rx="0.5" />
+            <rect x="9" y="4" width="6" height="18" rx="0.5" />
+            <rect x="16.5" y="9" width="6" height="13" rx="0.5" />
+        </svg>
+    );
 }
+
+// logo.png is 1080² with the disc's alpha inset by 171px on each side. That
+// empty art reads as bar margin on the left (paper showing through) and does
+// not exist on Generate, whose fill runs to its box edge — so equal CSS
+// padding still left the CTA short of the lockup's optical clearance. Sized
+// against the same `xl * 1.45` box the <LogoMark> below is drawn at.
+const LOGO_ART_PAD = "var(--spacing-xl) * 1.45 * 171 / 1080";
 
 /**
  * The site's navbar.
  *
  * THREE COLUMNS: reading group, open berth, offer. The berth is the gap between
- * the two clusters — Masthead hangs the moon from it (inset toward the middle)
- * so the curve only starts once the buttons have ended, and the bar stays
+ * the two clusters — Masthead sizes the moon from both clusters (tighter
+ * mid-clearance, centred) so the curve clears the buttons, and the bar stays
  * straight under every control.
  *
  * `gap-lg` is the air between a cluster and the berth. At a narrow window the
  * berth collapses first; the groups keep their gap rather than colliding.
  *
- * VERTICAL PADDING IS THE HEADER'S NOW, not the groups'.
+ * PADDING IS THE HEADER'S NOW, not the groups'. Optical clearance matches the
+ * lockup's ink on every side — see LOGO_ART_PAD for the right-edge compensate.
  */
 export default function Navbar({
-	edge = "var(--spacing-sm)",
-	berthRef,
+    edge = "var(--spacing-xs)",
+    leftClusterRef,
+    rightClusterRef,
 }: {
-	/** Horizontal inset of the bar's controls from the host's edges. */
-	edge?: string;
-	/** The open middle track — Masthead sizes the moon to this box. */
-	berthRef?: Ref<HTMLDivElement>;
+    /** Base inset of the bar from the host's edges. */
+    edge?: string;
+    /** The reading-group column — Masthead reads its right edge for the moon. */
+    leftClusterRef?: Ref<HTMLDivElement>;
+    /** The offer column — Masthead reads its left edge for the moon. */
+    rightClusterRef?: Ref<HTMLDivElement>;
 }) {
-	const pathname = usePathname();
+    const pathname = usePathname();
 
-	// THE READING GROUP IS SQUARE ALL THE WAY ALONG. ABOUT's rake was taken off
-	// so the row reads as text links rather than a cut object.
-	const isHere = (href?: string) =>
-		href
-			? href === "/"
-				? pathname === "/"
-				: pathname.startsWith(href)
-			: false;
+    // THE READING GROUP IS SQUARE ALL THE WAY ALONG. ABOUT's rake was taken off
+    // so the row reads as text links rather than a cut object.
+    const isHere = (href?: string) =>
+        href
+            ? href === "/"
+                ? pathname === "/"
+                : pathname.startsWith(href)
+            : false;
 
-	const ruled = (label: ReactNode, active: boolean) => (
-		<span className="relative inline-flex">
-			{label}
-			<span
-				aria-hidden
-				className={`pointer-events-none absolute left-0 -bottom-0.75 h-[1.5px] bg-mark transition-[width] duration-settle ease-out group-hover/nav:w-0 group-hover/nav:group-hover/btn:w-full ${
-					active ? "w-full" : "w-0"
-				}`}
-			/>
-		</span>
-	);
+    const ruled = (label: ReactNode, active: boolean) => (
+        <span className="relative inline-flex">
+            {label}
+            <span
+                aria-hidden
+                className={`pointer-events-none absolute left-0 -bottom-0.75 h-[1.5px] bg-mark transition-[width] duration-settle ease-out group-hover/nav:w-0 group-hover/nav:group-hover/btn:w-full ${
+                    active ? "w-full" : "w-0"
+                }`}
+            />
+        </span>
+    );
 
-	const pair = (items: { label: string; href?: string }[]) =>
-		items.map((item) => {
-			const active = isHere(item.href);
-			return item.href ? (
-				<Button
-					key={item.label}
-					href={item.href}
-					aria-current={active ? "page" : undefined}
-					variant="quiet"
-					shape="square"
-				>
-					{ruled(item.label, active)}
-				</Button>
-			) : (
-				<Button
-					key={item.label}
-					variant="quiet"
-					shape="square"
-					onClick={() => {}}
-				>
-					{ruled(item.label, active)}
-				</Button>
-			);
-		});
+    const pair = (items: { label: string; href?: string }[]) =>
+        items.map((item) => {
+            const active = isHere(item.href);
+            return item.href ? (
+                <Button
+                    key={item.label}
+                    href={item.href}
+                    aria-current={active ? "page" : undefined}
+                    variant="quiet"
+                    shape="square"
+                >
+                    {ruled(item.label, active)}
+                </Button>
+            ) : (
+                <Button
+                    key={item.label}
+                    variant="quiet"
+                    shape="square"
+                    onClick={() => {}}
+                >
+                    {ruled(item.label, active)}
+                </Button>
+            );
+        });
 
-	const onBoard = isHere("/leaderboard");
+    const onBoard = isHere("/leaderboard");
 
-	return (
-		<header
-			style={{ ...ON_PAPER, paddingLeft: edge, paddingRight: edge }}
-			className="relative z-20 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-lg pt-[2px] pb-xs"
-		>
-			{/* --- the mark ---------------------------------------------------- */}
-			<div className="flex items-center gap-md">
-				{/* THE LOCKUP GOES HOME, and it is an ANCHOR now rather than a button
+    return (
+        <header
+            style={{
+                ...ON_PAPER,
+                paddingTop: edge,
+                paddingBottom: edge,
+                paddingLeft: edge,
+                paddingRight: `calc(${edge} + ${LOGO_ART_PAD})`,
+
+            }}
+            className="relative z-20 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-lg"
+        >
+            {/* --- the mark ---------------------------------------------------- */}
+            <div
+                ref={leftClusterRef}
+                className="flex w-max max-w-full items-center gap-md justify-self-start"
+            >
+                {/* THE LOCKUP GOES HOME, and it is an ANCHOR now rather than a button
 				    with a handler — the same rule the Button component is written to:
 				    a control that navigates has to be middle-clickable, copyable and
 				    crawlable, and has to announce itself as a link. An onClick that
@@ -251,35 +272,35 @@ export default function Navbar({
 				    site's name wherever you are standing; announcing the masthead as
 				    the current page would say it on every visit to "/" and mean nothing
 				    the nav item has not already said. */}
-				<Link
-					href="/"
-					// ONE SIZE FOR THE WHOLE LOCKUP. The byline runs at `--lockup` and the
-					// wordmark at a fixed multiple of it, so scaling the pair is one number
-					// and the flush relationship cannot be broken by resizing either alone.
-					//
-					// WHAT THAT MULTIPLE IS, and how it was measured, lives at WORDMARK_TYPE
-					// — with the constant, which is the only place it stays true. It was
-					// restated here too, and the copy went stale: it still quoted Anton and
-					// Archivo and a ratio of 1.734 while the constant above had moved to
-					// 2.4527, so the file gave three different accounts of one number and
-					// two of them were wrong. A measurement is documentation of a VALUE.
-					// It belongs where the value is.
-					//
-					// `text-[length:...]`, not `text-[...]`. A bare `var()` in an arbitrary
-					// value is ambiguous — Tailwind cannot tell a length from a colour —
-					// so the byline's size was being dropped entirely and it rendered at
-					// the browser's default 16px against a wordmark computed from 12.96.
-					// That is where the last 38px of misalignment came from.
-					style={{ ["--lockup" as string]: "var(--text-2xs)" }}
-					aria-label='SceneBench by Starshot Labs'
-					// `text-left` went with the button: it existed only to undo the
-					// centring a <button> applies to its own contents, and an anchor
-					// never had it to undo.
-					className='group/mark flex flex-none cursor-pointer items-center gap-2xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent'
-				>
-					<LogoMark className='size-[calc(var(--spacing-xl)*1.45)] flex-none' />
-					<div className='flex flex-col justify-center gap-2xs'>
-						{/* THE TYPE IS SET ON THE WRAPPER, not on each copy, and that is
+                <Link
+                    href="/"
+                    // ONE SIZE FOR THE WHOLE LOCKUP. The byline runs at `--lockup` and the
+                    // wordmark at a fixed multiple of it, so scaling the pair is one number
+                    // and the flush relationship cannot be broken by resizing either alone.
+                    //
+                    // WHAT THAT MULTIPLE IS, and how it was measured, lives at WORDMARK_TYPE
+                    // — with the constant, which is the only place it stays true. It was
+                    // restated here too, and the copy went stale: it still quoted Anton and
+                    // Archivo and a ratio of 1.734 while the constant above had moved to
+                    // 2.4527, so the file gave three different accounts of one number and
+                    // two of them were wrong. A measurement is documentation of a VALUE.
+                    // It belongs where the value is.
+                    //
+                    // `text-[length:...]`, not `text-[...]`. A bare `var()` in an arbitrary
+                    // value is ambiguous — Tailwind cannot tell a length from a colour —
+                    // so the byline's size was being dropped entirely and it rendered at
+                    // the browser's default 16px against a wordmark computed from 12.96.
+                    // That is where the last 38px of misalignment came from.
+                    style={{ ["--lockup" as string]: "var(--text-2xs)" }}
+                    aria-label="SceneBench by Starshot Labs"
+                    // `text-left` went with the button: it existed only to undo the
+                    // centring a <button> applies to its own contents, and an anchor
+                    // never had it to undo.
+                    className="group/mark flex flex-none cursor-pointer items-center gap-2xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                >
+                    <LogoMark className="size-[calc(var(--spacing-xl)*1.45)] flex-none" />
+                    <div className="flex flex-col justify-center gap-2xs">
+                        {/* THE TYPE IS SET ON THE WRAPPER, not on each copy, and that is
 						    what actually holds the two in register. Both copies now
 						    INHERIT one declaration from a common ancestor rather than
 						    naming the same constant twice, which is a stronger guarantee
@@ -304,11 +325,11 @@ export default function Navbar({
 						    here makes the strut the wordmark's own, so the line box is the
 						    word's own box and the two copies land on one baseline by
 						    construction rather than by coincidence. */}
-						<span
-							className={`relative inline-block ${WORDMARK_TYPE}`}
-						>
-							<span>SCENEBENCH</span>
-							{/* THE GLEAM: the same word again, in WHITE, with a soft window
+                        <span
+                            className={`relative inline-block ${WORDMARK_TYPE}`}
+                        >
+                            <span>SCENEBENCH</span>
+                            {/* THE GLEAM: the same word again, in WHITE, with a soft window
 							    travelling along it — so only the stretch of the name inside
 							    the window is caught. Light crossing the letters, which is
 							    what the comp draws and what this is copied from.
@@ -333,63 +354,63 @@ export default function Navbar({
 							    make white letters exceed themselves on a black page and adds
 							    nothing over black ink, where painting white IS the lightest
 							    the pixel can go. */}
-							<span
-								aria-hidden
-								// THE HOVER MOVES ONE NUMBER and the transition does the rest.
-								// `--gleam` is the only thing the two states differ by, so
-								// there is no second declaration of the mask to keep in step
-								// — and no opacity to gate, because the light is genuinely
-								// off the word at both ends now.
-								//
-								// WRITTEN OUT, NOT INTERPOLATED. Tailwind reads these files as
-								// TEXT to decide what CSS to emit, so a class assembled from
-								// constants is a class it never sees and never generates. The
-								// two numbers are derived in GLEAM_REST / GLEAM_PAST above,
-								// which is where the working is; they have to appear literally
-								// here to exist at all.
-								className='pointer-events-none absolute inset-0 [--gleam:135%] group-hover/mark:[--gleam:-35%]'
-								style={{
-									// SET HERE RATHER THAN AS A UTILITY, because WORDMARK_TYPE
-									// ends in `text-mark` and a second colour class on the same
-									// element would be a coin-toss: equal specificity, so the
-									// winner is whichever Tailwind happened to emit last. That
-									// went unnoticed while the two copies shared a colour —
-									// `text-ink` and `text-mark` both resolve to the paper's ink
-									// in this bar — and would have surfaced as an intermittent
-									// dead animation the moment they differed, which is exactly
-									// what lighting the pass requires.
-									// `--gleam-rgb`, not `--ink-rgb` / `--mark-rgb`: this bar
-									// re-points those two for dark type on paper, and a gleam
-									// that followed them would bloom black around white letters.
-									color: "rgb(var(--gleam-rgb))",
-									textShadow:
-										"0 0 5px rgb(var(--gleam-rgb) / 0.9), 0 0 13px rgb(var(--accent-rgb) / 0.55), 0 0 26px rgb(var(--accent-deep-rgb) / 0.4)",
-									maskImage: GLOW_WINDOW,
-									WebkitMaskImage: GLOW_WINDOW,
-									// TALLER THAN THE TEXT, on purpose. The bloom spills well
-									// above and below the letters, and a mask only the height
-									// of the box cut it off flat at both — which drew a lit
-									// RECTANGLE around the word instead of a halo on it.
-									maskSize: "260% 420%",
-									WebkitMaskSize: "260% 420%",
-									maskRepeat: "no-repeat",
-									WebkitMaskRepeat: "no-repeat",
-									// READ FROM THE VARIABLE THE HOVER MOVES. The custom property
-									// itself is not what animates — an unregistered property has
-									// no type to interpolate and simply flips — but the mask
-									// position that CONSUMES it is a resolved length, and that is
-									// what the transition below is on.
-									maskPosition: "var(--gleam) 50%",
-									WebkitMaskPosition: "var(--gleam) 50%",
-									// BOTH SPELLINGS, because both are set above and a transition
-									// naming only one leaves the other to jump. The prefixed
-									// property is the one older WebKit is actually reading.
-									transition: `mask-position ${GLEAM_MS}ms ${GLEAM_EASE}, -webkit-mask-position ${GLEAM_MS}ms ${GLEAM_EASE}`,
-								}}
-							>
-								SCENEBENCH
-							</span>
-							{/* THE SPARK, where the gleam runs out: above the last letter,
+                            <span
+                                aria-hidden
+                                // THE HOVER MOVES ONE NUMBER and the transition does the rest.
+                                // `--gleam` is the only thing the two states differ by, so
+                                // there is no second declaration of the mask to keep in step
+                                // — and no opacity to gate, because the light is genuinely
+                                // off the word at both ends now.
+                                //
+                                // WRITTEN OUT, NOT INTERPOLATED. Tailwind reads these files as
+                                // TEXT to decide what CSS to emit, so a class assembled from
+                                // constants is a class it never sees and never generates. The
+                                // two numbers are derived in GLEAM_REST / GLEAM_PAST above,
+                                // which is where the working is; they have to appear literally
+                                // here to exist at all.
+                                className="pointer-events-none absolute inset-0 [--gleam:135%] group-hover/mark:[--gleam:-35%]"
+                                style={{
+                                    // SET HERE RATHER THAN AS A UTILITY, because WORDMARK_TYPE
+                                    // ends in `text-mark` and a second colour class on the same
+                                    // element would be a coin-toss: equal specificity, so the
+                                    // winner is whichever Tailwind happened to emit last. That
+                                    // went unnoticed while the two copies shared a colour —
+                                    // `text-ink` and `text-mark` both resolve to the paper's ink
+                                    // in this bar — and would have surfaced as an intermittent
+                                    // dead animation the moment they differed, which is exactly
+                                    // what lighting the pass requires.
+                                    // `--gleam-rgb`, not `--ink-rgb` / `--mark-rgb`: this bar
+                                    // re-points those two for dark type on paper, and a gleam
+                                    // that followed them would bloom black around white letters.
+                                    color: "rgb(var(--gleam-rgb))",
+                                    textShadow:
+                                        "0 0 5px rgb(var(--gleam-rgb) / 0.9), 0 0 13px rgb(var(--accent-rgb) / 0.55), 0 0 26px rgb(var(--accent-deep-rgb) / 0.4)",
+                                    maskImage: GLOW_WINDOW,
+                                    WebkitMaskImage: GLOW_WINDOW,
+                                    // TALLER THAN THE TEXT, on purpose. The bloom spills well
+                                    // above and below the letters, and a mask only the height
+                                    // of the box cut it off flat at both — which drew a lit
+                                    // RECTANGLE around the word instead of a halo on it.
+                                    maskSize: "260% 420%",
+                                    WebkitMaskSize: "260% 420%",
+                                    maskRepeat: "no-repeat",
+                                    WebkitMaskRepeat: "no-repeat",
+                                    // READ FROM THE VARIABLE THE HOVER MOVES. The custom property
+                                    // itself is not what animates — an unregistered property has
+                                    // no type to interpolate and simply flips — but the mask
+                                    // position that CONSUMES it is a resolved length, and that is
+                                    // what the transition below is on.
+                                    maskPosition: "var(--gleam) 50%",
+                                    WebkitMaskPosition: "var(--gleam) 50%",
+                                    // BOTH SPELLINGS, because both are set above and a transition
+                                    // naming only one leaves the other to jump. The prefixed
+                                    // property is the one older WebKit is actually reading.
+                                    transition: `mask-position ${GLEAM_MS}ms ${GLEAM_EASE}, -webkit-mask-position ${GLEAM_MS}ms ${GLEAM_EASE}`,
+                                }}
+                            >
+                                SCENEBENCH
+                            </span>
+                            {/* THE SPARK, where the gleam runs out: above the last letter,
 							    OUTSIDE the word rather than over it, timed to land as the
 							    light leaves.
 
@@ -412,23 +433,23 @@ export default function Navbar({
 							    IN and not the way out: the star waits for the light on
 							    arrival and leaves the instant the pointer does, rather than
 							    hanging on for 700ms after the mark is cold. */}
-							<span
-								aria-hidden
-								className='pointer-events-none absolute -top-[0.42em] -right-[0.3em] size-xs text-mark opacity-0 transition-opacity delay-0 duration-260 ease-out [animation-play-state:paused] group-hover/mark:opacity-100 group-hover/mark:delay-700 group-hover/mark:[animation-play-state:running] motion-safe:animate-[star-turn_9s_linear_infinite,star-breathe_1.9s_ease-in-out_infinite]'
-							>
-								<svg
-									viewBox='0 0 24 24'
-									fill='currentColor'
-									className='size-full'
-								>
-									{/* A four-point spark with concave sides — the shape a
+                            <span
+                                aria-hidden
+                                className="pointer-events-none absolute -top-[0.42em] -right-[0.3em] size-xs text-mark opacity-0 transition-opacity delay-0 duration-260 ease-out [animation-play-state:paused] group-hover/mark:opacity-100 group-hover/mark:delay-700 group-hover/mark:[animation-play-state:running] motion-safe:animate-[star-turn_9s_linear_infinite,star-breathe_1.9s_ease-in-out_infinite]"
+                            >
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    fill="currentColor"
+                                    className="size-full"
+                                >
+                                    {/* A four-point spark with concave sides — the shape a
 									    point of light makes, not the five-point badge on a
 									    sheriff. */}
-									<path d='M12 0c0 6.6 5.4 12 12 12-6.6 0-12 5.4-12 12 0-6.6-5.4-12-12-12 6.6 0 12-5.4 12-12z' />
-								</svg>
-							</span>
-						</span>
-						{/* NEVER WRAPS, and that was the whole bug. Without this the byline
+                                    <path d="M12 0c0 6.6 5.4 12 12 12-6.6 0-12 5.4-12 12 0-6.6-5.4-12-12-12 6.6 0 12-5.4 12-12z" />
+                                </svg>
+                            </span>
+                        </span>
+                        {/* NEVER WRAPS, and that was the whole bug. Without this the byline
 						    broke over two lines inside a shrinkable flex column — which not
 						    only looked wrong but made every measurement of it a lie: the ink
 						    width came back as the WIDEST LINE, not the string, so the flush
@@ -436,7 +457,7 @@ export default function Navbar({
 						    point. Adding tracking made it measure NARROWER, because more
 						    tracking moved the break earlier. Three tuning passes chased that
 						    ghost before the screenshot showed the two lines. */}
-						{/* THE BYLINE IS TRACKED OUT UNTIL IT MEASURES THE WORDMARK, which is
+                        {/* THE BYLINE IS TRACKED OUT UNTIL IT MEASURES THE WORDMARK, which is
 						    what makes the lockup a lockup: two lines of different lengths
 						    stacked is a name with a caption under it, two lines that end on
 						    the same vertical is one mark.
@@ -467,77 +488,79 @@ export default function Navbar({
 						    ink and the whole nav — which lands on the comp to the pixel —
 						    slides right by that much. Pulling exactly one letter-space back
 						    off the end trims the box to the glyphs. */}
-						<span className='font-label text-[length:var(--lockup)] leading-none tracking-[0.3774em] -mr-[0.3774em] whitespace-nowrap text-mark-40'>
-							BY STARSHOT LABS
-						</span>
-					</div>
-				</Link>
-				{/* THE GROUP IS THE NAV, not each link, because the rule is shared: an
+                        <span className="font-label text-[length:var(--lockup)] leading-none tracking-[0.3774em] -mr-[0.3774em] whitespace-nowrap text-mark-40">
+                            BY STARSHOT LABS
+                        </span>
+                    </div>
+                </Link>
+                {/* THE GROUP IS THE NAV, not each link, because the rule is shared: an
 				    item has to know that some OTHER item is being pointed at in order to
 				    give the line up. `group/nav` is what makes that knowable in CSS —
 				    the reading links are its descendants, so each one can be styled on
 				    whether the row is hot as well as on whether it is itself. */}
-				<nav
-					aria-label="About SceneBench"
-					className="group/nav flex items-center"
-				>
-					{pair(NAV_LEFT)}
-				</nav>
-			</div>
+                <nav
+                    aria-label="About SceneBench"
+                    className="group/nav flex items-center"
+                >
+                    {pair(NAV_LEFT)}
+                </nav>
+            </div>
 
-			{/* Open middle — the moon's chord lands on this track so the arch
-			    begins only after the reading group and ends before the offer. */}
-			<div ref={berthRef} aria-hidden className="min-w-0" />
+            {/* Open middle — air between the clusters; the moon is sized from
+			    the lockup's right edge, not this track (the grid gap would
+			    pull the chord in). */}
+            <div aria-hidden className="min-w-0" />
 
-			{/* --- the offer ------------------------------------------------------
+            {/* --- the offer ------------------------------------------------------
 			    Origin's interlocking pair. Generate's hover is the mark's glass;
-			    Leaderboard scoots its label left and opens a podium beside it. */}
-			<div className="flex items-center gap-2xs">
-				<nav aria-label="SceneBench standings">
-					<Button
-						href="/leaderboard"
-						aria-current={onBoard ? "page" : undefined}
-						variant="outline"
-						shape="upright-start"
-					>
-						{/* No underline — the hover is a scoot + reveal. The
-						    podium is width-collapsed at rest so the slab does
-						    not reserve a dead gap; on hover (and while active)
-						    the label shifts left and the mark unfolds beside it. */}
-						<span className="inline-flex items-center">
-							<span
-								className={`transition-transform duration-settle ease-out ${
-									onBoard
-										? "-translate-x-1.5"
-										: "group-hover/btn:-translate-x-1.5"
-								}`}
-							>
-								Leaderboard
-							</span>
-							<span
-								aria-hidden
-								className={`inline-flex overflow-hidden transition-[max-width,margin,opacity] duration-settle ease-out ${
-									onBoard
-										? "ml-1.5 max-w-[1.1em] opacity-100"
-										: "ml-0 max-w-0 opacity-0 group-hover/btn:ml-1.5 group-hover/btn:max-w-[1.1em] group-hover/btn:opacity-100"
-								}`}
-							>
-								<PodiumMark className="size-[1.1em] shrink-0" />
-							</span>
-						</span>
-					</Button>
-				</nav>
-				<Button
-					variant="solid"
-					sweep
-					shape="upright-end"
-					// #TODO: no action yet. This should take a prompt from the visitor
-					// and queue a build on both models.
-					onClick={() => {}}
-				>
-					Generate
-				</Button>
-			</div>
-		</header>
-	);
+			    Leaderboard swaps its label for a podium on hover. */}
+            <div
+                ref={rightClusterRef}
+                className="flex w-max max-w-full items-center gap-2xs justify-self-end"
+            >
+                <nav aria-label="SceneBench standings">
+                    <Button
+                        href="/leaderboard"
+                        aria-current={onBoard ? "page" : undefined}
+                        variant="outline"
+                        shape="upright-start"
+                    >
+                        {/* No underline. Off the board page, hover slides the label
+						    out and the podium in — same box, so width (and the
+						    raked right edge) never moves. On the board itself the
+						    label stays; the page is already the podium. */}
+                        <span className="inline-grid place-items-center overflow-hidden">
+                            <span
+                                className={`col-start-1 row-start-1 transition-transform duration-settle ease-out ${
+                                    onBoard
+                                        ? ""
+                                        : "group-hover/btn:-translate-y-full"
+                                }`}
+                            >
+                                Leaderboard
+                            </span>
+                            {!onBoard && (
+                                <span
+                                    aria-hidden
+                                    className="col-start-1 row-start-1 translate-y-full transition-transform duration-settle ease-out group-hover/btn:translate-y-0"
+                                >
+                                    <PodiumMark className="size-[1.1em]" />
+                                </span>
+                            )}
+                        </span>
+                    </Button>
+                </nav>
+                <Button
+                    variant="cta"
+                    sweep
+                    shape="upright-end"
+                    // #TODO: no action yet. This should take a prompt from the visitor
+                    // and queue a build on both models.
+                    onClick={() => {}}
+                >
+                    Generate
+                </Button>
+            </div>
+        </header>
+    );
 }

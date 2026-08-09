@@ -9,7 +9,7 @@ import Navbar, { ON_PAPER } from "./Navbar";
 // ---------------------------------------------------------------------------
 // THE PROMPT IS SET TO THE COMP'S OWN SIZE: 48 units of a 1600-wide viewBox laid
 // out at `min(96vw, 1560px)`. Vertical place is not a copied number — the title
-// is centred between the label and the moon's foot (see the caption well below).
+// sits in the well below the label (see the caption well below).
 // ---------------------------------------------------------------------------
 
 // One unit of the comp's viewBox, in CSS pixels: 96vw / 1600, capped where its
@@ -26,45 +26,56 @@ const UNIT = "min(0.06vw, 0.975px)";
 // by different hands. The comp states a size for this slot; that is the size.
 const TITLE_SIZE = `calc(48 * ${UNIT})`;
 
-// THE PROTRUDING MOON — a shallow segment centred on the bar. Half-width is the
-// tighter clearance from midline to either cluster (inset a quarter toward the
-// centre), so +x and −x match and the longer side simply sits closer to its
-// buttons; sag is the visible foot.
+// THE PROTRUDING MOON — a shallow segment centred on the bar. Its MAXIMUM half
+// is the tighter clearance from the screen mid to either nav cluster, minus a
+// small edge gap — so the lip opens as wide as the bar allows without running
+// into FAQ or Leaderboard. The arena can pass a tighter `chord` so a short
+// prompt gets a shorter smile; long prompts open out to that max, then the type
+// shrinks. Sag is the visible foot.
 const MOON_SAG = "calc(var(--spacing-xl) * 0.62)";
+
+/** Air between a chord end and the nearest nav control. */
+const MOON_EDGE_GAP = 12;
+
+/** Shortest chord, in title-size ems — below this the lip reads as a notch. */
+const MOON_CHORD_MIN_EMS = 9;
 
 // HOW FAR THE MIDDLE BUMP HANGS BELOW THE BAR. Same token as the moon's sag.
 export const BELLY = MOON_SAG;
 
 // WHERE THE LABEL SITS — the origin's own drop from the top of the masthead.
-// The prompt is then centred in whatever room remains below it (see the caption
-// well), so neither gap is a number we retune when the lip moves.
+// The prompt lives in the well BELOW this; moving the prompt never retunes it.
 const LABEL_TOP = "calc(var(--spacing-2xs) + 12px)";
 
+// Fallback disc radius (~1440-wide window) used before the limb has been measured.
+const ROLL_RADIUS_FALLBACK = 9600;
+
+/** Arc length of the prompt roll, in CSS pixels — held still across widths. */
+const ROLL_ARC_PX = 285;
+
+export type MastheadPrompt = {
+	/** Live moon disc radius, px — curvature for CurvedPrompt and the roll pivot. */
+	moonRadius: number;
+	/** Live moon chord width, px — prompt is capped to this so type stays on the face. */
+	moonWidth: number;
+	/** Transform origin that puts the pivot on the disc's centre. */
+	rollOrigin: string;
+	/** Angle whose arc length is ROLL_ARC_PX on the live radius. */
+	rollDeg: number;
+};
+
 /**
- * WHERE THE PROMPT PIVOTS: a point far below the page, so the caption ROLLS.
- *
- * Hand this to whatever carries `prompt-roll-out` / `prompt-settle`, which rotate
- * rather than translate. The angle is meaningless without it — about its own
- * centre, 1.7deg is just a caption tilting; about a point 9,600px down, the same
- * 1.7deg is 285px of travel along an almost flat arc, which is the prompt sliding
- * across the face of the moon.
- *
- * A CONSTANT, AND DELIBERATELY NOT THE LIVE RADIUS — which is the comp's own value
- * and worth defending, because the obvious "correction" here is a real regression.
- * The disc is sized off the window, so its radius is not fixed: 7,672px at 1280 and
- * 28,072px at 2560. Pivot on the true centre and the SAME 1.7deg sweeps an arc of
- * whatever length that radius makes it — 228px on a laptop against 833px on a wide
- * monitor, the prompt hurling itself off the side of the screen on the machines
- * most likely to be showing it.
- *
- * Rotation is a fixed angle; arc length is angle TIMES radius. Only one of the two
- * can be held still across a shape that resizes, and the one that has to be held is
- * the one you can see. 9,600 is the radius at about 1440 — so the roll is exact at
- * the width it was drawn for and stays believable either side of it, which is the
- * right trade for a curve this shallow: at 2560 the prompt travels on an arc a
- * little tighter than the limb, and there is no angle at which that is visible.
+ * Roll angle (degrees) for a constant arc length on the live moon radius.
+ * Holding the ANGLE still made the prompt hurl off-screen on wide monitors;
+ * holding the DISTANCE keeps the motion the same size you can see.
  */
-export const ROLL_ORIGIN = "50% -9600px";
+export function rollDegrees(moonRadius: number): number {
+	const r = Math.max(moonRadius, 1);
+	return (ROLL_ARC_PX / r) * (180 / Math.PI);
+}
+
+/** @deprecated Prefer MastheadPrompt.rollOrigin from the render-prop context. */
+export const ROLL_ORIGIN = `50% ${-ROLL_RADIUS_FALLBACK}px`;
 
 function Caption({ children }: { children: ReactNode }) {
 	return (
@@ -77,49 +88,96 @@ function Caption({ children }: { children: ReactNode }) {
 export default function Masthead({
 	label,
 	placement = "overlay",
+	chord: chordWanted,
 	children,
 }: {
 	label: string;
 	placement?: "overlay" | "flow";
-	children: ReactNode;
+	/**
+	 * Preferred chord width in px (from the prompt). Clamped to the navbar max
+	 * and a short minimum; omit on pages that always want the full lip.
+	 */
+	chord?: number;
+	children: ReactNode | ((ctx: MastheadPrompt) => ReactNode);
 }) {
 	const shellRef = useRef<HTMLDivElement>(null);
-	const berthRef = useRef<HTMLDivElement>(null);
-	const [moon, setMoon] = useState({ left: 0, width: 0 });
+	const leftClusterRef = useRef<HTMLDivElement>(null);
+	const rightClusterRef = useRef<HTMLDivElement>(null);
+	const limbRef = useRef<HTMLDivElement>(null);
+	const [moon, setMoon] = useState({
+		left: 0,
+		width: 0,
+		sag: 0,
+		radius: ROLL_RADIUS_FALLBACK,
+	});
 
-	// The moon's chord is centred on the bar, not on the berth. The lockup is
-	// wider than the offer, so a berth-relative chord would sit off-centre; both
-	// ends are instead the same distance from the midline. Width is capped by the
-	// tighter side (the longer cluster) so the arch stays clear of every control
-	// and simply lands closer to the longer side.
+	// Chord centred on the screen. Max half = tighter of (mid → FAQ content end,
+	// mid → offer start), minus edge gap — read straight from the clusters, not
+	// as a fraction of one side. When `chord` is set, a shorter prompt pulls both
+	// ends in; long prompts open to that max, then type shrinks.
 	useLayoutEffect(() => {
 		const shell = shellRef.current;
-		const berth = berthRef.current;
-		if (!shell || !berth) return;
+		const leftCluster = leftClusterRef.current;
+		const rightCluster = rightClusterRef.current;
+		if (!shell || !leftCluster || !rightCluster) return;
 
 		const sync = () => {
 			const s = shell.getBoundingClientRect();
-			const b = berth.getBoundingClientRect();
 			const mid = s.left + s.width / 2;
-			// 0 = flush with the nearer berth edge; 1 = collapsed to the midline.
-			const inset = 0.25;
-			const half =
-				(1 - inset) * Math.min(mid - b.left, b.right - mid);
+			const nav = leftCluster.querySelector("nav");
+			const last = nav?.lastElementChild ?? leftCluster;
+			const edge = last.getBoundingClientRect();
+			const padR = Number.parseFloat(getComputedStyle(last).paddingRight) || 0;
+			const leftEnd = edge.right - padR;
+			const rightStart = rightCluster.getBoundingClientRect().left;
+			const maxHalf = Math.max(
+				0,
+				Math.min(mid - leftEnd, rightStart - mid) - MOON_EDGE_GAP,
+			);
+			const maxWidth = 2 * maxHalf;
+			// Title size in px — same UNIT as CurvedPrompt / Title.
+			const titlePx = 48 * Math.min(window.innerWidth * 0.0006, 0.975);
+			const minWidth = Math.min(maxWidth, MOON_CHORD_MIN_EMS * titlePx);
+			const width =
+				chordWanted != null && chordWanted > 0
+					? Math.min(maxWidth, Math.max(minWidth, chordWanted))
+					: maxWidth;
+			const half = width / 2;
 			const left = mid - half - s.left;
-			const width = 2 * half;
+			const sag = limbRef.current?.offsetHeight ?? 0;
+			// Circle through chord + sagitta — same construction as MoonLimb.
+			const radius =
+				width > 0 && sag > 0
+					? (half * half + sag * sag) / (2 * sag)
+					: ROLL_RADIUS_FALLBACK;
 			setMoon((prev) =>
-				prev.left === left && prev.width === width
+				prev.left === left &&
+				prev.width === width &&
+				prev.sag === sag &&
+				Math.abs(prev.radius - radius) < 0.5
 					? prev
-					: { left, width },
+					: { left, width, sag, radius },
 			);
 		};
 
 		sync();
 		const observer = new ResizeObserver(sync);
 		observer.observe(shell);
-		observer.observe(berth);
+		observer.observe(leftCluster);
+		observer.observe(rightCluster);
+		const limb = limbRef.current;
+		if (limb) observer.observe(limb);
 		return () => observer.disconnect();
-	}, []);
+		// Re-bind when the limb host mounts (it only exists once width > 0).
+	}, [moon.width, chordWanted]);
+
+	const prompt: MastheadPrompt = {
+		moonRadius: moon.radius,
+		moonWidth: moon.width,
+		rollOrigin: `50% ${-moon.radius}px`,
+		rollDeg: rollDegrees(moon.radius),
+	};
+	const body = typeof children === "function" ? children(prompt) : children;
 
 	const frame = `pointer-events-none [&_a]:pointer-events-auto [&_button]:pointer-events-auto ${
 		placement === "overlay"
@@ -140,11 +198,15 @@ export default function Masthead({
 		<div data-masthead className={`${frame} z-20`}>
 			<div ref={shellRef} className="relative">
 				<div className="relative z-10 bg-mark">
-					<Navbar berthRef={berthRef} />
+					<Navbar
+						leftClusterRef={leftClusterRef}
+						rightClusterRef={rightClusterRef}
+					/>
 				</div>
 
 				{moon.width > 0 && (
 					<div
+						ref={limbRef}
 						className="absolute top-full -mt-px bg-transparent"
 						style={{
 							width: moon.width,
@@ -160,8 +222,8 @@ export default function Masthead({
 					</div>
 				)}
 
-				{/* Extends into the belly so the prompt still centres against the
-				    moon's foot, even though the lip no longer stretches the shell. */}
+				{/* Extends into the belly so the prompt can sit on the face of
+				    the moon, even though the lip no longer stretches the shell. */}
 				<div
 					className="absolute inset-x-0 top-0 z-20"
 					style={{
@@ -183,8 +245,15 @@ export default function Masthead({
 								<Caption>{label}</Caption>
 							</div>
 							<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
-								<div className="flex min-w-0 max-w-[64vw] justify-center">
-									{children}
+								{/* Cap to the moon chord — a vw ceiling let the prompt outgrow
+								    the face, so the arc math broke and the caption jumped. */}
+								<div
+									className="flex w-full min-w-0 justify-center"
+									style={{
+										maxWidth: moon.width > 0 ? moon.width : undefined,
+									}}
+								>
+									{body}
 								</div>
 							</div>
 						</div>

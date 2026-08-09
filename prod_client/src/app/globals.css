@@ -1,195 +1,205 @@
 @import "tailwindcss";
 
 :root {
-  --ground-rgb: 0 0 0;
-  --background: rgb(var(--ground-rgb));
+    --ground-rgb: 0 0 0;
+    --background: rgb(var(--ground-rgb));
 
-  --ink-rgb: 237 237 237;
-  --foreground: rgb(var(--ink-rgb));
+    --ink-rgb: 237 237 237;
+    --foreground: rgb(var(--ink-rgb));
 
-  --mark-rgb: 237 237 237;
+    --mark-rgb: 237 237 237;
 
-  /* THE LIGHT THAT MUST NOT INVERT. The masthead re-points `--ink-rgb` /
+    /* THE LIGHT THAT MUST NOT INVERT. The masthead re-points `--ink-rgb` /
      `--mark-rgb` for type on paper; the wordmark gleam has to stay the page's
      bright highlight through that swap, so it reads its own triplet. */
-  --gleam-rgb: 237 237 237;
+    --gleam-rgb: 237 237 237;
 
-  --moon-rgb: var(--mark-rgb);
+    --moon-rgb: var(--mark-rgb);
 
-  /* EVERY COLOUR IS A TRIPLET HERE, and the theme below only ever aliases these.
+    /* EVERY COLOUR IS A TRIPLET HERE, and the theme below only ever aliases these.
      A theme entry written as a literal gets INLINED into the utilities that use
      it — `.bg-surface { background-color: #131313 }` — and once inlined there is
      no variable left to re-point, so scoped inversions fail silently on it.
      Written as `rgb(var(--x-rgb))` the reference survives into the utility and
      the colour can be swapped for any subtree. */
-  /* ONE LIGHT. The vote slabs (`bg-mark`) are the reference; paper is the same
+    /* ONE LIGHT. The vote slabs (`bg-mark`) are the reference; paper is the same
      token so the masthead cannot drift from them. Paper-ink / paper-surface are
      the dark type and hover step used when a subtree is drawn ON that light. */
-  --paper-rgb: var(--mark-rgb);
-  --paper-ink-rgb: 17 17 17;
-  --paper-surface-rgb: 221 221 221;
+    --paper-rgb: var(--mark-rgb);
+    --paper-ink-rgb: 17 17 17;
+    --paper-surface-rgb: 221 221 221;
 
-  --surface-rgb: 19 19 19;
-  --surface-lit-rgb: 38 38 38;
+    --surface-rgb: 19 19 19;
+    --surface-lit-rgb: 38 38 38;
 
-  --accent-rgb: 195 205 255;
-  --accent-deep-rgb: 107 79 158;
+    --accent-rgb: 195 205 255;
+    --accent-deep-rgb: 107 79 158;
 
-  --rise-rgb: 53 196 106;
-  --fall-rgb: 229 52 43;
+    --rise-rgb: 53 196 106;
+    --fall-rgb: 229 52 43;
 
-  /* Warm attention cue — unvisited floors, portal-adjacent chrome. Kept off the
+    /* Warm attention cue — unvisited floors, portal-adjacent chrome. Kept off the
      edge-type hex table so UI can re-point it without touching WebGL markers. */
-  --signal-rgb: 255 196 107;
+    --signal-rgb: 255 196 107;
 
-  /* Accent-sweep mid stops — tinted off mark so the button glass has chroma. */
-  --sweep-1-rgb: 230 240 255;
-  --sweep-2-rgb: 216 220 245;
-  --sweep-3-rgb: 230 213 230;
-  --sweep-4-rgb: 251 220 210;
+    /* Accent-sweep mid stops — tinted off mark so the button glass has chroma. */
+    --sweep-1-rgb: 230 240 255;
+    --sweep-2-rgb: 216 220 245;
+    --sweep-3-rgb: 230 213 230;
+    --sweep-4-rgb: 251 220 210;
 
-  /* THE FACE IS LIT, NOT TINTED. These were a cool blue, a mid violet and a warm
+    /* THE FACE IS LIT, NOT TINTED. These were a cool blue, a mid violet and a warm
      salmon, which made the moon the one large light shape on the page that was not
      the page's light colour. All three now read the mark, so the disc keeps its
      modelling — the highlight and the terminator below are what shape it — and
      loses the chroma. Re-point any one of them to tint it again. */
-  --moon-cool-rgb: var(--mark-rgb);
-  --moon-mid-rgb: var(--mark-rgb);
-  --moon-warm-rgb: var(--mark-rgb);
+    --moon-cool-rgb: var(--mark-rgb);
+    --moon-mid-rgb: var(--mark-rgb);
+    --moon-warm-rgb: var(--mark-rgb);
 
-  --font-sans-src: var(--font-manrope);
-  --font-mono-src: var(--font-manrope);
+    --font-sans-src: var(--font-manrope);
+    --font-mono-src: var(--font-manrope);
 
-  --seam-gap: var(--spacing-md);
+    --seam-gap: var(--spacing-md);
 
-  /* THE ARENA'S RULE WEIGHT — the vertical join between the two scenes, the
+    /* THE ARENA'S RULE WEIGHT — the vertical join between the two scenes, the
      hairline that draws across the vote bar, and SKIP's outline all share it so
      none of them can drift from the others. */
-  --seam-width: 3px;
+    --seam-width: 3px;
 
-  /* Width of the geometric thumb — ScrollBox paints it; WebKit native bars match. */
-  --scroll-size: 6px;
+    /* Width of the geometric thumb — ScrollBox paints it; WebKit native bars match. */
+    --scroll-size: 6px;
 }
 
 @theme inline {
-  --color-ground: rgb(var(--ground-rgb));
-  --color-ink: rgb(var(--ink-rgb));
-  --color-ink-64: rgb(var(--ink-rgb) / 0.64);
-  --color-ink-40: rgb(var(--ink-rgb) / 0.4);
-  --color-ink-16: rgb(var(--ink-rgb) / 0.16);
-  --color-ink-8: rgb(var(--ink-rgb) / 0.08);
+    --color-ground: rgb(var(--ground-rgb));
+    --color-ink: rgb(var(--ink-rgb));
+    --color-ink-64: rgb(var(--ink-rgb) / 0.64);
+    --color-ink-40: rgb(var(--ink-rgb) / 0.4);
+    --color-ink-16: rgb(var(--ink-rgb) / 0.16);
+    --color-ink-8: rgb(var(--ink-rgb) / 0.08);
 
-  --color-mark: rgb(var(--mark-rgb));
-  --color-mark-64: rgb(var(--mark-rgb) / 0.64);
-  --color-mark-40: rgb(var(--mark-rgb) / 0.4);
-  --color-mark-16: rgb(var(--mark-rgb) / 0.16);
-  --color-mark-8: rgb(var(--mark-rgb) / 0.08);
+    --color-mark: rgb(var(--mark-rgb));
+    --color-mark-64: rgb(var(--mark-rgb) / 0.64);
+    --color-mark-40: rgb(var(--mark-rgb) / 0.4);
+    --color-mark-16: rgb(var(--mark-rgb) / 0.16);
+    --color-mark-8: rgb(var(--mark-rgb) / 0.08);
 
-  --color-paper: rgb(var(--paper-rgb));
+    --color-paper: rgb(var(--paper-rgb));
 
-  --color-surface: rgb(var(--surface-rgb));
-  --color-surface-lit: rgb(var(--surface-lit-rgb));
+    --color-surface: rgb(var(--surface-rgb));
+    --color-surface-lit: rgb(var(--surface-lit-rgb));
 
-  --color-accent: rgb(var(--accent-rgb));
+    --color-accent: rgb(var(--accent-rgb));
 
-  --color-rise: rgb(var(--rise-rgb));
-  --color-fall: rgb(var(--fall-rgb));
-  --color-signal: rgb(var(--signal-rgb));
+    --color-rise: rgb(var(--rise-rgb));
+    --color-fall: rgb(var(--fall-rgb));
+    --color-signal: rgb(var(--signal-rgb));
 
-  --color-accent-deep: rgb(var(--accent-deep-rgb));
+    --color-accent-deep: rgb(var(--accent-deep-rgb));
 
-  --moon-surface:
-    radial-gradient(
-      circle at 40% 30%,
-      rgb(var(--mark-rgb) / 0.4) 0%,
-      rgb(var(--mark-rgb) / 0.12) 36%,
-      transparent 64%
-    ),
-    radial-gradient(
-      circle at 50% 48%,
-      transparent 50%,
-      rgb(var(--surface-lit-rgb) / 0.15) 80%,
-      rgb(var(--surface-lit-rgb) / 0.36) 100%
-    ),
-    linear-gradient(
-      104deg,
-      rgb(var(--moon-cool-rgb)) 0%,
-      color-mix(in srgb, rgb(var(--moon-cool-rgb)), rgb(var(--moon-mid-rgb)) 45%) 26%,
-      rgb(var(--moon-mid-rgb)) 52%,
-      color-mix(in srgb, rgb(var(--moon-mid-rgb)), rgb(var(--moon-warm-rgb)) 70%) 78%,
-      rgb(var(--moon-warm-rgb)) 100%
+    --moon-surface:
+        radial-gradient(
+            circle at 40% 30%,
+            rgb(var(--mark-rgb) / 0.4) 0%,
+            rgb(var(--mark-rgb) / 0.12) 36%,
+            transparent 64%
+        ),
+        radial-gradient(
+            circle at 50% 48%,
+            transparent 50%,
+            rgb(var(--surface-lit-rgb) / 0.15) 80%,
+            rgb(var(--surface-lit-rgb) / 0.36) 100%
+        ),
+        linear-gradient(
+            104deg,
+            rgb(var(--moon-cool-rgb)) 0%,
+            color-mix(
+                    in srgb,
+                    rgb(var(--moon-cool-rgb)),
+                    rgb(var(--moon-mid-rgb)) 45%
+                )
+                26%,
+            rgb(var(--moon-mid-rgb)) 52%,
+            color-mix(
+                    in srgb,
+                    rgb(var(--moon-mid-rgb)),
+                    rgb(var(--moon-warm-rgb)) 70%
+                )
+                78%,
+            rgb(var(--moon-warm-rgb)) 100%
+        );
+
+    --moon-body: radial-gradient(
+        closest-side circle,
+        rgb(var(--moon-rgb) / 0.03) 80%,
+        rgb(var(--moon-rgb) / 0.12) 93%,
+        rgb(var(--moon-rgb) / 0.2) 98%,
+        rgb(var(--moon-rgb) / 0.13) 100%
     );
 
-  --moon-body: radial-gradient(
-    closest-side circle,
-    rgb(var(--moon-rgb) / 0.03) 80%,
-    rgb(var(--moon-rgb) / 0.12) 93%,
-    rgb(var(--moon-rgb) / 0.2) 98%,
-    rgb(var(--moon-rgb) / 0.13) 100%
-  );
+    --moon-bloom: radial-gradient(
+        closest-side circle,
+        rgb(var(--moon-rgb) / 0.07) 70%,
+        rgb(var(--moon-rgb) / 0.09) 100%
+    );
 
-  --moon-bloom: radial-gradient(
-    closest-side circle,
-    rgb(var(--moon-rgb) / 0.07) 70%,
-    rgb(var(--moon-rgb) / 0.09) 100%
-  );
+    --moon-wash: radial-gradient(
+        closest-side ellipse,
+        rgb(var(--moon-rgb) / 0.05) 0%,
+        rgb(var(--moon-rgb) / 0.038) 30%,
+        rgb(var(--moon-rgb) / 0.026) 56%,
+        rgb(var(--moon-rgb) / 0.011) 78%,
+        transparent 100%
+    );
 
-  --moon-wash: radial-gradient(
-    closest-side ellipse,
-    rgb(var(--moon-rgb) / 0.05) 0%,
-    rgb(var(--moon-rgb) / 0.038) 30%,
-    rgb(var(--moon-rgb) / 0.026) 56%,
-    rgb(var(--moon-rgb) / 0.011) 78%,
-    transparent 100%
-  );
+    --sweep-0: rgb(var(--mark-rgb));
+    --sweep-1: rgb(var(--sweep-1-rgb));
+    --sweep-2: rgb(var(--sweep-2-rgb));
+    --sweep-3: rgb(var(--sweep-3-rgb));
+    --sweep-4: rgb(var(--sweep-4-rgb));
+    --accent-sweep: linear-gradient(
+        104deg,
+        var(--sweep-0) 0%,
+        var(--sweep-1) 24%,
+        var(--sweep-2) 46%,
+        var(--sweep-3) 68%,
+        var(--sweep-4) 88%,
+        var(--sweep-0) 100%
+    );
 
-  --sweep-0: rgb(var(--mark-rgb));
-  --sweep-1: rgb(var(--sweep-1-rgb));
-  --sweep-2: rgb(var(--sweep-2-rgb));
-  --sweep-3: rgb(var(--sweep-3-rgb));
-  --sweep-4: rgb(var(--sweep-4-rgb));
-  --accent-sweep: linear-gradient(
-    104deg,
-    var(--sweep-0) 0%,
-    var(--sweep-1) 24%,
-    var(--sweep-2) 46%,
-    var(--sweep-3) 68%,
-    var(--sweep-4) 88%,
-    var(--sweep-0) 100%
-  );
+    --color-background: var(--background);
+    --color-foreground: var(--foreground);
 
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+    --font-display: var(--font-public-sans);
+    --font-sans: var(--font-sans-src);
+    --font-mono: var(--font-mono-src);
+    --font-serif: var(--font-instrument-serif);
 
-  --font-display: var(--font-public-sans);
-  --font-sans: var(--font-sans-src);
-  --font-mono: var(--font-mono-src);
-  --font-serif: var(--font-instrument-serif);
+    --text-2xs: clamp(9px, 0.72vw, 12px);
+    --text-xs: clamp(11px, 0.9vw, 14px);
+    --text-sm: clamp(13px, 1.1vw, 17px);
+    --text-base: clamp(16px, 1.45vw, 23px);
+    --text-lg: clamp(22px, 2.2vw, 34px);
+    --text-xl: clamp(34px, 3.6vw, 56px);
 
-  --text-2xs: clamp(9px, 0.72vw, 12px);
-  --text-xs: clamp(11px, 0.9vw, 14px);
-  --text-sm: clamp(13px, 1.1vw, 17px);
-  --text-base: clamp(16px, 1.45vw, 23px);
-  --text-lg: clamp(22px, 2.2vw, 34px);
-  --text-xl: clamp(34px, 3.6vw, 56px);
+    --spacing-2xs: clamp(3px, 0.3vw, 5px);
+    --spacing-xs: clamp(6px, 0.6vw, 9px);
+    --spacing-sm: clamp(9px, 0.95vw, 14px);
+    --spacing-md: clamp(14px, 1.5vw, 22px);
+    --spacing-lg: clamp(22px, 2.4vw, 36px);
+    --spacing-xl: clamp(34px, 3.8vw, 58px);
 
-  --spacing-2xs: clamp(3px, 0.3vw, 5px);
-  --spacing-xs: clamp(6px, 0.6vw, 9px);
-  --spacing-sm: clamp(9px, 0.95vw, 14px);
-  --spacing-md: clamp(14px, 1.5vw, 22px);
-  --spacing-lg: clamp(22px, 2.4vw, 36px);
-  --spacing-xl: clamp(34px, 3.8vw, 58px);
-
-  --duration-quick: 110ms;
-  --duration-settle: 260ms;
-  --ease-out-soft: cubic-bezier(0.25, 0.8, 0.3, 1);
+    --duration-quick: 110ms;
+    --duration-settle: 260ms;
+    --ease-out-soft: cubic-bezier(0.25, 0.8, 0.3, 1);
 }
 
 @utility font-label {
-  font-family: var(--font-sans);
-  font-weight: 600;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
+    font-family: var(--font-sans);
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
 }
 
 /* THE ONE ARRIVAL EVERY PAGE USES. Rows, paragraphs and bars all enter on this
@@ -197,13 +207,13 @@
    timed entrances. Distance and delay belong to the element; the curve and the
    duration do not. */
 @utility lift-in {
-  animation: lift-in var(--lift-dur, 520ms) var(--ease-out-soft)
-    var(--lift-delay, 0ms) both;
+    animation: lift-in var(--lift-dur, 520ms) var(--ease-out-soft)
+        var(--lift-delay, 0ms) both;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
+    background: var(--background);
+    color: var(--foreground);
 }
 
 /* NATIVE BARS WHERE WE HAVE NOT MOUNTED ScrollBox. Chromium will honour these
@@ -215,30 +225,30 @@ body {
    `scrollbar-width` / `scrollbar-color` win over `::-webkit-scrollbar` on the
    same element and silently restore the OS thin bar. */
 *::-webkit-scrollbar {
-  width: var(--scroll-size);
-  height: var(--scroll-size);
+    width: var(--scroll-size);
+    height: var(--scroll-size);
 }
 
 *::-webkit-scrollbar-track {
-  background: transparent;
+    background: transparent;
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgb(var(--mark-rgb) / 0.4);
-  border-radius: 0;
+    background: rgb(var(--mark-rgb) / 0.4);
+    border-radius: 0;
 }
 
 *::-webkit-scrollbar-thumb:hover,
 *::-webkit-scrollbar-thumb:active {
-  background: rgb(var(--mark-rgb));
+    background: rgb(var(--mark-rgb));
 }
 
 *::-webkit-scrollbar-corner,
 *::-webkit-scrollbar-button {
-  display: none;
-  width: 0;
-  height: 0;
-  background: transparent;
+    display: none;
+    width: 0;
+    height: 0;
+    background: transparent;
 }
 
 /* THE GLEAM IS NO LONGER A KEYFRAME AT ALL — it is a transition on the mask's
@@ -262,306 +272,306 @@ body {
    `scale` are their own properties now, not two halves of one `transform`, so
    neither overwrites the other. */
 @keyframes star-turn {
-  from {
-    rotate: 0deg;
-  }
-  to {
-    rotate: 360deg;
-  }
+    from {
+        rotate: 0deg;
+    }
+    to {
+        rotate: 360deg;
+    }
 }
 
 @keyframes star-breathe {
-  0%,
-  100% {
-    scale: 0.82;
-  }
-  50% {
-    scale: 1.16;
-  }
+    0%,
+    100% {
+        scale: 0.82;
+    }
+    50% {
+        scale: 1.16;
+    }
 }
 
-/* THE PROMPT ROLLS ALONG THE LIMB. It does not rise and fall — it ROTATES, by a
-   little under two degrees, about a point thousands of pixels below the page: the
-   centre of the disc the masthead is the bottom of. So the caption travels on the
-   moon's own surface, arriving from one side and leaving by the other along the
-   curve it is sitting on, and the 1.7deg is chosen against that radius rather than
-   being an angle anyone would pick by eye.
+/* THE PROMPT ROLLS ALONG THE LIMB. It does not rise and fall — it ROTATES about
+   the moon disc's centre (transform-origin on the element; see MastheadPrompt).
+   So the caption travels on the moon's own surface, arriving from one side and
+   leaving by the other along the curve it is sitting on.
 
-   The origin is not here — it cannot be, since it moves with the disc. It is set
-   on the element, from the radius the limb publishes. See ROLL_ORIGIN in Masthead.
+   `--prompt-roll-deg` is the angle whose ARC LENGTH is constant across widths
+   (see rollDegrees in Masthead). Holding the angle still made the prompt hurl
+   off-screen on wide monitors; holding the distance keeps the motion the size
+   you can see.
 
    THE TRANSLATE THIS REPLACES was the same beat played straight: the prompt slid
    up 0.55em and the next slid in from 0.7em below. Perfectly reasonable motion for
    a caption on a flat bar, and the reason the masthead never quite read as round —
    everything else curved and the one moving thing on it travelled in a line. */
 @keyframes prompt-roll-out {
-  0% {
-    opacity: 1;
-    transform: rotate(0deg);
-  }
-  70% {
-    opacity: 0.45;
-  }
-  100% {
-    opacity: 0;
-    transform: rotate(-1.7deg);
-  }
+    0% {
+        opacity: 1;
+        transform: rotate(0deg);
+    }
+    70% {
+        opacity: 0.45;
+    }
+    100% {
+        opacity: 0;
+        transform: rotate(calc(var(--prompt-roll-deg, 1.7) * -1deg));
+    }
 }
 
 @keyframes prompt-settle {
-  0% {
-    opacity: 0;
-    transform: rotate(1.7deg);
-  }
-  30% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 1;
-    transform: rotate(0deg);
-  }
+    0% {
+        opacity: 0;
+        transform: rotate(calc(var(--prompt-roll-deg, 1.7) * 1deg));
+    }
+    30% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 1;
+        transform: rotate(0deg);
+    }
 }
 
 @keyframes moon-cycle {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(-80deg);
-  }
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(-80deg);
+    }
 }
 
 @keyframes content-swap {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
 }
 @keyframes arena-rise {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+    from {
+        opacity: 0;
+        transform: translateY(10px) scale(0.96);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
 }
 
 @keyframes arena-chev-up {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-5px);
-  }
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+    50% {
+        transform: translateY(-5px);
+    }
 }
 
 @keyframes moon-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(-360deg);
-  }
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(-360deg);
+    }
 }
 
 @keyframes moon-texture-marquee {
-  from {
-    transform: translateX(0);
-  }
-  to {
-    transform: translateX(50%);
-  }
+    from {
+        transform: translateX(0);
+    }
+    to {
+        transform: translateX(50%);
+    }
 }
 
 @keyframes pano-pan {
-  from {
-    background-position-x: 0;
-  }
-  to {
-    background-position-x: calc(-1 * var(--pano-tile, 1800px));
-  }
+    from {
+        background-position-x: 0;
+    }
+    to {
+        background-position-x: calc(-1 * var(--pano-tile, 1800px));
+    }
 }
 
 @keyframes floor-unvisited {
-  0%,
-  100% {
-    background-color: rgb(var(--signal-rgb) / 0.1);
-    box-shadow: 0 0 0 0 rgb(var(--signal-rgb) / 0);
-  }
-  50% {
-    background-color: rgb(var(--signal-rgb) / 0.26);
-    box-shadow: 0 0 9px 2px rgb(var(--signal-rgb) / 0.5);
-  }
+    0%,
+    100% {
+        background-color: rgb(var(--signal-rgb) / 0.1);
+        box-shadow: 0 0 0 0 rgb(var(--signal-rgb) / 0);
+    }
+    50% {
+        background-color: rgb(var(--signal-rgb) / 0.26);
+        box-shadow: 0 0 9px 2px rgb(var(--signal-rgb) / 0.5);
+    }
 }
 
 @keyframes reach-layer-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
 }
 
 @keyframes bar-grow {
-  from {
-    transform: scaleX(0);
-  }
-  to {
-    transform: scaleX(1);
-  }
+    from {
+        transform: scaleX(0);
+    }
+    to {
+        transform: scaleX(1);
+    }
 }
 
 @keyframes shooting-star {
-  0%,
-  80% {
-    opacity: 0;
-    transform: translate3d(0, 0, 0) scale(0.45);
-  }
-  84% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-    transform: translate3d(var(--shoot-x), var(--shoot-y), 0) scale(1.1);
-  }
+    0%,
+    80% {
+        opacity: 0;
+        transform: translate3d(0, 0, 0) scale(0.45);
+    }
+    84% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0;
+        transform: translate3d(var(--shoot-x), var(--shoot-y), 0) scale(1.1);
+    }
 }
 
 @keyframes voxel-drift {
-  0%,
-  100% {
-    translate: 0 0;
-  }
-  25% {
-    translate: var(--drift-x) calc(var(--drift-y) * 0.3);
-  }
-  50% {
-    translate: calc(var(--drift-x) * 0.45) var(--drift-y);
-  }
-  75% {
-    translate: calc(var(--drift-x) * -0.6) calc(var(--drift-y) * 0.55);
-  }
+    0%,
+    100% {
+        translate: 0 0;
+    }
+    25% {
+        translate: var(--drift-x) calc(var(--drift-y) * 0.3);
+    }
+    50% {
+        translate: calc(var(--drift-x) * 0.45) var(--drift-y);
+    }
+    75% {
+        translate: calc(var(--drift-x) * -0.6) calc(var(--drift-y) * 0.55);
+    }
 }
 
 @keyframes voxel-turn {
-  from {
-    rotate: var(--turn-from);
-  }
-  to {
-    rotate: var(--turn-to);
-  }
+    from {
+        rotate: var(--turn-from);
+    }
+    to {
+        rotate: var(--turn-to);
+    }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  [data-sky] * {
-    animation: none !important;
-  }
+    [data-sky] * {
+        animation: none !important;
+    }
 }
 
 @keyframes veil-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
 }
 
 @keyframes about-shoot {
-  0% {
-    opacity: 0;
-    transform: rotate(38deg) translateX(-30vw);
-  }
-  2% {
-    opacity: 0.9;
-  }
-  13% {
-    opacity: 0.9;
-  }
-  18%,
-  100% {
-    opacity: 0;
-    transform: rotate(38deg) translateX(122vw);
-  }
+    0% {
+        opacity: 0;
+        transform: rotate(38deg) translateX(-30vw);
+    }
+    2% {
+        opacity: 0.9;
+    }
+    13% {
+        opacity: 0.9;
+    }
+    18%,
+    100% {
+        opacity: 0;
+        transform: rotate(38deg) translateX(122vw);
+    }
 }
 
 @keyframes about-rise {
-  from {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+    from {
+        opacity: 0;
+        transform: translateY(14px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 
 @keyframes about-nudge {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(5px);
-  }
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+    50% {
+        transform: translateY(5px);
+    }
 }
 
 @keyframes caret-blink {
-  0%,
-  49% {
-    opacity: 1;
-  }
-  50%,
-  100% {
-    opacity: 0;
-  }
+    0%,
+    49% {
+        opacity: 1;
+    }
+    50%,
+    100% {
+        opacity: 0;
+    }
 }
 
 @keyframes vote-rule {
-  0% {
-    scale: 0 1;
-    animation-timing-function: cubic-bezier(0.18, 0.82, 0.3, 1);
-  }
-  41.94% {
-    scale: 1 1;
-  }
-  100% {
-    scale: 1 1;
-  }
+    0% {
+        scale: 0 1;
+        animation-timing-function: cubic-bezier(0.18, 0.82, 0.3, 1);
+    }
+    41.94% {
+        scale: 1 1;
+    }
+    100% {
+        scale: 1 1;
+    }
 }
 
 @keyframes vote-rule-hide {
-  from {
-    opacity: 1;
-  }
-  to {
-    opacity: 0;
-  }
+    from {
+        opacity: 1;
+    }
+    to {
+        opacity: 0;
+    }
 }
 
 @keyframes seam-untuck {
-  from {
-    scale: 1 0;
-  }
-  to {
-    scale: 1 1;
-  }
+    from {
+        scale: 1 0;
+    }
+    to {
+        scale: 1 1;
+    }
 }
 
 @keyframes lift-in {
-  from {
-    opacity: 0;
-    transform: translateY(var(--lift-from, 10px));
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+    from {
+        opacity: 0;
+        transform: translateY(var(--lift-from, 10px));
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
 }
 
 /* TIERS GOING UP WHILE A SCENE LOADS — see LoadingOverlay. A wait that builds
@@ -569,30 +579,30 @@ body {
    The loop resets at zero width, where the retraction cannot be seen, so the
    bars never appear to un-build. */
 @keyframes lay-in {
-  0% {
-    opacity: 0.2;
-    transform: scaleX(0);
-  }
-  36% {
-    opacity: 1;
-    transform: scaleX(1);
-  }
-  72% {
-    opacity: 1;
-    transform: scaleX(1);
-  }
-  100% {
-    opacity: 0;
-    transform: scaleX(1);
-  }
+    0% {
+        opacity: 0.2;
+        transform: scaleX(0);
+    }
+    36% {
+        opacity: 1;
+        transform: scaleX(1);
+    }
+    72% {
+        opacity: 1;
+        transform: scaleX(1);
+    }
+    100% {
+        opacity: 0;
+        transform: scaleX(1);
+    }
 }
 
 /* Matched on the attribute rather than the class, because the arrival is also
    used behind a variant — `[[data-arrived]_&]:lift-in` — and that compiles to a
    class of its own that a plain `.lift-in` rule would never reach. */
 @media (prefers-reduced-motion: reduce) {
-  [class*="lift-in"],
-  [data-loader] * {
-    animation: none !important;
-  }
+    [class*="lift-in"],
+    [data-loader] * {
+        animation: none !important;
+    }
 }

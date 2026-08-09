@@ -163,7 +163,7 @@ export default function Composer({
 					}}
 				>
 					<Button
-						variant="solid"
+						variant="cta"
 						shape="standalone"
 						sweep
 						tabIndex={-1}

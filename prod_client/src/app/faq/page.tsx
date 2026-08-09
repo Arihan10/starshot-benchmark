@@ -84,7 +84,7 @@ export default function FaqPage() {
 						<span className="font-label text-2xs text-ink-40">
 							Still wondering?
 						</span>
-						<Button href="/" shape="standalone" variant="solid" sweep>
+						<Button href="/" shape="standalone" variant="cta" sweep>
 							Go to the arena
 						</Button>
 					</div>
