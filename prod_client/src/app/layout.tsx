@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Instrument_Serif, Manrope, Public_Sans } from "next/font/google";
 import ColorLab from "@/components/debug/ColorLab";
 import FontLab from "@/components/debug/FontLab";
+import MastheadLab from "@/components/debug/MastheadLab";
 import MoonStage from "@/components/site/MoonStage";
 import PageTransition from "@/components/site/PageTransition";
 import { DEBUG_ENABLED } from "@/lib/flags";
@@ -57,6 +58,7 @@ export default function RootLayout({
 					<>
 						<FontLab />
 						<ColorLab />
+						<MastheadLab />
 					</>
 				)}
 			</body>

@@ -1,52 +1,32 @@
+"use client";
+
 import type { ReactNode } from "react";
+import { useMastheadShape } from "@/lib/mastheadShape";
 import Fade from "./Fade";
 import MoonLimb from "./MoonLimb";
 import Navbar, { ON_PAPER } from "./Navbar";
+import PaperGrain from "./PaperGrain";
 
-// HOW FAR THE PAPER HANGS BELOW THE BAR — the room the limb has to fall into,
-// and the comp's own expression for it rather than a rounded-off equivalent.
+// HOW FAR THE PAPER HANGS BELOW THE BAR — the moon's depth.
 //
-// WRITTEN AGAINST THE SAME TOKEN THE LOCKUP IS SIZED FROM, which is what makes it
-// hold. The mark is `--spacing-xl * 1.45` and this is `* 0.36`, so bar and belly
-// are two readings of one number and the masthead comes out at 1.81 of it plus
-// the two paddings — 112px at 1440. Pinned to a `vw` of its own, as it was, the
-// belly drifted against the lockup at every width and was 38px where the comp
-// wanted 22.
-export const BELLY =
-	"calc(var(--spacing-xl) * 0.36 + var(--spacing-2xs) - 2px)";
+// Deep enough that the bar's outer controls (the offer especially) still sit on
+// the paper at `LIMB_EDGE`: a shallower sag pinches past them into the void.
+export const BELLY = "calc(var(--spacing-xl) * 1.35)";
+
+// HOW FAR THE BAR'S CONTROLS STAND IN FROM THE CHORD ENDS. A shallower moon
+// narrows faster, so the inset is larger than a deep segment would need — enough
+// that the (now smaller) lockup's foot still sits on the paper.
+const LIMB_EDGE = "clamp(6.5rem, 14vw, 16rem)";
 
 // WHERE THE LABEL SITS, measured from the top of the bar. It rides in the gap the
 // two nav groups leave in the middle of the header — not below them — which is
 // why this is a small fixed offset and not a fraction of the masthead's height.
 const LABEL_TOP = "calc(var(--spacing-2xs) + 12px)";
 
-// THE TWO CAPTIONS ARE PINNED TO OPPOSITE ENDS, not spaced within a column.
-//
-// They were a flex column with equal flexers above and below the prompt, which
-// kept them equidistant from each other — a relationship neither of them actually
-// has. The label belongs to the BAR and the prompt belongs to the LIMB, and each
-// is anchored to the thing it belongs to: the label a fixed drop from the top
-// edge, the prompt a hair off the bottom, where the paper is deepest. Tie them to
-// each other instead and the prompt climbs whenever the label moves.
-const PROMPT_BOTTOM = "var(--spacing-2xs)";
-
 // ---------------------------------------------------------------------------
-// THE PROMPT IS SET TO THE COMP'S OWN MEASUREMENTS, converted rather than copied.
-//
-// The comp draws this caption as SVG text — a 1600 × 68 viewBox laid out at
-// `min(96vw, 1560px)` wide, type at 48 of those units, sitting on an arc whose
-// midpoint puts the BASELINE at y = 44, which is 24 units up from the foot of
-// that box. We are not drawing an SVG, so what has to be carried across is not
-// the drawing but the two numbers a reader can actually see: how big the type is
-// and where its baseline lands.
-//
-// Both convert at one rate — the scale the comp's box is drawn at — so that rate
-// is named once and everything else is a multiple of it. This is why the prompt
-// was sitting on the limb: the block is pinned at `--spacing-2xs` in both, but
-// the comp's SVG carries 24 units of EMPTY BOX under its baseline and our bare
-// span carries only the font's descent, so our type landed the best part of half
-// its own height lower. It was also a quarter too large, `--text-xl` being a
-// type-scale step rather than this drawing's own size.
+// THE PROMPT IS SET TO THE COMP'S OWN SIZE: 48 units of a 1600-wide viewBox laid
+// out at `min(96vw, 1560px)`. Vertical place is not a copied number — the title
+// is centred between the label and the moon's foot (see the caption well below).
 // ---------------------------------------------------------------------------
 
 // One unit of the comp's viewBox, in CSS pixels: 96vw / 1600, capped where its
@@ -62,42 +42,6 @@ const UNIT = "min(0.06vw, 0.975px)";
 // same moment in the same masthead, disagreeing by 10px reads as two pages built
 // by different hands. The comp states a size for this slot; that is the size.
 const TITLE_SIZE = `calc(48 * ${UNIT})`;
-
-// HOW FAR THE TYPE RIDES UP so its baseline lands where the comp puts it, in `em`
-// of the prompt's own size — so it holds at every width without a second copy of
-// the scale.
-//
-// 24 units of clear box under the baseline is half of the 48-unit type, and a
-// `leading-none` line box already puts its own baseline 0.1706em above the foot
-// of the box. The lift is the difference: 0.5 − 0.1706.
-//
-// THE 0.1706 IS A PROPERTY OF THE FACE — half of Instrument Serif's descent minus
-// ascent — and is MEASURED, not derived: put a zero-height inline-block in the
-// line and read where its bottom lands. Re-measure it if the serif is ever
-// changed, exactly as the wordmark's ratio is re-measured when its face moves.
-const PROMPT_LIFT = "0.3294em";
-
-// THE SAME RULE FOR THE NAME, in the name's own face.
-//
-// The leaderboard's title sits in the same slot and was getting none of this: its
-// baseline landed 0.132em above the foot of the block against the prompt's half an
-// em, so it rode 15px lower and finished up on the limb — the block's foot clears
-// the paper by 4px, and a `leading-none` box hangs the type most of the way down
-// that. The comp has no leaderboard to copy, so what carries across is the
-// PROPORTION the comp does state — baseline at half the type's own size above the
-// foot — which is a rule about a title in this slot rather than about a caption on
-// an arc.
-//
-// 0.5 − 0.132, and the 0.132 is MANROPE'S, measured on the live element the way
-// PROMPT_LIFT's was: drop a zero-height inline-block in the line and read where its
-// bottom lands. It is not the serif's number and could not be — this is the whole
-// reason the correction is per-voice. Re-measure if the sans is ever changed.
-const NAME_LIFT = "0.368em";
-
-// The comp fits the caption to 0.86 of its arc, which is 1308 units of the 1520
-// between the arc's ends. Wider than the 64vw that was here, and it is the comp's
-// number rather than a guess at one.
-const PROMPT_ROOM = `calc(1308 * ${UNIT})`;
 
 /**
  * WHERE THE PROMPT PIVOTS: a point far below the page, so the caption ROLLS.
@@ -125,6 +69,58 @@ const PROMPT_ROOM = `calc(1308 * ${UNIT})`;
  */
 export const ROLL_ORIGIN = "50% -9600px";
 
+// ---------------------------------------------------------------------------
+// THE FIVE FIGURES.
+//
+// The bar's contents are the same row of controls in every one of them, dead
+// straight, and that is the point: what is being compared is only ever what the
+// PAPER does around a layout that does not move. See `mastheadShape` for the
+// switch and the reasoning behind the set.
+// ---------------------------------------------------------------------------
+
+// How far the paper turns as it ends, for the one figure that ends full-bleed on a
+// level edge. The limb's own shading follows its circle; a straight edge has to be
+// given the same darkening by hand or the paper reads as a sheet of white cut with
+// scissors.
+//
+// NOT ON THE ISLAND, which is the same edge and a different object. A slab floating
+// clear of the page has nothing to turn away INTO — the shade there reads as what
+// the house style calls a component with an altered background inside it, and the
+// thing that separates a bright slab from a black page is that it is bright.
+//
+// NOR ON THE SPLIT'S BAR, where the edge is a lie: the paper does not end at the
+// bar's foot, it carries on down the tongue. Shading it drew a band across the
+// tongue's shoulders and stepped the tone at the join.
+const EDGE_TURN = "inset 0 -22px 40px -24px rgba(9,11,16,0.34)";
+
+// THE FEATHER, and it is deliberately shallower than it wants to be. The rim can
+// dissolve over any distance at all; what bounds it is the prompt, which sits in
+// the same paper and has to stay on stock that is still opaque. This is the depth
+// the belly below is opened up by, so the fade happens entirely under the type.
+const VEIL = 30;
+const VEIL_ROOM = "24px";
+
+// THE TONGUE: the arc, cut loose from the bar and given to the arena.
+//
+// NARROW ENOUGH TO READ AS AN OBJECT rather than as a second bar — at the full
+// window it would simply be the limb again with a seam above it. The overhang
+// comes down with the width for the reason given at MoonLimb: sixty pixels either
+// side of a chord this short flattens the arc out of existence.
+const TONGUE = {
+	width: "min(58vw, 780px)",
+	height: `calc(${TITLE_SIZE} + var(--text-2xs) + var(--spacing-xl) * 0.58)`,
+	sag: 18,
+	overhang: 16,
+} as const;
+
+function Caption({ children }: { children: ReactNode }) {
+	return (
+		<span className="font-mono text-2xs tracking-[0.24em] whitespace-nowrap uppercase text-ink-40">
+			{children}
+		</span>
+	);
+}
+
 export default function Masthead({
 	label,
 	placement = "overlay",
@@ -134,18 +130,129 @@ export default function Masthead({
 	placement?: "overlay" | "flow";
 	children: ReactNode;
 }) {
+	const shape = useMastheadShape();
+
+	const frame = `pointer-events-none [&_a]:pointer-events-auto [&_button]:pointer-events-auto ${
+		placement === "overlay"
+			? "absolute inset-x-0 top-0"
+			: "relative flex-none"
+	}`;
+
+	// THE SLAB FLOATS FREE OF ALL FOUR EDGES, which is the whole of this figure:
+	// with no edge to meet, there is no geometry for a straight row to disagree
+	// with. The prompt cannot follow it — a slab sized to the nav has no belly to
+	// hang a title in — so it goes on the page's own black, where it is the only
+	// bright thing below the bar.
+	if (shape === "island")
+		return (
+			<div className={frame}>
+				<div className="px-sm pt-sm">
+					<div className="relative overflow-hidden rounded-[14px] bg-paper">
+						<PaperGrain />
+						<Navbar />
+						<div className="absolute inset-0" style={ON_PAPER}>
+							<Fade
+								enter={700}
+								delay={180}
+								leave={220}
+								className="absolute inset-0 flex items-center justify-center px-lg"
+							>
+								<Caption>{label}</Caption>
+							</Fade>
+						</div>
+					</div>
+				</div>
+
+				<Fade
+					enter={700}
+					delay={240}
+					leave={220}
+					className="flex justify-center px-lg pt-sm pb-2xs"
+				>
+					<div className="flex min-w-0 max-w-[64vw] justify-center">
+						{children}
+					</div>
+				</Fade>
+			</div>
+		);
+
+	// THE BAR STANDS UP AND THE ARC MOVES DOWN A ROW. Navigation is a straight
+	// object because it is a row of straight objects; the arena is not, and gets
+	// the curve to itself — so the two never have to be the same shape. They are
+	// the same paper and meet without a seam, which is what keeps it one masthead
+	// rather than two stacked bands.
+	if (shape === "split")
+		return (
+			<div className={frame}>
+				<div className="relative bg-paper">
+					<PaperGrain />
+					<Navbar />
+				</div>
+
+				<div
+					className="relative mx-auto"
+					style={{ width: TONGUE.width, height: TONGUE.height }}
+				>
+					<MoonLimb
+						sag={TONGUE.sag}
+						chord={(width) => width + 2 * TONGUE.overhang}
+					/>
+					<div className="absolute inset-0" style={ON_PAPER}>
+						<Fade
+							enter={700}
+							delay={180}
+							leave={220}
+							className="absolute inset-0"
+						>
+							{/* Label at the top of the tongue; prompt centred in what
+							    remains so the gaps above and below it stay equal. */}
+							<div className="absolute inset-x-0 top-2xs bottom-0 flex flex-col px-md">
+								<div className="flex flex-none justify-center">
+									<Caption>{label}</Caption>
+								</div>
+								<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+									<div className="flex min-w-0 max-w-[52vw] justify-center">
+										{children}
+									</div>
+								</div>
+							</div>
+						</Fade>
+					</div>
+				</div>
+			</div>
+		);
+
+	const veiled = shape === "veil";
+
 	return (
 		<div
-			className={`pointer-events-none [&_a]:pointer-events-auto [&_button]:pointer-events-auto ${
-				placement === "overlay"
-					? "absolute inset-x-0 top-0"
-					: "relative flex-none"
-			}`}
-			style={{ paddingBottom: BELLY }}
+			className={frame}
+			style={{
+				paddingBottom: veiled ? `calc(${BELLY} + ${VEIL_ROOM})` : BELLY,
+			}}
 		>
-			<MoonLimb />
+			{shape === "flat" ? (
+				<div
+					className="absolute inset-0 overflow-hidden bg-paper"
+					style={{ boxShadow: EDGE_TURN }}
+				>
+					<PaperGrain />
+				</div>
+			) : (
+				<MoonLimb
+					// THE CHORD IS THE TOP EDGE OF THE FRAME. Ends on the two top
+					// corners, sag through the whole host — so what you see is a moon
+					// segment, not a bar with a curved bottom. The overhang default
+					// would push those ends past the frame and flatten the limb back
+					// into the pseudo-navbar this is leaving behind.
+					sag="host"
+					chord={(width) => width}
+					fade={veiled ? VEIL : undefined}
+					shade={!veiled}
+				/>
+			)}
 
-			<Navbar />
+			<Navbar edge={LIMB_EDGE} />
 
 			{/* In the belly, which is paper — so it takes the bar's inverted palette
 			    even though it sits outside the bar.
@@ -156,24 +263,28 @@ export default function Masthead({
 			    ink against the paper. */}
 			<div className="absolute inset-0" style={ON_PAPER}>
 				<Fade enter={700} delay={180} leave={220} className="absolute inset-0">
+					{/* THE PROMPT SITS IN THE MIDDLE OF WHAT IS LEFT. Label pinned at
+					    the top of this well; the title is centred in the flex room
+					    below it — so the gap from the label to the prompt equals the
+					    gap from the prompt to the moon's foot, and neither distance is
+					    a number we have to retune when the belly moves. */}
 					<div
-						className="absolute inset-x-0 flex justify-center px-lg"
-						style={{ top: LABEL_TOP }}
+						className="absolute inset-x-0 flex flex-col px-lg"
+						style={{
+							top: LABEL_TOP,
+							bottom: veiled ? VEIL_ROOM : 0,
+						}}
 					>
-						<span className="font-mono text-2xs tracking-[0.24em] whitespace-nowrap uppercase text-ink-40">
-							{label}
-						</span>
-					</div>
-
-					{/* CENTRED ON THE WINDOW, not laid across it. A full-width flex row
-					    would be centred too, but it would also stretch under the whole
-					    bar and take the pointer with it; this is only as wide as the
-					    prompt it holds. */}
-					<div
-						className="absolute left-1/2 flex min-w-0 max-w-[64vw] -translate-x-1/2 justify-center"
-						style={{ bottom: PROMPT_BOTTOM }}
-					>
-						{children}
+						<div className="flex flex-none justify-center">
+							<Caption>{label}</Caption>
+						</div>
+						<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+							{/* Only as wide as the prompt — a full-width row would take
+							    the pointer under the whole bar. */}
+							<div className="flex min-w-0 max-w-[64vw] justify-center">
+								{children}
+							</div>
+						</div>
 					</div>
 				</Fade>
 			</div>
@@ -205,29 +316,14 @@ const VOICE = {
 	name: "font-sans font-black tracking-[-0.015em] uppercase",
 } as const;
 
-// SIZE AND LIFT TRAVEL WITH THE VOICE, not with the block. The block is the
-// masthead's title slot and both voices sit in it, and both now land their baseline
-// half their own size above its foot — but they cannot get there by the same
-// number. The correction is the gap between that target and where the FACE already
-// puts its baseline in a `leading-none` box, and that second term is a property of
-// the typeface: 0.180em for the serif against 0.132em for the sans. Hoisted onto
-// the block, one of the two would be riding a measurement of a face it is not set
-// in, which is a quarter of a pixel per em of being quietly wrong.
-//
-// SIZE IS SHARED, and it is the one thing here that is. Both voices take
-// TITLE_SIZE, so the two titles are the same height whichever page you arrive on;
-// only the lift differs, and only because the faces do. That is the split worth
-// holding — one number for what the slot IS, and a per-face correction for what
-// each typeface does inside it.
+// SIZE IS SHARED across voices. Both titles take TITLE_SIZE so the slot is the
+// same height whichever page you arrive on. The old per-face baseline lift is
+// gone: the prompt is centred between the label and the moon's foot by its box
+// edges, and a translateY would steal from the gap above and give it to the gap
+// below.
 const VOICE_STYLE: Partial<Record<keyof typeof VOICE, React.CSSProperties>> = {
-	prompt: {
-		fontSize: TITLE_SIZE,
-		transform: `translateY(-${PROMPT_LIFT})`,
-	},
-	name: {
-		fontSize: TITLE_SIZE,
-		transform: `translateY(-${NAME_LIFT})`,
-	},
+	prompt: { fontSize: TITLE_SIZE },
+	name: { fontSize: TITLE_SIZE },
 };
 
 export function Title({

@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import LogoMark from "@/components/LogoMark";
@@ -136,15 +137,26 @@ export const ON_PAPER = {
 const NAV_LEFT: { label: string; href?: string }[] = [
 	{ label: "About", href: "/about" },
 	{ label: "FAQ", href: "/faq" },
-	// ARENA JOINS THE READING SIDE. The split was "what the site is ABOUT" on the
-	// left and "what it DOES" on the right; the right is now a pair of buttons, and
-	// a plain text link standing next to two solid controls reads as something that
-	// failed to become one. Arena is also the page you come BACK to, which makes it
-	// a way of navigating rather than an offer.
-	{ label: "Arena", href: "/" },
 ];
 // The right is no longer a list at all: it is two controls, cut to interlock —
-// see the pair at the foot of this file.
+// see the pair at the foot of this file. The board is a podium mark rather than
+// the word — the label is on `aria-label`, so the control stays a named link.
+
+/** Three steps: short, tall, medium — the board, without the word. */
+function PodiumMark({ className }: { className?: string }) {
+	return (
+		<svg
+			aria-hidden
+			viewBox="0 0 24 24"
+			fill="currentColor"
+			className={className}
+		>
+			<rect x="1.5" y="13" width="6" height="9" rx="0.5" />
+			<rect x="9" y="4" width="6" height="18" rx="0.5" />
+			<rect x="16.5" y="9" width="6" height="13" rx="0.5" />
+		</svg>
+	);
+}
 
 /**
  * The site's navbar.
@@ -167,26 +179,24 @@ const NAV_LEFT: { label: string; href?: string }[] = [
  * into; with no middle track there is nothing to stretch, and two copies of the
  * same padding is one more place for the two sides to drift apart.
  */
-export default function Navbar() {
+export default function Navbar({
+	edge = "var(--spacing-sm)",
+}: {
+	/** Horizontal inset of the bar's controls from the host's edges. */
+	edge?: string;
+}) {
 	const pathname = usePathname();
 
 	// THE READING GROUP, AND IT IS SQUARE ALL THE WAY ALONG.
 	//
 	// ABOUT's leading edge stands up now. It was the group's one raked edge — a
 	// `cap-start`, whose whole distinguishing feature IS that slant — so taking the
-	// slant off makes it a plain rectangle like the two beside it, and the row reads
-	// as three text links rather than as a cut object with one bevelled end. Worth
-	// knowing this is a deliberate step away from the comp, which does rake it, by
-	// the same 13px: `polygon(0 0, 100% 0, 100% 100%, 13px 100%)`. Nothing MOVES,
-	// though — `clip-path` paints, it does not lay out — so the three labels stay
-	// exactly where the comp puts them.
-	//
-	// The `side` argument went with it. It existed to choose which END of a pair was
-	// raked, and the right-hand pair became two standalone buttons some time ago, so
-	// it was already deciding between one live branch and one dead one; with the
-	// left-hand rake gone it decides nothing at all.
-	// THE ARENA IS ONLY ACTIVE ON EXACTLY "/". Every path starts with a slash, so a
-	// `startsWith` test would light it on every page of the site.
+	// slant off makes it a plain rectangle like the one beside it, and the row reads
+	// as text links rather than as a cut object with one bevelled end. Worth knowing
+	// this is a deliberate step away from the comp, which does rake it, by the same
+	// 13px: `polygon(0 0, 100% 0, 100% 100%, 13px 100%)`. Nothing MOVES, though —
+	// `clip-path` paints, it does not lay out — so the labels stay exactly where the
+	// comp puts them.
 	const isHere = (href?: string) =>
 		href
 			? href === "/"
@@ -194,8 +204,8 @@ export default function Navbar() {
 				: pathname.startsWith(href)
 			: false;
 
-	const ruled = (label: string, active: boolean) => (
-		<span className='relative'>
+	const ruled = (label: ReactNode, active: boolean) => (
+		<span className='relative inline-flex'>
 			{label}
 			<span
 				aria-hidden
@@ -233,8 +243,8 @@ export default function Navbar() {
 
 	return (
 		<header
-			style={ON_PAPER}
-			className='relative z-20 flex items-center justify-between gap-lg px-sm pt-[2px] pb-xs'
+			style={{ ...ON_PAPER, paddingLeft: edge, paddingRight: edge }}
+			className='relative z-20 flex items-center justify-between gap-lg pt-[2px] pb-xs'
 		>
 			{/* --- the mark ---------------------------------------------------- */}
 			<div className='flex items-center gap-md'>
@@ -244,15 +254,13 @@ export default function Navbar() {
 				    crawlable, and has to announce itself as a link. An onClick that
 				    pushed the route would look identical and be none of those things.
 
-				    IT POINTS AT THE ARENA, which is "/" — the same place the ARENA nav
-				    item goes. Two routes to one page is not a duplication to fix: a
-				    wordmark that goes home is a convention people arrive already
-				    knowing, and the nav item is the one that says so out loud.
+				    IT POINTS AT THE ARENA, which is "/" — home. The wordmark that goes
+				    home is a convention people arrive already knowing; there is no
+				    separate Arena nav item to say it out loud.
 
-				    NOT MARKED `aria-current`, unlike that nav item. The wordmark is the
-				    site's name wherever you are standing; announcing the masthead as
-				    the current page would say it on every visit to "/" and mean nothing
-				    the nav item has not already said. */}
+				    NOT MARKED `aria-current`. The wordmark is the site's name wherever
+				    you are standing; announcing the masthead as the current page would
+				    say it on every visit to "/" and mean little. */}
 				<Link
 					href='/'
 					// ONE SIZE FOR THE WHOLE LOCKUP. The byline runs at `--lockup` and the
@@ -279,7 +287,7 @@ export default function Navbar() {
 					// never had it to undo.
 					className='group/mark flex flex-none cursor-pointer items-center gap-2xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent'
 				>
-					<LogoMark className='size-[calc(var(--spacing-xl)*1.45)] flex-none' />
+					<LogoMark className='size-[calc(var(--spacing-xl)*1.05)] flex-none' />
 					<div className='flex flex-col justify-center gap-2xs'>
 						{/* THE TYPE IS SET ON THE WRAPPER, not on each copy, and that is
 						    what actually holds the two in register. Both copies now
@@ -505,35 +513,28 @@ export default function Navbar() {
 			    gradient set on hover would snap in while everything else eased.
 			    Fading a copy over the ink is the only way the two arrive together. */}
 			<div className='flex items-center gap-2xs'>
-				{/* THE BOARD KEEPS ITS SLAB AND LOSES ITS FLOOD. It is still cut to
-				    interlock with the offer beside it — same sizing, same type, the
-				    outer edge stood up and the inner one raked, so the two read as one
-				    bar that ends where it ends — and only what happens on hover has
-				    changed. It used to fill to the mark, which is the ink the offer
-				    already wears at REST: pointing at the quieter half turned it into a
-				    copy of the louder one, and for that moment the bar carried two solid
-				    controls and no hierarchy.
-
-				    WHAT IT DOES INSTEAD BELONGS TO THE ROW. The accent rule draws under
-				    its label exactly as it does under ABOUT, FAQ and ARENA — so the four
-				    destinations in this bar answer the pointer the same way wherever they
-				    sit, and the slab itself holds still. See MOTION.outline in Button.
-
-				    IT CARRIES ITS OWN `group/nav` because that rule is written against a
-				    group; the reasoning is at `ruled`. */}
+				{/* THE BOARD IS A MARK NOW. Same interlocking cut with the offer beside
+				    it — upright out, rake in — but the slab only has to clear the
+				    podium, not the word. The accent rule still draws under the icon the
+				    way it does under ABOUT and FAQ, so every destination in the bar
+				    answers the pointer the same way. See MOTION.outline in Button. */}
 				<nav
 					aria-label='SceneBench standings'
 					className='group/nav flex items-center'
 				>
 					<Button
 						href='/leaderboard'
+						aria-label='Leaderboard'
 						aria-current={
 							isHere("/leaderboard") ? "page" : undefined
 						}
 						variant='outline'
 						shape='upright-start'
 					>
-						{ruled("Leaderboard", isHere("/leaderboard"))}
+						{ruled(
+							<PodiumMark className='size-[1.15em]' />,
+							isHere("/leaderboard"),
+						)}
 					</Button>
 				</nav>
 				<Button
@@ -556,7 +557,7 @@ export default function Navbar() {
 					// and queue a build on both models.
 					onClick={() => {}}
 				>
-					Build one yourself
+					Generate
 				</Button>
 			</div>
 		</header>
