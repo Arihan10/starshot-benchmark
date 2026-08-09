@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import LogoMark from "@/components/LogoMark";
@@ -139,64 +139,33 @@ const NAV_LEFT: { label: string; href?: string }[] = [
 	{ label: "FAQ", href: "/faq" },
 ];
 // The right is no longer a list at all: it is two controls, cut to interlock —
-// see the pair at the foot of this file. The board is a podium mark rather than
-// the word — the label is on `aria-label`, so the control stays a named link.
-
-/** Three steps: short, tall, medium — the board, without the word. */
-function PodiumMark({ className }: { className?: string }) {
-	return (
-		<svg
-			aria-hidden
-			viewBox="0 0 24 24"
-			fill="currentColor"
-			className={className}
-		>
-			<rect x="1.5" y="13" width="6" height="9" rx="0.5" />
-			<rect x="9" y="4" width="6" height="18" rx="0.5" />
-			<rect x="16.5" y="9" width="6" height="13" rx="0.5" />
-		</svg>
-	);
-}
+// see the pair at the foot of this file.
 
 /**
  * The site's navbar.
  *
- * TWO GROUPS, PUSHED APART — and nothing at all in the middle. This was a three
- * column grid with a spacer track sized to a `TITLE_BERTH` of `min(38vw, 520px)`,
- * reserving a berth in the bar for a moon that does not sit in the bar: the disc
- * is drawn behind the whole masthead and the prompt hangs off the BOTTOM of it,
- * a full row below this one. There was nothing in the middle to clear. What the
- * berth actually did was hold the two groups hundreds of pixels apart at every
- * width, which is why the offer sat so far in from the right edge.
+ * THREE COLUMNS: reading group, open berth, offer. The berth is the gap between
+ * the two clusters — Masthead hangs the moon from it so the curve only starts
+ * once the buttons have ended, and the bar stays straight under every control.
  *
- * `space-between` leaves exactly the gap the two groups do not use, and the
- * caption rides in it — see Masthead, which centres the label on the window at
- * this height. `gap-lg` is the floor under that: at a narrow enough window the
- * groups stop separating and hold a large gap instead of touching.
+ * `gap-lg` is the air between a cluster and the berth. At a narrow window the
+ * berth collapses first; the groups keep their gap rather than colliding.
  *
- * VERTICAL PADDING IS THE HEADER'S NOW, not the groups'. It sat on the groups so
- * that the middle track could stretch the bar's full height for the moon to hang
- * into; with no middle track there is nothing to stretch, and two copies of the
- * same padding is one more place for the two sides to drift apart.
+ * VERTICAL PADDING IS THE HEADER'S NOW, not the groups'.
  */
 export default function Navbar({
 	edge = "var(--spacing-sm)",
+	berthRef,
 }: {
 	/** Horizontal inset of the bar's controls from the host's edges. */
 	edge?: string;
+	/** The open middle track — Masthead sizes the moon to this box. */
+	berthRef?: Ref<HTMLDivElement>;
 }) {
 	const pathname = usePathname();
 
-	// THE READING GROUP, AND IT IS SQUARE ALL THE WAY ALONG.
-	//
-	// ABOUT's leading edge stands up now. It was the group's one raked edge — a
-	// `cap-start`, whose whole distinguishing feature IS that slant — so taking the
-	// slant off makes it a plain rectangle like the one beside it, and the row reads
-	// as text links rather than as a cut object with one bevelled end. Worth knowing
-	// this is a deliberate step away from the comp, which does rake it, by the same
-	// 13px: `polygon(0 0, 100% 0, 100% 100%, 13px 100%)`. Nothing MOVES, though —
-	// `clip-path` paints, it does not lay out — so the labels stay exactly where the
-	// comp puts them.
+	// THE READING GROUP IS SQUARE ALL THE WAY ALONG. ABOUT's rake was taken off
+	// so the row reads as text links rather than a cut object.
 	const isHere = (href?: string) =>
 		href
 			? href === "/"
@@ -205,7 +174,7 @@ export default function Navbar({
 			: false;
 
 	const ruled = (label: ReactNode, active: boolean) => (
-		<span className='relative inline-flex'>
+		<span className="relative inline-flex">
 			{label}
 			<span
 				aria-hidden
@@ -224,16 +193,16 @@ export default function Navbar({
 					key={item.label}
 					href={item.href}
 					aria-current={active ? "page" : undefined}
-					variant='quiet'
-					shape='square'
+					variant="quiet"
+					shape="square"
 				>
 					{ruled(item.label, active)}
 				</Button>
 			) : (
 				<Button
 					key={item.label}
-					variant='quiet'
-					shape='square'
+					variant="quiet"
+					shape="square"
 					onClick={() => {}}
 				>
 					{ruled(item.label, active)}
@@ -244,25 +213,27 @@ export default function Navbar({
 	return (
 		<header
 			style={{ ...ON_PAPER, paddingLeft: edge, paddingRight: edge }}
-			className='relative z-20 flex items-center justify-between gap-lg pt-[2px] pb-xs'
+			className="relative z-20 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-lg pt-[2px] pb-xs"
 		>
 			{/* --- the mark ---------------------------------------------------- */}
-			<div className='flex items-center gap-md'>
+			<div className="flex items-center gap-md">
 				{/* THE LOCKUP GOES HOME, and it is an ANCHOR now rather than a button
 				    with a handler — the same rule the Button component is written to:
 				    a control that navigates has to be middle-clickable, copyable and
 				    crawlable, and has to announce itself as a link. An onClick that
 				    pushed the route would look identical and be none of those things.
 
-				    IT POINTS AT THE ARENA, which is "/" — home. The wordmark that goes
-				    home is a convention people arrive already knowing; there is no
-				    separate Arena nav item to say it out loud.
+				    IT POINTS AT THE ARENA, which is "/" — the same place the ARENA nav
+				    item goes. Two routes to one page is not a duplication to fix: a
+				    wordmark that goes home is a convention people arrive already
+				    knowing, and the nav item is the one that says so out loud.
 
-				    NOT MARKED `aria-current`. The wordmark is the site's name wherever
-				    you are standing; announcing the masthead as the current page would
-				    say it on every visit to "/" and mean little. */}
+				    NOT MARKED `aria-current`, unlike that nav item. The wordmark is the
+				    site's name wherever you are standing; announcing the masthead as
+				    the current page would say it on every visit to "/" and mean nothing
+				    the nav item has not already said. */}
 				<Link
-					href='/'
+					href="/"
 					// ONE SIZE FOR THE WHOLE LOCKUP. The byline runs at `--lockup` and the
 					// wordmark at a fixed multiple of it, so scaling the pair is one number
 					// and the flush relationship cannot be broken by resizing either alone.
@@ -287,7 +258,7 @@ export default function Navbar({
 					// never had it to undo.
 					className='group/mark flex flex-none cursor-pointer items-center gap-2xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent'
 				>
-					<LogoMark className='size-[calc(var(--spacing-xl)*1.05)] flex-none' />
+					<LogoMark className='size-[calc(var(--spacing-xl)*1.45)] flex-none' />
 					<div className='flex flex-col justify-center gap-2xs'>
 						{/* THE TYPE IS SET ON THE WRAPPER, not on each copy, and that is
 						    what actually holds the two in register. Both copies now
@@ -491,68 +462,43 @@ export default function Navbar({
 				{/* THE GROUP IS THE NAV, not each link, because the rule is shared: an
 				    item has to know that some OTHER item is being pointed at in order to
 				    give the line up. `group/nav` is what makes that knowable in CSS —
-				    the three links are its descendants, so each one can be styled on
+				    the reading links are its descendants, so each one can be styled on
 				    whether the row is hot as well as on whether it is itself. */}
 				<nav
-					aria-label='About SceneBench'
-					className='group/nav flex items-center'
+					aria-label="About SceneBench"
+					className="group/nav flex items-center"
 				>
 					{pair(NAV_LEFT)}
 				</nav>
 			</div>
 
-			{/* --- the offer ------------------------------------------------------
-			    The one solid button up here, and the only one on the page outside the
-			    vote itself.
+			{/* Open middle — the moon's chord lands on this track so the arch
+			    begins only after the reading group and ends before the offer. */}
+			<div ref={berthRef} aria-hidden className="min-w-0" />
 
-			    ITS HOVER IS THE MARK'S OWN GLASS. The site is black, white and one
-			    accent, and the accent is the logo's — so the control the page most
-			    wants pressed lights up in the same material as the name in the
-			    opposite corner. It rides OVER the button's own hover rather than
-			    replacing it, because `background-image` does not interpolate: a
-			    gradient set on hover would snap in while everything else eased.
-			    Fading a copy over the ink is the only way the two arrive together. */}
-			<div className='flex items-center gap-2xs'>
-				{/* THE BOARD IS A MARK NOW. Same interlocking cut with the offer beside
-				    it — upright out, rake in — but the slab only has to clear the
-				    podium, not the word. The accent rule still draws under the icon the
-				    way it does under ABOUT and FAQ, so every destination in the bar
-				    answers the pointer the same way. See MOTION.outline in Button. */}
+			{/* --- the offer ------------------------------------------------------
+			    Origin's interlocking pair. Hover is the mark's own glass — see
+			    Button's sweep. */}
+			<div className="flex items-center gap-2xs">
 				<nav
-					aria-label='SceneBench standings'
-					className='group/nav flex items-center'
+					aria-label="SceneBench standings"
+					className="group/nav flex items-center"
 				>
 					<Button
-						href='/leaderboard'
-						aria-label='Leaderboard'
+						href="/leaderboard"
 						aria-current={
 							isHere("/leaderboard") ? "page" : undefined
 						}
-						variant='outline'
-						shape='upright-start'
+						variant="outline"
+						shape="upright-start"
 					>
-						{ruled(
-							<PodiumMark className='size-[1.15em]' />,
-							isHere("/leaderboard"),
-						)}
+						{ruled("Leaderboard", isHere("/leaderboard"))}
 					</Button>
 				</nav>
 				<Button
-					variant='solid'
+					variant="solid"
 					sweep
-					// THE EDGE IS BACK, and the note that removed it had the mechanism
-					// right and the conclusion backwards. It is drawn in `mark` and so is
-					// this button's ground, so at rest it is black on black and does
-					// nothing — and the ONE thing it does is hold the sweep a pixel in
-					// and leave a black frame round the gradient on hover.
-					//
-					// That frame is the point. Under the sweep the button is four pale
-					// stops of near-white glass, and in a light bar a pale slab with no
-					// edge has nothing to end it: the control dissolves into the paper at
-					// exactly the moment it is being pointed at. The border is what keeps
-					// the silhouette — the rake, the upright, the whole shape it is cut
-					// to — legible while the fill is at its lightest.
-					shape='upright-end'
+					shape="upright-end"
 					// #TODO: no action yet. This should take a prompt from the visitor
 					// and queue a build on both models.
 					onClick={() => {}}

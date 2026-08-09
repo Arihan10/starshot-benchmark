@@ -1,27 +1,11 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useMastheadShape } from "@/lib/mastheadShape";
 import Fade from "./Fade";
 import MoonLimb from "./MoonLimb";
 import Navbar, { ON_PAPER } from "./Navbar";
-import PaperGrain from "./PaperGrain";
-
-// HOW FAR THE PAPER HANGS BELOW THE BAR — the moon's depth.
-//
-// Deep enough that the bar's outer controls (the offer especially) still sit on
-// the paper at `LIMB_EDGE`: a shallower sag pinches past them into the void.
-export const BELLY = "calc(var(--spacing-xl) * 1.35)";
-
-// HOW FAR THE BAR'S CONTROLS STAND IN FROM THE CHORD ENDS. A shallower moon
-// narrows faster, so the inset is larger than a deep segment would need — enough
-// that the (now smaller) lockup's foot still sits on the paper.
-const LIMB_EDGE = "clamp(6.5rem, 14vw, 16rem)";
-
-// WHERE THE LABEL SITS, measured from the top of the bar. It rides in the gap the
-// two nav groups leave in the middle of the header — not below them — which is
-// why this is a small fixed offset and not a fraction of the masthead's height.
-const LABEL_TOP = "calc(var(--spacing-2xs) + 12px)";
 
 // ---------------------------------------------------------------------------
 // THE PROMPT IS SET TO THE COMP'S OWN SIZE: 48 units of a 1600-wide viewBox laid
@@ -42,6 +26,19 @@ const UNIT = "min(0.06vw, 0.975px)";
 // same moment in the same masthead, disagreeing by 10px reads as two pages built
 // by different hands. The comp states a size for this slot; that is the size.
 const TITLE_SIZE = `calc(48 * ${UNIT})`;
+
+// THE PROTRUDING MOON — a shallow segment hung from the navbar's open berth.
+// Width is measured from that berth so the arch starts only after the left
+// cluster and ends before the right; sag is the visible foot below the bar.
+const MOON_SAG = "calc(var(--spacing-xl) * 0.62)";
+
+// HOW FAR THE MIDDLE BUMP HANGS BELOW THE BAR. Same token as the moon's sag.
+export const BELLY = MOON_SAG;
+
+// WHERE THE LABEL SITS — the origin's own drop from the top of the masthead.
+// The prompt is then centred in whatever room remains below it (see the caption
+// well), so neither gap is a number we retune when the lip moves.
+const LABEL_TOP = "calc(var(--spacing-2xs) + 12px)";
 
 /**
  * WHERE THE PROMPT PIVOTS: a point far below the page, so the caption ROLLS.
@@ -131,6 +128,35 @@ export default function Masthead({
 	children: ReactNode;
 }) {
 	const shape = useMastheadShape();
+	const shellRef = useRef<HTMLDivElement>(null);
+	const berthRef = useRef<HTMLDivElement>(null);
+	const [moon, setMoon] = useState({ left: 0, width: 0 });
+
+	// The moon's chord is the navbar berth — measured, not guessed, so it stays
+	// clear of every control as the lockup and offer change width.
+	useLayoutEffect(() => {
+		const shell = shellRef.current;
+		const berth = berthRef.current;
+		if (!shell || !berth) return;
+
+		const sync = () => {
+			const s = shell.getBoundingClientRect();
+			const b = berth.getBoundingClientRect();
+			const left = b.left - s.left;
+			const width = b.width;
+			setMoon((prev) =>
+				prev.left === left && prev.width === width
+					? prev
+					: { left, width },
+			);
+		};
+
+		sync();
+		const observer = new ResizeObserver(sync);
+		observer.observe(shell);
+		observer.observe(berth);
+		return () => observer.disconnect();
+	}, [shape]);
 
 	const frame = `pointer-events-none [&_a]:pointer-events-auto [&_button]:pointer-events-auto ${
 		placement === "overlay"
@@ -148,7 +174,6 @@ export default function Masthead({
 			<div className={frame}>
 				<div className="px-sm pt-sm">
 					<div className="relative overflow-hidden rounded-[14px] bg-paper">
-						<PaperGrain />
 						<Navbar />
 						<div className="absolute inset-0" style={ON_PAPER}>
 							<Fade
@@ -185,7 +210,6 @@ export default function Masthead({
 		return (
 			<div className={frame}>
 				<div className="relative bg-paper">
-					<PaperGrain />
 					<Navbar />
 				</div>
 
@@ -224,69 +248,84 @@ export default function Masthead({
 
 	const veiled = shape === "veil";
 
+	// STRAIGHT BAR + BERTH-SIZED MOON LIP. The bump is only as wide as the open
+	// track between the nav clusters, so the bar's foot stays straight under
+	// every control and the arch begins only once the buttons have ended.
 	return (
-		<div
-			className={frame}
-			style={{
-				paddingBottom: veiled ? `calc(${BELLY} + ${VEIL_ROOM})` : BELLY,
-			}}
-		>
-			{shape === "flat" ? (
+		<div data-masthead className={frame}>
+			<div ref={shellRef} className="relative">
 				<div
-					className="absolute inset-0 overflow-hidden bg-paper"
-					style={{ boxShadow: EDGE_TURN }}
+					className="relative z-10 bg-paper"
+					style={
+						shape === "flat" ? { boxShadow: EDGE_TURN } : undefined
+					}
 				>
-					<PaperGrain />
+					<Navbar berthRef={berthRef} />
 				</div>
-			) : (
-				<MoonLimb
-					// THE CHORD IS THE TOP EDGE OF THE FRAME. Ends on the two top
-					// corners, sag through the whole host — so what you see is a moon
-					// segment, not a bar with a curved bottom. The overhang default
-					// would push those ends past the frame and flatten the limb back
-					// into the pseudo-navbar this is leaving behind.
-					sag="host"
-					chord={(width) => width}
-					fade={veiled ? VEIL : undefined}
-					shade={!veiled}
-				/>
-			)}
 
-			<Navbar edge={LIMB_EDGE} />
-
-			{/* In the belly, which is paper — so it takes the bar's inverted palette
-			    even though it sits outside the bar.
-
-			    ON_PAPER is handed to an element of its own rather than merged into a
-			    style literal alongside other properties: spread into another literal
-			    it does not survive to the DOM, and the captions silently lose their
-			    ink against the paper. */}
-			<div className="absolute inset-0" style={ON_PAPER}>
-				<Fade enter={700} delay={180} leave={220} className="absolute inset-0">
-					{/* THE PROMPT SITS IN THE MIDDLE OF WHAT IS LEFT. Label pinned at
-					    the top of this well; the title is centred in the flex room
-					    below it — so the gap from the label to the prompt equals the
-					    gap from the prompt to the moon's foot, and neither distance is
-					    a number we have to retune when the belly moves. */}
+				{shape !== "flat" && moon.width > 0 && (
 					<div
-						className="absolute inset-x-0 flex flex-col px-lg"
+						className="relative z-10 -mt-px"
 						style={{
-							top: LABEL_TOP,
-							bottom: veiled ? VEIL_ROOM : 0,
+							width: moon.width,
+							height: MOON_SAG,
+							marginLeft: moon.left,
 						}}
 					>
-						<div className="flex flex-none justify-center">
-							<Caption>{label}</Caption>
-						</div>
-						<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
-							{/* Only as wide as the prompt — a full-width row would take
-							    the pointer under the whole bar. */}
-							<div className="flex min-w-0 max-w-[64vw] justify-center">
+						<MoonLimb
+							// Chord = berth width, sag = host height → a shallow
+							// circular segment whose flat edge is the bar's foot.
+							sag="host"
+							chord={(width) => width}
+							fade={veiled ? VEIL : undefined}
+							// Same paper as the bar — no turn-away shade on a lip
+							// this shallow, or the bump reads as a second object.
+							shade={false}
+						/>
+					</div>
+				)}
+
+				{shape !== "flat" && (
+					<div className="absolute inset-0 z-20" style={ON_PAPER}>
+						<Fade
+							enter={700}
+							delay={180}
+							leave={220}
+							className="absolute inset-0"
+						>
+							{/* Label pinned; prompt centred in the room below it —
+							    origin's layout, so the stack sits in the well rather
+							    than hugging the moon's foot. */}
+							<div
+								className="absolute inset-x-0 flex flex-col px-lg"
+								style={{
+									top: LABEL_TOP,
+									bottom: veiled ? VEIL_ROOM : 0,
+								}}
+							>
+								<div className="flex flex-none justify-center">
+									<Caption>{label}</Caption>
+								</div>
+								<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+									<div className="flex min-w-0 max-w-[64vw] justify-center">
+										{children}
+									</div>
+								</div>
+							</div>
+						</Fade>
+					</div>
+				)}
+
+				{shape === "flat" && (
+					<div className="relative flex justify-center px-lg pt-sm pb-2xs">
+						<Fade enter={700} delay={180} leave={220}>
+							<div className="flex min-w-0 max-w-[64vw] flex-col items-center gap-2xs">
+								<Caption>{label}</Caption>
 								{children}
 							</div>
-						</div>
+						</Fade>
 					</div>
-				</Fade>
+				)}
 			</div>
 		</div>
 	);

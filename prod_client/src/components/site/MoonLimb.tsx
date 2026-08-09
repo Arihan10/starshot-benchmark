@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import PaperGrain from "./PaperGrain";
 
 // THE ARC IS A TRUE CIRCLE, AND IT IS ENORMOUS. What follows is the comp's own
 // construction rather than an approximation of it.
@@ -132,7 +131,7 @@ export default function MoonLimb({
 			style={veil ? { maskImage: veil, WebkitMaskImage: veil } : undefined}
 		>
 			<div
-				className="absolute bottom-0 left-1/2 -translate-x-1/2 overflow-hidden rounded-full bg-paper"
+				className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-full bg-paper"
 				style={{
 					width: d,
 					height: d,
@@ -145,14 +144,7 @@ export default function MoonLimb({
 						? "inset 0 -26px 48px -22px rgba(9,11,16,0.32)"
 						: undefined,
 				}}
-			>
-				<div
-					className="absolute bottom-0 left-1/2 -translate-x-1/2"
-					style={{ width: box.w, height: box.h }}
-				>
-					<PaperGrain />
-				</div>
-			</div>
+			/>
 		</div>
 	);
 }
