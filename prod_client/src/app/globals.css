@@ -4,15 +4,15 @@
     --ground-rgb: 0 0 0;
     --background: rgb(var(--ground-rgb));
 
-    --ink-rgb: 237 237 237;
+    --ink-rgb: 255 255 255;
     --foreground: rgb(var(--ink-rgb));
 
-    --mark-rgb: 237 237 237;
+    --mark-rgb: 255 255 255;
 
     /* THE LIGHT THAT MUST NOT INVERT. The masthead re-points `--ink-rgb` /
      `--mark-rgb` for type on paper; the wordmark gleam has to stay the page's
      bright highlight through that swap, so it reads its own triplet. */
-    --gleam-rgb: 237 237 237;
+    --gleam-rgb: 255 255 255;
 
     --moon-rgb: var(--mark-rgb);
 

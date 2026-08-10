@@ -30,7 +30,7 @@ const RASTER = 48;
 
 /** The paper the row turns to — `--paper-rgb` / `--mark-rgb` from globals.css. */
 function paperTriplet(): [number, number, number] {
-	if (typeof window === "undefined") return [237, 237, 237];
+	if (typeof window === "undefined") return [255, 255, 255];
 	// `--paper-rgb` is an alias (`var(--mark-rgb)`); read the resolved channels.
 	const raw = getComputedStyle(document.documentElement)
 		.getPropertyValue("--mark-rgb")
@@ -39,7 +39,7 @@ function paperTriplet(): [number, number, number] {
 	if (parts.length >= 3 && parts.every((n) => Number.isFinite(n))) {
 		return [parts[0], parts[1], parts[2]];
 	}
-	return [237, 237, 237];
+	return [255, 255, 255];
 }
 
 // Below alpha this, a pixel is the antialiased edge of the mark rather than the

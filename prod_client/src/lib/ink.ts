@@ -1,7 +1,7 @@
 // Fallbacks match `:root` in globals.css — used only when the document has no
 // computed style yet (SSR / first paint before tokens land).
-const INK_FALLBACK = "237 237 237";
-const MARK_FALLBACK = "237 237 237";
+const INK_FALLBACK = "255 255 255";
+const MARK_FALLBACK = "255 255 255";
 const GROUND_FALLBACK = "0 0 0";
 
 function readTriplet(name: string, fallback: string): string {
