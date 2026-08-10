@@ -29,23 +29,44 @@ const TITLE_SIZE = `calc(48 * ${UNIT})`;
 // THE PROTRUDING MOON — a shallow segment centred on the bar. Its MAXIMUM half
 // is the tighter clearance from the screen mid to either nav cluster, minus a
 // small edge gap — so the lip opens as wide as the bar allows without running
-// into FAQ or Leaderboard. The arena can pass a tighter `chord` so a short
-// prompt gets a shorter smile; long prompts open out to that max, then the type
-// shrinks. Sag is the visible foot.
-const MOON_SAG = "calc(var(--spacing-xl) * 0.62)";
+// into FAQ or Leaderboard. A caller can pass a tighter `chord` so a long prompt
+// opens out to that max and then lets the type shrink; below the floor set out
+// underneath, a shorter one no longer pulls the lip in with it.
+//
+// RADIUS IS FIXED. Sag used to be the constant and radius fell out of
+// chord + sag, so short titles (About, FAQ) sat on a tiny circle and looked
+// crushed. Radius is pinned to the homepage prompt — "A modern house" at a
+// 1440-wide window with the old sag token — and sag now falls out of
+// chord + radius. Chord length tracks the caption; curvature does not.
+const MOON_RADIUS_PX = 487;
+
+// AND THE LIP HAS A FLOOR, because a fixed radius makes the DIP a consequence of
+// the chord: FAQ opened 139px of it and the moon reached five pixels into the
+// scene, which is not a moon. This is the homepage prompt's own dip — the other
+// half of the measurement the radius is pinned to — so "A modern house" is the
+// shallowest the lip is ever drawn, and a shorter title borrows its footprint
+// rather than shrinking the moon to its own width.
+//
+// THE FLOOR IS ON THE DIP, NOT ON THE CHORD, even though the chord is what gets
+// clamped. Depth is what the arena sees, so it is the number worth stating; the
+// chord that carries it falls out of the circle and re-derives on its own if the
+// radius is ever re-pinned. Written the other way round the dip would change
+// silently the next time the curvature moved.
+const MOON_MIN_SAG_PX = 33.9;
+
+/** Chord that opens MOON_MIN_SAG_PX on the fixed circle: hw = √(s(2r − s)). */
+const MOON_MIN_CHORD_PX =
+	2 * Math.sqrt(MOON_MIN_SAG_PX * (2 * MOON_RADIUS_PX - MOON_MIN_SAG_PX));
 
 /** Air between a chord end and the nearest nav control. */
 const MOON_EDGE_GAP = 12;
-
-// HOW FAR THE MIDDLE BUMP HANGS BELOW THE BAR. Same token as the moon's sag.
-export const BELLY = MOON_SAG;
 
 // WHERE THE LABEL SITS — the origin's own drop from the top of the masthead.
 // The prompt lives in the well BELOW this; moving the prompt never retunes it.
 const LABEL_TOP = "calc(var(--spacing-2xs) + 12px)";
 
-// Fallback disc radius (~1440-wide window) used before the limb has been measured.
-const ROLL_RADIUS_FALLBACK = 9600;
+// Before the first layout pass — same circle the lip uses.
+const ROLL_RADIUS_FALLBACK = MOON_RADIUS_PX;
 
 /** Arc length of the prompt roll, in CSS pixels — held still across widths. */
 const ROLL_ARC_PX = 285;
@@ -120,9 +141,10 @@ export default function Masthead({
 
 	// Chord centred on the screen. Max half = tighter of (mid → FAQ content end,
 	// mid → offer start), minus edge gap — read straight from the clusters, not
-	// as a fraction of one side. When `chord` is set, a shorter prompt pulls both
-	// ends in; long prompts open to that max, then the type shrinks. Floor is
-	// the gray label above the title so the lip never undercuts its own caption.
+	// as a fraction of one side. When `chord` is set, a longer prompt pushes both
+	// ends out to that max and then the type shrinks; a shorter one pulls them in
+	// only as far as MOON_MIN_CHORD_PX, which holds the dip at the homepage's.
+	// Radius is MOON_RADIUS_PX; only the chord (and thus the sag) moves.
 	useLayoutEffect(() => {
 		const shell = shellRef.current;
 		const leftCluster = leftClusterRef.current;
@@ -144,19 +166,29 @@ export default function Masthead({
 			);
 			const maxWidth = 2 * maxHalf;
 			const labelWidth = labelRef.current?.getBoundingClientRect().width ?? 0;
-			const minWidth = Math.min(maxWidth, labelWidth);
+			// The lip may neither undercut its own caption nor sit shallower than
+			// the homepage's. Capped to the berth last, so a narrow window opens
+			// the lip as wide as the bar allows instead of overrunning the nav.
+			const minWidth = Math.min(
+				maxWidth,
+				Math.max(labelWidth, MOON_MIN_CHORD_PX),
+			);
+			// Chord may not reach a diameter — beyond that the fixed circle cannot
+			// host the arc (sag collapses / goes imaginary).
+			const chordCeil = Math.min(maxWidth, MOON_RADIUS_PX * 1.98);
 			const width =
 				chordWanted != null && chordWanted > 0
-					? Math.min(maxWidth, Math.max(minWidth, chordWanted))
-					: maxWidth;
+					? Math.min(chordCeil, Math.max(minWidth, chordWanted))
+					: chordCeil;
 			const half = width / 2;
 			const left = mid - half - s.left;
-			const sag = limbRef.current?.offsetHeight ?? 0;
-			// Circle through chord + sagitta — same construction as MoonLimb.
-			const radius =
-				width > 0 && sag > 0
-					? (half * half + sag * sag) / (2 * sag)
-					: ROLL_RADIUS_FALLBACK;
+			const radius = MOON_RADIUS_PX;
+			// Sagitta of this chord on the fixed circle — short captions sit on a
+			// shallow bite of the same arc the homepage prompt uses.
+			const sag =
+				width > 0 && half < radius
+					? radius - Math.sqrt(radius * radius - half * half)
+					: 0;
 			setMoon((prev) =>
 				prev.left === left &&
 				prev.width === width &&
@@ -199,11 +231,9 @@ export default function Masthead({
 	// slabs use (`Button` solid). Paper aliases mark at :root, so ON_PAPER and
 	// the bar stay one light.
 	//
-	// THE LIP HANGS; IT DOES NOT PUSH. In flow it added MOON_SAG to the masthead's
-	// height and the arena started below that — so left and right of the disc the
-	// page ground showed as a black bar between the white navbar and the scene.
-	// Absolute under the bar, the limb paints over the arena and the empty berth
-	// stays clear.
+	// THE LIP HANGS; IT DOES NOT PUSH. Absolute under the bar, the limb paints
+	// over the arena and the empty berth stays clear — its height is the live
+	// sag for this chord on MOON_RADIUS_PX.
 	return (
 		<div data-masthead className={`${frame} z-20`}>
 			<div ref={shellRef} className="relative">
@@ -220,7 +250,7 @@ export default function Masthead({
 						className="absolute top-full -mt-px bg-transparent"
 						style={{
 							width: moon.width,
-							height: MOON_SAG,
+							height: moon.sag,
 							left: moon.left,
 						}}
 					>
@@ -238,7 +268,7 @@ export default function Masthead({
 					className="absolute inset-x-0 top-0 z-20"
 					style={{
 						...ON_PAPER,
-						bottom: `calc(-1 * ${MOON_SAG})`,
+						bottom: moon.sag > 0 ? -moon.sag : 0,
 					}}
 				>
 					<Fade

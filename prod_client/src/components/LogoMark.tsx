@@ -97,8 +97,7 @@ export default function LogoMark({ className }: { className?: string }) {
 
 			    `--paper-rgb` is the right name for it because it is a literal at :root
 			    and never re-pointed, so it stays light in every subtree — which is what
-			    a highlight has to be. It is 236 against ink's 237, so this is invisibly
-			    different on the black pages and correct on this one. */}
+			    a highlight has to be. */}
             <span className="pointer-events-none absolute inset-0 transition-[background-position] duration-[820ms] ease-[cubic-bezier(0.4,0,0.6,1)] [background-image:linear-gradient(104deg,transparent_34%,rgb(var(--paper-rgb)_/_0.92)_50%,transparent_66%)] [background-position:118%_50%] [background-repeat:no-repeat] [background-size:300%_100%] [mask-image:url(/logo.png)] [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain] group-hover/mark:[background-position:-18%_50%]" />
         </span>
     );
