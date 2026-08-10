@@ -58,7 +58,9 @@ function gaugeCss(voice: Voice): string {
 		`font-style:${type.fontStyle}`,
 		`font-weight:${type.fontWeight}`,
 		`letter-spacing:${type.letterSpacing}`,
-		type.textTransform ? `text-transform:${type.textTransform}` : "",
+		"textTransform" in type && type.textTransform
+			? `text-transform:${type.textTransform}`
+			: "",
 	]
 		.filter(Boolean)
 		.join(";");
