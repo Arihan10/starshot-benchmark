@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import VoxelSky from "@/components/site/VoxelSky";
 import ExitBar from "@/components/leaderboard/ExitBar";
 import LeaderboardStage from "@/components/leaderboard/LeaderboardStage";
-import Masthead, { Title } from "@/components/site/Masthead";
+import CurvedMasthead from "@/components/site/CurvedMasthead";
 import { STANDINGS } from "@/lib/leaderboard";
 
 export const metadata: Metadata = {
@@ -53,9 +53,7 @@ export default function LeaderboardPage() {
 		<div className="relative flex h-dvh flex-col overflow-hidden bg-ground">
 			<VoxelSky voxels={false} />
 
-			<Masthead label="Current standings" placement="flow">
-				<Title voice="name">Leaderboard</Title>
-			</Masthead>
+			<CurvedMasthead label="Current standings" title="Leaderboard" />
 
 				<LeaderboardStage rows={STANDINGS} top={top} foot={FOOT} />
 

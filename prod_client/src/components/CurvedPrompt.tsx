@@ -28,37 +28,56 @@ const VOICE = {
 		fontFamily: "var(--font-sans), sans-serif",
 		fontStyle: "normal" as const,
 		fontWeight: 900,
-		letterSpacing: "-0.015em",
+		// Flat name titles run tight (−0.015em); on an arc that reads as crushed,
+		// especially on short words (FAQ / ABOUT). Open tracking here — the chord
+		// gauge uses the same value so the moon still matches the ink.
+		letterSpacing: "0.14em",
 		textTransform: "uppercase" as const,
 	},
 };
 
-const GAUGE_STYLE = [
-	"position:fixed",
-	"left:0",
-	"top:0",
-	"visibility:hidden",
-	"pointer-events:none",
-	"white-space:nowrap",
-	`font-size:${TITLE_SIZE}`,
-	"font-family:var(--font-instrument-serif),serif",
-	"font-style:italic",
-	"font-weight:400",
-	"letter-spacing:0.01em",
-].join(";");
+type Voice = keyof typeof VOICE;
 
-/** Flat advance of the prompt at title size → chord the moon should open to. */
-export function measurePromptChord(text: string): number {
+function gaugeCss(voice: Voice): string {
+	const type = VOICE[voice];
+	// Name voice fits at NAME_SCALE of the slot — measure at that size so the
+	// moon chord tracks the ink that will actually sit on the arc.
+	const size =
+		voice === "name"
+			? `calc(48 * ${UNIT} * ${NAME_SCALE})`
+			: TITLE_SIZE;
+	return [
+		"position:fixed",
+		"left:0",
+		"top:0",
+		"visibility:hidden",
+		"pointer-events:none",
+		"white-space:nowrap",
+		`font-size:${size}`,
+		`font-family:${type.fontFamily}`,
+		`font-style:${type.fontStyle}`,
+		`font-weight:${type.fontWeight}`,
+		`letter-spacing:${type.letterSpacing}`,
+		type.textTransform ? `text-transform:${type.textTransform}` : "",
+	]
+		.filter(Boolean)
+		.join(";");
+}
+
+/** Flat advance of the caption at its voice size → chord the moon should open to. */
+export function measurePromptChord(
+	text: string,
+	voice: Voice = "prompt",
+): number {
 	if (typeof document === "undefined" || !text) return 0;
-	let gauge = document.getElementById(
-		"prompt-chord-gauge",
-	) as HTMLSpanElement | null;
+	const id = `prompt-chord-gauge-${voice}`;
+	let gauge = document.getElementById(id) as HTMLSpanElement | null;
 	if (!gauge) {
 		gauge = document.createElement("span");
-		gauge.id = "prompt-chord-gauge";
-		gauge.style.cssText = GAUGE_STYLE;
+		gauge.id = id;
 		document.body.appendChild(gauge);
 	}
+	gauge.style.cssText = gaugeCss(voice);
 	gauge.textContent = text;
 	const advance = gauge.getBoundingClientRect().width;
 	// Shallow arc length ≈ chord; FIT_MARGIN is the same headroom fit() keeps.
@@ -66,19 +85,22 @@ export function measurePromptChord(text: string): number {
 }
 
 /** Live chord needed for `text` at the current viewport title size. */
-export function usePromptChord(text: string): number {
+export function usePromptChord(
+	text: string,
+	voice: Voice = "prompt",
+): number {
 	const [chord, setChord] = useState(0);
 
 	useLayoutEffect(() => {
 		const sync = () => {
-			const next = measurePromptChord(text);
+			const next = measurePromptChord(text, voice);
 			setChord((prev) => (Math.abs(prev - next) < 0.5 ? prev : next));
 		};
 		sync();
 		document.fonts?.ready.then(sync).catch(() => {});
 		window.addEventListener("resize", sync);
 		return () => window.removeEventListener("resize", sync);
-	}, [text]);
+	}, [text, voice]);
 
 	return chord;
 }

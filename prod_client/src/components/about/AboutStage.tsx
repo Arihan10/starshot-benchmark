@@ -2,10 +2,10 @@
 
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
 import Fade from "@/components/site/Fade";
+import CurvedMasthead from "@/components/site/CurvedMasthead";
 import MoonAnchor from "@/components/site/MoonAnchor";
 import ScrollBox from "@/components/site/ScrollBox";
 import { VoxelDrift } from "@/components/site/VoxelSky";
-import Navbar from "@/components/site/Navbar";
 
 const STARS = [
 	{ top: "-6%", left: "-14%", width: 210, alpha: 0.85, seconds: 17, delay: 0 },
@@ -27,7 +27,6 @@ export default function AboutStage({ children }: { children: ReactNode }) {
 	const stage = useRef<HTMLDivElement>(null);
 	const scroller = useRef<HTMLDivElement>(null);
 	const anchor = useRef<HTMLDivElement>(null);
-	const bar = useRef<HTMLDivElement>(null);
 
 	useBeforePaint(() => {
 		const box = scroller.current;
@@ -140,13 +139,12 @@ export default function AboutStage({ children }: { children: ReactNode }) {
 				<Fade enter={null}>{children}</Fade>
 			</ScrollBox>
 
-			{/* The paper the bar runs on. Masthead supplies its own; this page mounts
-			    the bar directly, and the inverted palette is unreadable without it. */}
-			<div
-				ref={bar}
-				className="pointer-events-none absolute inset-x-0 top-0 z-30 bg-mark [&_a]:pointer-events-auto [&_button]:pointer-events-auto"
-			>
-				<Navbar />
+			<div className="pointer-events-none absolute inset-x-0 top-0 z-30 [&_a]:pointer-events-auto [&_button]:pointer-events-auto">
+				<CurvedMasthead
+					label="About SceneBench"
+					title="About"
+					placement="overlay"
+				/>
 			</div>
 		</div>
 	);

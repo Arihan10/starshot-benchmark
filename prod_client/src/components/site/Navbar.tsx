@@ -179,7 +179,7 @@ const LOGO_ART_PAD = "var(--spacing-xl) * 1.45 * 171 / 1080";
  * lockup's ink on every side — see LOGO_ART_PAD for the right-edge compensate.
  */
 export default function Navbar({
-    edge = "var(--spacing-xs)",
+    edge = "calc(var(--spacing-xs) * 0.01)",
     leftClusterRef,
     rightClusterRef,
 }: {
@@ -248,7 +248,6 @@ export default function Navbar({
                 paddingBottom: edge,
                 paddingLeft: edge,
                 paddingRight: `calc(${edge} + ${LOGO_ART_PAD})`,
-
             }}
             className="relative z-20 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-lg"
         >

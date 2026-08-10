@@ -37,9 +37,6 @@ const MOON_SAG = "calc(var(--spacing-xl) * 0.62)";
 /** Air between a chord end and the nearest nav control. */
 const MOON_EDGE_GAP = 12;
 
-/** Shortest chord, in title-size ems — below this the lip reads as a notch. */
-const MOON_CHORD_MIN_EMS = 9;
-
 // HOW FAR THE MIDDLE BUMP HANGS BELOW THE BAR. Same token as the moon's sag.
 export const BELLY = MOON_SAG;
 
@@ -77,9 +74,18 @@ export function rollDegrees(moonRadius: number): number {
 /** @deprecated Prefer MastheadPrompt.rollOrigin from the render-prop context. */
 export const ROLL_ORIGIN = `50% ${-ROLL_RADIUS_FALLBACK}px`;
 
-function Caption({ children }: { children: ReactNode }) {
+function Caption({
+	children,
+	ref,
+}: {
+	children: ReactNode;
+	ref?: React.Ref<HTMLSpanElement>;
+}) {
 	return (
-		<span className="font-mono text-2xs tracking-[0.24em] whitespace-nowrap uppercase text-ink-40">
+		<span
+			ref={ref}
+			className="font-mono text-2xs tracking-[0.24em] whitespace-nowrap uppercase text-ink-40"
+		>
 			{children}
 		</span>
 	);
@@ -94,8 +100,8 @@ export default function Masthead({
 	label: string;
 	placement?: "overlay" | "flow";
 	/**
-	 * Preferred chord width in px (from the prompt). Clamped to the navbar max
-	 * and a short minimum; omit on pages that always want the full lip.
+	 * Preferred chord width in px (from the prompt / title). Clamped to the
+	 * navbar max and floored at the gray label's width — omit for the full lip.
 	 */
 	chord?: number;
 	children: ReactNode | ((ctx: MastheadPrompt) => ReactNode);
@@ -104,6 +110,7 @@ export default function Masthead({
 	const leftClusterRef = useRef<HTMLDivElement>(null);
 	const rightClusterRef = useRef<HTMLDivElement>(null);
 	const limbRef = useRef<HTMLDivElement>(null);
+	const labelRef = useRef<HTMLSpanElement>(null);
 	const [moon, setMoon] = useState({
 		left: 0,
 		width: 0,
@@ -114,7 +121,8 @@ export default function Masthead({
 	// Chord centred on the screen. Max half = tighter of (mid → FAQ content end,
 	// mid → offer start), minus edge gap — read straight from the clusters, not
 	// as a fraction of one side. When `chord` is set, a shorter prompt pulls both
-	// ends in; long prompts open to that max, then type shrinks.
+	// ends in; long prompts open to that max, then the type shrinks. Floor is
+	// the gray label above the title so the lip never undercuts its own caption.
 	useLayoutEffect(() => {
 		const shell = shellRef.current;
 		const leftCluster = leftClusterRef.current;
@@ -135,9 +143,8 @@ export default function Masthead({
 				Math.min(mid - leftEnd, rightStart - mid) - MOON_EDGE_GAP,
 			);
 			const maxWidth = 2 * maxHalf;
-			// Title size in px — same UNIT as CurvedPrompt / Title.
-			const titlePx = 48 * Math.min(window.innerWidth * 0.0006, 0.975);
-			const minWidth = Math.min(maxWidth, MOON_CHORD_MIN_EMS * titlePx);
+			const labelWidth = labelRef.current?.getBoundingClientRect().width ?? 0;
+			const minWidth = Math.min(maxWidth, labelWidth);
 			const width =
 				chordWanted != null && chordWanted > 0
 					? Math.min(maxWidth, Math.max(minWidth, chordWanted))
@@ -161,15 +168,18 @@ export default function Masthead({
 		};
 
 		sync();
+		document.fonts?.ready.then(sync).catch(() => {});
 		const observer = new ResizeObserver(sync);
 		observer.observe(shell);
 		observer.observe(leftCluster);
 		observer.observe(rightCluster);
 		const limb = limbRef.current;
 		if (limb) observer.observe(limb);
+		const labelEl = labelRef.current;
+		if (labelEl) observer.observe(labelEl);
 		return () => observer.disconnect();
 		// Re-bind when the limb host mounts (it only exists once width > 0).
-	}, [moon.width, chordWanted]);
+	}, [moon.width, chordWanted, label]);
 
 	const prompt: MastheadPrompt = {
 		moonRadius: moon.radius,
@@ -242,7 +252,7 @@ export default function Masthead({
 							style={{ top: LABEL_TOP }}
 						>
 							<div className="flex flex-none justify-center">
-								<Caption>{label}</Caption>
+								<Caption ref={labelRef}>{label}</Caption>
 							</div>
 							<div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
 								{/* Cap to the moon chord — a vw ceiling let the prompt outgrow

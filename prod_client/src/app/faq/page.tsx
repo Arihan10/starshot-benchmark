@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Fade from "@/components/site/Fade";
-import Masthead, { Title } from "@/components/site/Masthead";
+import CurvedMasthead from "@/components/site/CurvedMasthead";
 import PageShell from "@/components/site/PageShell";
 import VoxelSky from "@/components/site/VoxelSky";
 import Button from "@/components/ui/Button";
@@ -72,9 +72,7 @@ export default function FaqPage() {
 
 			<PageShell
 				masthead={
-					<Masthead label="Frequently asked" placement="flow">
-						<Title voice="name">FAQ</Title>
-					</Masthead>
+					<CurvedMasthead label="Frequently asked" title="FAQ" />
 				}
 				footer={
 					<div
