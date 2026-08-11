@@ -534,6 +534,19 @@ export function fmtClockTime(ts) {
   return `${_MON[d.getMonth()]} ${d.getDate()}, ${p(h)}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)} ${ap}`;
 }
 
+// Wall clock WITHOUT the date or milliseconds — for dense inline rows where
+// `fmtClockTime`'s "Aug 8, " prefix and ".123" don't fit. Same instant, and
+// still unambiguous within a run, which never spans more than a day.
+export function fmtClockShort(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  let h = d.getHours();
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${h}:${p(d.getMinutes())}:${p(d.getSeconds())} ${ap}`;
+}
+
 // Completion tokens per wall-clock second of the (final) provider call — the
 // log's throughput. null when either side is missing (a seeded / legacy call).
 export function callThroughput(call) {

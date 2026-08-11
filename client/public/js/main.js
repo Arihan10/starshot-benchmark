@@ -68,7 +68,7 @@ function resetLabSession() {
     state.lab.atomicLocks = new Set();
 }
 
-async function switchRun(name) {
+async function switchRun(name, { quiet = false } = {}) {
     if (!name || (name === state.run && !bootSelectionPending)) return;
     try {
         await api.activateRun(name);
@@ -95,7 +95,9 @@ async function switchRun(name) {
     resetLabSession();
     renderRunPicker();
     await refreshSlots();
-    toast(`run :: ${name}`);
+    // The boot restore is not a user action, so it doesn't announce itself —
+    // a toast on every page reload is noise.
+    if (!quiet) toast(`run :: ${name}`);
 }
 
 runCombo = createRunCombo(runPickerEl, {
@@ -136,7 +138,13 @@ on("open-cell-focus", async ({ run, slot, model, branch = false, focus = null })
 // --- slots polling -----------------------------------------------------------------
 
 let pollTimer = null;
+// No run has been chosen yet — neither restored at boot nor picked. Keeps the
+// slots poll from firing against nothing.
 let bootSelectionPending = true;
+// The run restored at boot is still loading. Distinguishes "its cells haven't
+// arrived yet" from "it genuinely has none", so a slow hydrate doesn't read as
+// an empty run.
+let bootHydrating = false;
 
 async function refreshSlots() {
     if (!state.run || bootSelectionPending) {
@@ -176,6 +184,13 @@ function updateStatusText() {
     const stepAllBtn = document.getElementById("btn-step-all");
     if (bootSelectionPending && state.run) {
         statusTextEl.textContent = `${state.run} — select a run to load its scenes`;
+        stepAllBtn.style.display = "none";
+        stepAllUntilEl.style.display = "none";
+        exitSteppingEl.style.display = "none";
+        return;
+    }
+    if (bootHydrating && state.run) {
+        statusTextEl.textContent = `${state.run} — loading scenes…`;
         stepAllBtn.style.display = "none";
         stepAllUntilEl.style.display = "none";
         exitSteppingEl.style.display = "none";
@@ -1173,18 +1188,30 @@ document
 
     try {
         await refreshRuns();
-        // Choose the browser's last run locally, but leave it unhydrated until
-        // the user explicitly picks a run. This makes the run picker usable even
-        // when the previous run contains multi-gigabyte event logs.
         let saved = null;
         try {
             saved = localStorage.getItem(LAST_RUN_KEY);
         } catch {
             /* ignore */
         }
-        if (saved && state.runs.some((r) => r.name === saved)) {
-            state.run = saved;
-            renderRunPicker();
+        // Restore the browser's last run, else fall back to whatever the server
+        // has active (`refreshRuns` already put that in `state.run`), and LOAD
+        // it. Selecting used to stop at setting `state.run`, which left the
+        // picker showing a run whose board was empty until you re-picked it —
+        // reading as a broken reload rather than the deliberate deferral it was.
+        //
+        // Not awaited, which is what keeps the original concern addressed: the
+        // picker and the rest of the UI stay usable while a multi-gigabyte run
+        // parses, and the board fills in when the slots land. `activate` itself
+        // is metadata-only server-side; the slots fetch is what hydrates.
+        const boot =
+            saved && state.runs.some((r) => r.name === saved) ? saved : state.run;
+        if (boot) {
+            bootHydrating = true;
+            void switchRun(boot, { quiet: true }).finally(() => {
+                bootHydrating = false;
+                updateStatusText();
+            });
         }
     } catch (e) {
         statusTextEl.textContent = `server unreachable: ${e.message}`;

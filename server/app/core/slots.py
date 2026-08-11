@@ -118,6 +118,8 @@ MODELS: dict[str, str] = {
     "laguna": "poolside/laguna-s-2.1",
     "new-opus-new": "anthropic/claude-opus-5",
     "muse-spark-contributor": "meta/muse-spark-1.2-contributor",
+    "qwen-small": "qwen/qwen3.5-35b-a3b",
+    "gemma-small": "google/gemma-4-26b-a4b-it",
 }
 
 # Model ids from MODELS that are actually served by a third-party
@@ -250,4 +252,6 @@ def model_reasoning(model_id: str | None) -> str:
 # since dropping the schema removes the wire-level guarantee that output parses.
 NO_STRUCTURED_OUTPUT_LIST = [
     "poolside/laguna-s-2.1",
+    "qwen/qwen3.5-35b-a3b",
+    "google/gemma-4-26b-a4b-it",
 ]

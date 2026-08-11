@@ -517,18 +517,28 @@ export function createObsModel() {
 // step's calls (null when none of them carry timing).
 export function nodeStepsOf(model, id) {
     if (!model || !id) return [];
-    const byStep = new Map(); // step name -> { step, count, index, relation, flightMs }
+    // step name -> { step, count, index, relation, flightMs, tStart, tEnd }.
+    // `flightMs` SUMS the step's calls (time actually spent in the provider);
+    // `tStart`/`tEnd` bracket them instead — earliest request to latest response.
+    // The two differ whenever a step ran more than once, and the span can also
+    // exceed the sum outright, because a zone's calls are no longer contiguous:
+    // the overlapped walk interleaves other zones' work between them.
+    const byStep = new Map();
     const add = (call, relation) => {
         const step = call.template ?? call.step ?? "?";
         let e = byStep.get(step);
         if (!e) {
-            e = { step, count: 0, index: call.index ?? 0, relation: relation ?? null, flightMs: null };
+            e = { step, count: 0, index: call.index ?? 0, relation: relation ?? null, flightMs: null, tStart: null, tEnd: null };
             byStep.set(step, e);
         }
         e.count += 1;
         if (typeof call.index === "number" && call.index < e.index) e.index = call.index;
         if (relation && !e.relation) e.relation = relation;
         if (typeof call.flight_ms === "number") e.flightMs = (e.flightMs ?? 0) + call.flight_ms;
+        if (typeof call.t_request === "number")
+            e.tStart = e.tStart == null ? call.t_request : Math.min(e.tStart, call.t_request);
+        if (typeof call.t_response === "number")
+            e.tEnd = e.tEnd == null ? call.t_response : Math.max(e.tEnd, call.t_response);
     };
     for (const p of model.provenance?.get(id) ?? []) add(p.call, p.relation);
     for (const c of model.nodes.get(id)?.calls ?? []) add(c, null);

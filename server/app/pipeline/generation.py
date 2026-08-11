@@ -53,7 +53,7 @@ from typing import Any, Literal
 
 import trimesh
 
-from app.core import prompt_store, scene_context, schemas
+from app.core import prompt_store, scene_context, schemas, util
 from app.core.slots import MODELS
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed, context_cull
@@ -2184,9 +2184,17 @@ def cancel_pending(run_id: str) -> None:
     """Cancel any in-flight asset / mesh tasks for this run. Called when the run
     itself is being torn down (cancellation or fatal error). Cancelling an asset
     task before it reaches `_spawn_meshes` also stops the meshes it would have
-    queued."""
+    queued.
+
+    The split pipeline's interior work goes too: zones still queued behind their
+    surroundings, and the anchor passes already running off the walk. Without
+    that an aborted run would leave anchors building into a scene nobody is going
+    to drain."""
     _admitted_ids.pop(run_id, None)
     _deferred_interiors.pop(run_id, None)
+    _pending_anchors.pop(run_id, None)
+    for anchor in _anchor_tasks.pop(run_id, []):
+        anchor.cancel()
     while tasks := _pending.pop(run_id, []):
         for t in tasks:
             t.cancel()
@@ -2350,10 +2358,19 @@ async def run(
         rounds += 1
 
 
-# Interior passes `run_parallel` skipped, in the order the walk reached them.
-# The walk emits negative space post-order, so a zone's children always precede
-# it here — `run_deferred_interiors` relies on that to rebuild the dependency.
-_deferred_interiors: dict[str, list[tuple[Node, str]]] = {}
+# Negative-space passes the walk deferred, in the order it reached them. The
+# walk emits them post-order, so a zone's children always precede it here —
+# `run_deferred_interiors` relies on that to rebuild the dependency.
+_deferred_interiors: dict[str, list[Node]] = {}
+
+# Zones whose anchor pass the walk has reached but whose surroundings had not
+# settled yet, keyed by id so insertion order fixes the release order. Drained
+# by `_release_ready_anchors` as each shell commits.
+_pending_anchors: dict[str, dict[str, Node]] = {}
+
+# Anchor passes now running off the walk. Each resolves to the nodes it placed,
+# which `drain_anchors` merges back at a point the walk order determines.
+_anchor_tasks: dict[str, list[asyncio.Task[list[Node]]]] = {}
 
 
 async def run_parallel(
@@ -2364,27 +2381,38 @@ async def run_parallel(
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
 ) -> None:
-    """`run`, minus every interior-object scenario — the structural half of the
-    split pipeline.
+    """`run`, rescheduled: the walk keeps its serial shape and every blocking
+    structural step, but a zone's anchor pass no longer holds it up.
 
-    Only `encapsulating` executes, and it does so by delegating to `run`, so a
-    zone's shell / ground is authored exactly as the serial pipeline authors it
-    (including under the `_spawn_meshes` rebinds the noframes / nomesh entries
-    install). `anchor` and `negative-space` are recorded and skipped: their
-    objects live inside a single zone whose envelope is already fixed by the
-    parent's `child_bbox_batch`, so they are handed to `run_deferred_interiors`
-    to fan out concurrently instead of being paid for one zone at a time.
+    ENCAPSULATING runs inline and is awaited, exactly as the serial pipeline
+    runs it, so a zone's shell / ground is authored identically (including under
+    the `_spawn_meshes` rebinds the noframes / nomesh entries install). Its
+    completion is also the scheduler's only trigger, so the pump follows it.
 
-    Walking the whole tree with this leaves a scene that is fully planned, fully
-    decomposed and fully framed, with every zone's interior still empty. The
-    caller MUST then drain `run_deferred_interiors` or the scene stays empty.
+    ANCHOR is registered and returns at once. It starts later, off the walk, as
+    soon as `neighbours_framed` says everything on its boundary has resolved to
+    a framed atomic zone or to negative space — so it is still authored against
+    a settled neighbourhood, just without waiting for the whole tree to be
+    framed first.
+
+    NEGATIVE SPACE defers wholesale to `run_deferred_interiors`. A zone's fill
+    covers the gaps between its children, so it has to see their interiors, and
+    those are precisely what is still in flight.
+
+    The walk therefore ends with the tree fully planned, decomposed and framed,
+    most interiors already built or building, and none of them merged into
+    `all_nodes`. The caller MUST drain `drain_anchors` and then
+    `run_deferred_interiors`, in that order, or the scene stays empty.
 
     Only replays onto a log written by this same walk: a cell part-built by
     `run` has committed interior objects that this never reads back into
     `all_nodes`, so later zones would be framed against a scene missing them.
     """
-    if scenario != "encapsulating":
-        _deferred_interiors.setdefault(run_id, []).append((zone, scenario))
+    if scenario == "anchor":
+        _pending_anchors.setdefault(run_id, {})[zone.id] = zone
+        return
+    if scenario == "negative-space":
+        _deferred_interiors.setdefault(run_id, []).append(zone)
         return
     await run(
         zone=zone,
@@ -2393,6 +2421,369 @@ async def run_parallel(
         scenario=scenario,
         all_nodes=all_nodes,
     )
+    _release_ready_anchors(runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes)
+
+
+def _shell_settled(zone_id: str) -> bool:
+    """One region's shell is final: its encapsulating pass has committed AND
+    every frame object that pass emitted has been given a bbox.
+
+    `committed.object_specs` separates the three states that matter. `None` is
+    "the pass never ran" — not settled. `[]` is "ran, and decided the zone needs
+    no bounding geometry at all", which IS settled: there is nothing to place,
+    so there is no batch to wait on — the `if applicable` case. A non-empty list
+    is settled only once `object_bbox_batch` has resolved every spec, because
+    until then the walls exist as intent with no position a neighbour could
+    reason against.
+    """
+    specs = committed.object_specs(zone_id, "encapsulating")
+    if specs is None:
+        return False
+    return all(committed.bbox(spec.id) is not None for spec in specs)
+
+
+def _subregions_placed(zone_id: str) -> bool:
+    """A zone has been broken up: `zone_decompose` committed AND
+    `child_bbox_batch` gave every subregion a bbox. Both matter — without the
+    boxes the children have no geometry, so there is nothing to test the
+    boundary against and the frontier cannot be resolved at all."""
+    out = committed.zone_decompose(zone_id)
+    if out is None:
+        return False
+    return all(committed.bbox(sub.id) is not None for sub in out.subregions)
+
+
+def _region_settled(region: Node) -> bool:
+    """Whether one region on the frontier is something a neighbour's interior
+    can be authored against.
+
+    UNPLANNED regions fail outright: until `zone_plan` commits there is no
+    `is_atomic` to branch on, and `divider._build` places a child before it
+    plans it, so a freshly placed zone sits here. It could still subdivide into
+    something that lands flush against us, so wait.
+
+    An ATOMIC region will never be broken up, so what abuts us is exactly its
+    walls and they have to be up — encapsulating decomposed, every frame object
+    placed. A pass that decided no bounding geometry was needed counts as up.
+
+    A SUBDIVIDED one must have finished decomposing and framed its own
+    perimeter. Once it has, its still being on the frontier means some ray met
+    its interior without entering a child first, so what faces us there is its
+    unclaimed volume — negative space, which stops the ray. Whatever sits behind
+    that gap is not our boundary and carries no condition. Requiring the
+    perimeter costs nothing in practice: `divider._build` encapsulates a zone
+    immediately after placing its children and before recursing into them.
+    """
+    plan = committed.zone_plan(region.id)
+    if plan is None:
+        return False
+    if plan.is_atomic:
+        return _shell_settled(region.id)
+    return _subregions_placed(region.id) and _shell_settled(region.id)
+
+
+# A frontier region has to be TOUCHING the zone. `util.adjacent_zones` casts rays
+# of UNCAPPED length — deliberately, because scene context wants a zone to know
+# what sits across the yard — so it also returns the first region a ray reaches
+# after crossing open space. For a dependency gate that is wrong: the volume the
+# ray crossed is unclaimed, and unclaimed volume is negative space, which is a
+# wall. The cast cannot see that itself, because the space in question belongs to
+# one of the target's ANCESTORS and ancestors are excluded from its candidate set,
+# so the contact test has to reintroduce it here.
+#
+# Measured on a real cell: a driveway apron came back with five frontier regions,
+# three of them 5.5m to 7.5m away, across its root's empty front yard — and one
+# of those phantoms was an unplanned zone, which stalled the apron (and every
+# other queued zone) behind a branch of the walk it had no business waiting on.
+#
+# `child_bbox_batch` tiles a parent exactly, so genuine neighbours read as 0.00m
+# and the tolerance only has to absorb authoring slop.
+_CONTACT_TOLERANCE_M = 0.05
+
+
+def _aabb_gap(a: BoundingBox, b: BoundingBox) -> float:
+    """Widest per-axis separation between two boxes; 0.0 when they touch or
+    overlap. Two boxes are apart by the LARGEST axis gap, not the smallest —
+    daylight on any one axis is enough to keep them from touching."""
+    return max(
+        max(a.min_corner[i] - b.max_corner[i], b.min_corner[i] - a.max_corner[i], 0.0)
+        for i in range(3)
+    )
+
+
+def neighbours_framed(zone_id: str, nodes: list[Node]) -> bool:
+    """True when everything on `zone_id`'s boundary has resolved to negative
+    space, or to an atomic zone whose framing is done — the gate for starting
+    one zone's interior without waiting for the whole tree to be framed.
+
+    One cast of `util.adjacent_zones`, filtered to what is actually in contact,
+    answers this outright: 256 rays from the zone's centre, keeping the FIRST
+    region each enters, with ancestors and the zone's own subtree excluded. No
+    recursion is needed, because that first-hit rule already resolves the tree to
+    whatever depth it has been divided to. On a tie it keeps the deepest region,
+    so a child sitting flush against the face a ray crosses shadows its parent and
+    arrives on the frontier in its own right, however many levels down it is. A
+    parent whose children are all inset is not shadowed and stays — and it stays
+    precisely because what that ray met first was its own unclaimed volume.
+
+    So treating negative space as a wall is the first-hit rule taken at face
+    value, plus `_CONTACT_TOLERANCE_M` to enforce it across the gaps the cast
+    flies through: a subdivided region that has finished decomposing and is STILL
+    on the frontier IS the gap and passes, and a region the ray only reached by
+    crossing open space is not on the boundary at all. Nothing tucked behind
+    either is reachable, or relevant.
+
+    Two things this deliberately does NOT assert:
+
+      * That the neighbourhood is COMPLETE. Adjacency is computed over `nodes`
+        as they stand, and a zone placed later in the walk can turn out to touch
+        this one — a sibling in another branch is invisible until its own parent
+        is decomposed. A True means "everything bordering us today has settled",
+        not "no new neighbour can appear". A caller needing the stronger
+        property needs a separate completeness gate.
+      * That THIS zone is framed. `divider._build` encapsulates a zone directly
+        before its anchor pass, so its own shell is settled by construction.
+
+    Reads committed state from the task-bound slot log, so it must be called
+    inside the run's logging context.
+    """
+    target = next((n for n in nodes if n.id == zone_id), None)
+    if target is None:
+        return True
+    return all(
+        _region_settled(r)
+        for r in util.adjacent_zones(zone_id, nodes)
+        if _aabb_gap(target.bbox, r.bbox) <= _CONTACT_TOLERANCE_M
+    )
+
+
+async def _run_anchor(
+    *,
+    zone: Node,
+    base: list[Node],
+    runs_dir: Path,
+    run_id: str,
+) -> list[Node]:
+    """One released zone's anchor pass, run off the walk's critical path.
+
+    `base` is the scene it was released against, frozen and shared with every
+    zone released in the same pump — so those zones render an identical
+    `SCENE_CONTEXT` and a provider-side prefix cache can serve the batch from one
+    entry. The working copy is private, and `run` only ever appends, so the tail
+    past `base` is exactly what this zone placed.
+    """
+    scene = list(base)
+    async with _interior_zone_slot:
+        await run(
+            zone=zone,
+            runs_dir=runs_dir,
+            run_id=run_id,
+            scenario="anchor",
+            all_nodes=scene,
+        )
+    return scene[len(base) :]
+
+
+def _release_ready_anchors(
+    *,
+    runs_dir: Path,
+    run_id: str,
+    all_nodes: list[Node],
+    force: bool = False,
+) -> None:
+    """Start the anchor pass for every pending zone whose surroundings have now
+    settled. Called from the walk, synchronously, right after a shell commits.
+
+    That is the only moment worth checking: `neighbours_framed` reads a region's
+    plan, its decomposition + child boxes, and its encapsulating pass + frame
+    boxes, and `divider._build` lands them in exactly that order — so a region
+    becomes settled precisely when its shell does, and nothing else in the walk
+    can open a gate. (Decomposing a zone can CLOSE one by introducing unplanned
+    children, but the shell that follows it is where we look, so the intermediate
+    state is never acted on.)
+
+    Evaluating here rather than inside the spawned task is what keeps the run
+    reproducible. The LLM cache is keyed on the rendered prompt, so a snapshot
+    taken whenever the loop happened to wake a waiter would fork the cache key
+    between runs and cost the cell its replay. Read from the walk, both the gate
+    and the snapshot depend only on how far the walk has got.
+
+    `force` releases whatever is left regardless of the gate — the drain's
+    insurance, so a zone whose neighbour never framed (an errored pass, say) ends
+    up authored against an incomplete neighbourhood rather than not at all.
+    """
+    waiting = _pending_anchors.get(run_id)
+    if not waiting:
+        return
+    ready = [zid for zid in waiting if force or neighbours_framed(zid, all_nodes)]
+    if not ready:
+        return
+    # One snapshot for the whole batch, so zones released together see the same
+    # scene rather than each other's partial progress.
+    base = list(all_nodes)
+    for zid in ready:
+        zone = waiting.pop(zid)
+        logging.log_once(
+            "generation.anchor.release",
+            match_fields=("zone",),
+            zone=zid,
+            forced=force,
+            scene_nodes=len(base),
+            still_waiting=len(waiting),
+        )
+        _anchor_tasks.setdefault(run_id, []).append(
+            asyncio.create_task(
+                _run_anchor(zone=zone, base=base, runs_dir=runs_dir, run_id=run_id)
+            )
+        )
+
+
+async def drain_anchors(
+    *,
+    runs_dir: Path,
+    run_id: str,
+    all_nodes: list[Node],
+) -> None:
+    """Join every anchor pass the walk started and merge what each one placed.
+
+    Anything still waiting is force-released first. By the end of the walk the
+    whole tree is framed, so every gate is open anyway and this is normally a
+    formality — it exists so a stranded zone still gets built.
+
+    Merging HERE, and not inside the tasks, is deliberate: the walk's own prompts
+    stay free of interior objects, which keeps them both smaller and reproducible.
+    Letting a task write into the live scene would make every later structural
+    call depend on how far some peer's anchor had got.
+
+    Failures are collected rather than raced: gathering with `return_exceptions`
+    lets every task finish (so none is orphaned mid-flight), the successful
+    placements still merge, and the first error is re-raised for the run's own
+    error handling to catch. One consequence of the overlap is that an anchor
+    failure now surfaces after the walk instead of stopping it partway.
+    """
+    _release_ready_anchors(
+        runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes, force=True,
+    )
+    failure: BaseException | None = None
+    while tasks := _anchor_tasks.pop(run_id, []):
+        for placed in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(placed, BaseException):
+                failure = failure or placed
+            else:
+                all_nodes.extend(placed)
+    _pending_anchors.pop(run_id, None)
+    if failure is not None:
+        raise failure
+
+
+def gate_report(zone_id: str, nodes: list[Node]) -> dict[str, Any]:
+    """Why `neighbours_framed` does or doesn't hold for one zone, region by
+    region — the inspector's view of the interior gate.
+
+    `_region_settled` decides each verdict, exactly as the gate does, so the two
+    cannot drift; the sub-checks are re-read only to phrase WHY. Regions the ray
+    reached across open space are reported as `ignored` with their measured
+    separation, because "it's stuck on something 7m away" is the question people
+    actually arrive with.
+    """
+    target = next((n for n in nodes if n.id == zone_id), None)
+    if target is None:
+        return {"zone": zone_id, "known": False, "passed": False, "regions": []}
+
+    plan = committed.zone_plan(zone_id)
+    regions: list[dict[str, Any]] = []
+    for r in util.adjacent_zones(zone_id, nodes):
+        gap = round(_aabb_gap(target.bbox, r.bbox), 2)
+        if gap > _CONTACT_TOLERANCE_M:
+            regions.append({
+                "id": r.id,
+                "gap_m": gap,
+                "touching": False,
+                "state": "ignored",
+                "detail": "across negative space — not on the boundary",
+            })
+            continue
+        rp = committed.zone_plan(r.id)
+        if rp is None:
+            state, detail = "unplanned", "placed, but its zone plan has not committed"
+        elif rp.is_atomic:
+            state, detail = (
+                ("settled", "atomic, framing done")
+                if _shell_settled(r.id)
+                else ("unframed", "atomic, waiting on its encapsulating pass")
+            )
+        elif not _subregions_placed(r.id):
+            state, detail = "undecomposed", "subdivided, waiting on its children to be placed"
+        elif not _shell_settled(r.id):
+            state, detail = "unframed", "subdivided, waiting on its own perimeter"
+        else:
+            state, detail = "settled", "subdivided and framed — what faces us is its negative space"
+        regions.append({
+            "id": r.id,
+            "gap_m": gap,
+            "touching": True,
+            "state": state,
+            "detail": detail,
+            "settled": _region_settled(r),
+        })
+
+    blocking = [r["id"] for r in regions if r["touching"] and not r.get("settled")]
+    return {
+        "zone": zone_id,
+        "known": True,
+        "atomic": None if plan is None else bool(plan.is_atomic),
+        "own_shell_settled": _shell_settled(zone_id),
+        "passed": not blocking,
+        "blocking": blocking,
+        "regions": regions,
+    }
+
+
+def frontier_report(zone_id: str, nodes: list[Node]) -> list[dict[str, Any]]:
+    """Every region the ray cast finds around `zone_id`, annotated with whether
+    the gate counts it and why — what `/parallel-debug` renders.
+
+    Walks the same helpers `neighbours_framed` walks, in the same order, so the
+    explanation can't drift from the decision. A region with `counts=False` was
+    seen by a ray but is not on the boundary: the ray reached it across unclaimed
+    volume, which is negative space, which is a wall.
+    """
+    target = next((n for n in nodes if n.id == zone_id), None)
+    if target is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for region in util.adjacent_zones(zone_id, nodes):
+        gap = _aabb_gap(target.bbox, region.bbox)
+        counts = gap <= _CONTACT_TOLERANCE_M
+        plan = committed.zone_plan(region.id)
+        if not counts:
+            why = "across negative space — not our boundary"
+        elif plan is None:
+            why = "waiting: placed but not yet planned"
+        elif plan.is_atomic:
+            why = (
+                "settled: atomic, shell framed"
+                if _shell_settled(region.id)
+                else "waiting: atomic, shell not framed yet"
+            )
+        elif not _subregions_placed(region.id):
+            why = (
+                "waiting: subdivided, not decomposed yet"
+                if committed.zone_decompose(region.id) is None
+                else "waiting: subdivided, children not all placed"
+            )
+        elif not _shell_settled(region.id):
+            why = "waiting: subdivided, own shell not framed yet"
+        else:
+            why = "settled: subdivided — what faces us is its negative space"
+        out.append({
+            "id": region.id,
+            "gap_m": round(gap, 3),
+            "counts": counts,
+            "settled": bool(counts and _region_settled(region)),
+            "why": why,
+        })
+    return out
 
 
 def _zone_depths(nodes: list[Node]) -> dict[str, int]:
@@ -2455,41 +2846,28 @@ async def run_deferred_interiors(
     run_id: str,
     all_nodes: list[Node],
 ) -> None:
-    """Build every interior `run_parallel` deferred, fanning the zones out.
+    """Run every negative-space pass the walk deferred, deepest level first.
 
-    Two stages, because the scenarios differ in what they depend on:
+    A zone's fill covers the gaps its named children don't own, and a parent's
+    region physically CONTAINS its children's, so a parent has to see their fill
+    or the two double-fill the same volume. Equal-depth zones are disjoint, so a
+    level goes out together, against one frozen snapshot.
 
-      * ANCHOR — every atomic zone in one wave. Each zone's envelope was fixed
-        by its parent's `child_bbox_batch` during the walk, so no two can
-        contend for space and none needs another's contents.
-      * NEGATIVE SPACE — deepest level first, one level per wave. A zone's fill
-        covers the gaps between its children and a parent's region physically
-        CONTAINS its children's, so a parent has to see their fill or the two
-        double-fill the same volume. Equal-depth zones are disjoint, so a level
-        goes out together.
+    `drain_anchors` must have run already: each pass reads `all_nodes`, and a
+    zone's fill is meant to work around the objects its subtree placed.
 
-    Each zone's pass is `run` itself, so object decomposition, the capped
-    `next_object` loop (`STARSHOT_NEXT_OBJECT_CAP`), resume replay and every
-    event it writes behave exactly as in the serial pipeline. Only the
+    Each zone's pass is `run` itself, so object decomposition, resume replay and
+    every event it writes behave exactly as in the serial pipeline. Only the
     scheduling differs — and the loss of cross-zone visibility that buys.
     """
     deferred = _deferred_interiors.pop(run_id, [])
     if not deferred:
         return
 
-    await _build_interiors(
-        zones=[z for z, s in deferred if s == "anchor"],
-        scenario="anchor",
-        runs_dir=runs_dir,
-        run_id=run_id,
-        all_nodes=all_nodes,
-    )
-
-    negative = [z for z, s in deferred if s == "negative-space"]
     depths = _zone_depths(all_nodes)
-    for depth in sorted({depths.get(z.id, 0) for z in negative}, reverse=True):
+    for depth in sorted({depths.get(z.id, 0) for z in deferred}, reverse=True):
         await _build_interiors(
-            zones=[z for z in negative if depths.get(z.id, 0) == depth],
+            zones=[z for z in deferred if depths.get(z.id, 0) == depth],
             scenario="negative-space",
             runs_dir=runs_dir,
             run_id=run_id,

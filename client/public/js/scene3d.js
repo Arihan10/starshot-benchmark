@@ -13,7 +13,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { createLightRig, LIGHTING_DEFAULTS } from "./splatlight.js";
-import { fmtDurationMs } from "./ui.js";
+import { fmtDurationMs, fmtClockShort } from "./ui.js";
 
 const BBOX_COLOR_DEFAULT = 0xff3b3b; // zones
 // Objects are colored by the decomposition step that emitted them, so the
@@ -49,6 +49,10 @@ const PROXY_DIM_OPACITY = 0.2;
 // is barely tinted; isolate a single depth layer to see sibling overlaps clean.
 const ZONE_FILL_OPACITY = 0.08;
 const ZONE_FILL_DIM_OPACITY = 0.03;
+// Annotation-overlay fills (replay highlights, proposed boxes). Higher than the
+// zone-layers fills because these mark ONE thing deliberately rather than
+// building up a density map from many stacked zones.
+const OVERLAY_FILL_OPACITY = 0.14;
 const TOOLTIP_KIND_COLOR = {
 	zone: "#9ad4ff",
 	object: "#8bd17c",
@@ -1070,6 +1074,17 @@ export function createViewer(
 					row.appendChild(t);
 				}
 				tooltip.appendChild(row);
+				// When it ran matters as much as how long it took, now that a zone's
+				// steps are interleaved with other zones' — the span brackets the
+				// step's calls, so it reads wider than the summed flight above
+				// whenever the walk cut in between them.
+				if (s.tStart != null || s.tEnd != null) {
+					const when = document.createElement("div");
+					when.textContent = `${fmtClockShort(s.tStart)} → ${fmtClockShort(s.tEnd)}`;
+					when.style.color = "#6b7280";
+					when.style.paddingLeft = "20px";
+					tooltip.appendChild(when);
+				}
 			}
 		}
 		placeTooltip(clientX, clientY);
@@ -1509,9 +1524,10 @@ export function createViewer(
 		invalidate();
 	}
 
-	// Proposed-placement overlay — the prompt-lab's "after" boxes (a tested
-	// step's output) drawn on top of the current scene (the "before"). Modeled
-	// on the old tune sandbox's magenta overlay; never replaces scene bboxes.
+	// Annotation overlay — boxes drawn ON TOP of the scene without touching its
+	// own bboxes: a proposed placement (the prompt-lab's "after" of a tested step)
+	// or, during replay, the zone a step is acting on and what it just placed.
+	// Each box may carry its own `color`; omitting it keeps the magenta default.
 	function clearOverlayBoxes() {
 		while (overlayRoot.children.length > 0) {
 			const child = overlayRoot.children[0];
@@ -1542,13 +1558,36 @@ export function createViewer(
 					Math.max(origin[2], fz),
 				),
 			);
-			const helper = new THREE.Box3Helper(box3, BBOX_COLOR_OVERLAY);
+			const color = b.color ?? BBOX_COLOR_OVERLAY;
+			const helper = new THREE.Box3Helper(box3, color);
 			// Draw on top of everything so the proposal reads against the scene.
 			helper.material.depthTest = false;
 			helper.material.transparent = true;
 			helper.renderOrder = 999;
 			helper.layers.set(OVERLAY_LAYER);
 			overlayRoot.add(helper);
+			// Translucent solid, same idea as the zone-layers fills: an outline alone
+			// is easy to lose against a scene already full of wireframes, and the
+			// tint is what makes the highlighted volume read at a glance. Kept
+			// double-sided so it still tints when the camera sits inside the box,
+			// and depth-test-off to match the pass — depth is not meaningful here,
+			// the overlay draws after the composite.
+			const fill = new THREE.Mesh(
+				new THREE.BoxGeometry(1, 1, 1),
+				new THREE.MeshBasicMaterial({
+					color,
+					transparent: true,
+					opacity: OVERLAY_FILL_OPACITY,
+					depthTest: false,
+					depthWrite: false,
+					side: THREE.DoubleSide,
+				}),
+			);
+			fill.position.copy(box3.getCenter(new THREE.Vector3()));
+			fill.scale.copy(box3.getSize(new THREE.Vector3()));
+			fill.renderOrder = 998; // under the outline
+			fill.layers.set(OVERLAY_LAYER);
+			overlayRoot.add(fill);
 		}
 	}
 

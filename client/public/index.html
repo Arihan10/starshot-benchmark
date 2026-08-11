@@ -1312,13 +1312,99 @@
                 z-index: 5;
                 transition: left 0.2s ease;
             }
+            /* Replay bar (replay.js): shown while a paced re-walk of the event log
+               owns the scene. Sits directly above the toggle row, same left edge. */
+            #replay-bar {
+                position: absolute;
+                left: 10px;
+                /* Clears the toggle row, whose height changes as it wraps
+                   (overlay.js publishes it as --toggles-h). */
+                bottom: calc(var(--toggles-h, 30px) + 16px);
+                display: flex;
+                /* With the trace panel open the canvas can be ~270px wide, well
+                   under this row's min-content width, so it wraps rather than
+                   overflowing across the obs dock. */
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 4px 6px;
+                max-width: calc(100% - 20px);
+                padding: 5px 8px;
+                background: var(--panel-2);
+                border: 1px solid var(--line-2);
+                border-radius: 6px;
+                z-index: 6;
+                transition: left 0.2s ease;
+            }
+            #replay-bar .rp-btn {
+                font-size: 10px;
+                padding: 3px 7px;
+            }
+            #replay-bar .rp-play {
+                min-width: 30px;
+            }
+            #replay-bar .rp-speed {
+                font-size: 10px;
+                padding: 2px 4px;
+            }
+            #replay-bar .rp-slider {
+                flex: 1 1 110px;
+                min-width: 70px;
+                accent-color: var(--accent);
+            }
+            #replay-bar .rp-count,
+            #replay-bar .rp-label {
+                font-size: 10px;
+                color: var(--text-dim);
+                white-space: nowrap;
+            }
+            #replay-bar .rp-count {
+                font-variant-numeric: tabular-nums;
+                flex: none;
+            }
+            /* The step label is "<step> + <batch> · <zone id>", which routinely runs
+               past the whole bar, so it gets its own line under the controls and
+               ellipsises there instead of shoving the exit button off the canvas. */
+            #replay-bar .rp-label {
+                flex: 1 1 100%;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                color: var(--text);
+            }
+            #replay-bar .rp-next {
+                font-weight: 600;
+            }
+            /* Key for the annotation-overlay colours; swatch fills are set inline
+               from replay.js's constants so they can't drift from the 3D outlines. */
+            #replay-bar .rp-legend {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex: none;
+            }
+            #replay-bar .rp-key {
+                display: flex;
+                align-items: center;
+                gap: 3px;
+                font-size: 10px;
+                color: var(--text-dim);
+                white-space: nowrap;
+            }
+            #replay-bar .rp-sw {
+                width: 8px;
+                height: 8px;
+                border-radius: 2px;
+                flex: none;
+            }
             /* While the emittance-trace panel is open, slide the canvas overlays
                clear of it so the toggles + zone legend stay usable. */
             #canvas-host:has(#trace-panel.open) #viewer-toggles,
+            #canvas-host:has(#trace-panel.open) #replay-bar,
             #canvas-host:has(#trace-panel.open) #zone-layers-legend {
                 left: calc(var(--trace-w) + 16px);
             }
             #canvas-host:has(#trace-panel.open) #viewer-toggles,
+            #canvas-host:has(#trace-panel.open) #replay-bar,
             #canvas-host:has(#trace-panel.open) #zone-layers-legend {
                 max-width: calc(100% - var(--trace-w) - 36px);
             }
@@ -1529,6 +1615,66 @@
                 color: var(--text);
                 font-variant-numeric: tabular-nums;
                 word-break: break-word;
+            }
+            /* Interior gate (tracepanel.renderGate): whether a zone's anchor pass
+               is cleared to start, and which neighbours it is still waiting on.
+               `far` rows are regions the adjacency ray only reached across open
+               space — listed so their absence from the verdict is explicable. */
+            .tp-gate-body {
+                display: flex;
+                flex-direction: column;
+                gap: 3px;
+            }
+            .tp-gate-verdict {
+                font-size: 11px;
+                font-weight: 600;
+            }
+            .tp-gate-verdict.ok {
+                color: var(--green);
+            }
+            .tp-gate-verdict.wait {
+                color: var(--amber);
+            }
+            .tp-gate-note {
+                font-size: 10px;
+                color: var(--text-faint);
+            }
+            /* Ids run long (`central_modern_house_upper_private_bar_…`) and the
+               panel is narrow, so the reason drops to its own line, indented past
+               the dot, rather than fighting the id for horizontal room. */
+            .tp-gate-row {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 0 6px;
+                font-size: 10px;
+                margin-bottom: 2px;
+            }
+            .tp-gate-row::before {
+                content: "●";
+                flex: none;
+                color: var(--text-faint);
+            }
+            .tp-gate-row.ok::before {
+                color: var(--green);
+            }
+            .tp-gate-row.wait::before {
+                color: var(--amber);
+            }
+            .tp-gate-row.far {
+                opacity: 0.45;
+            }
+            .tp-gate-row.far::before {
+                content: "○";
+            }
+            .tp-gate-id {
+                color: var(--text);
+                overflow-wrap: anywhere;
+            }
+            .tp-gate-why {
+                color: var(--text-faint);
+                flex: 1 1 100%;
+                margin-left: 14px;
             }
             .tp-rels {
                 display: flex;
@@ -6345,6 +6491,13 @@
                             title="First-person camera (mouse-look). Click to enter · WASD move (W follows look) · Q/E down·up · Shift sprint · Esc to exit"
                         >
                             first-person
+                        </button>
+                        <button
+                            id="btn-replay"
+                            class="off"
+                            title="Replay — rebuild the scene one event at a time, in the order the pipeline committed them, instead of showing it all at once"
+                        >
+                            replay
                         </button>
                         <button id="btn-refit">refit</button>
                     </div>

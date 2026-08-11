@@ -623,6 +623,13 @@ export const api = {
         request(cellPath(slot, model, "/scene"), {
             params: { run, until_index: untilIndex },
         }),
+    // Why one zone's interior generation is or isn't cleared to start: the
+    // per-region read of the surroundings gate. Live — it reflects what has
+    // committed so far, so a finished cell reads as all-settled.
+    gate: (run, slot, model, zoneId) =>
+        request(cellPath(slot, model, `/gate/${encodeURIComponent(zoneId)}`), {
+            params: { run },
+        }),
     eventsUrl: (run, slot, model, { since } = {}) =>
         u(cellPath(slot, model, "/events"), { run, since }).toString(),
     //   mode="generated" streams one generated version of the cell instead of the

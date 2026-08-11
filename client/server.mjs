@@ -253,6 +253,11 @@ const server = createServer(async (req, res) => {
     if (path === "/tourview" || path === "/tourview/" || path === "/tourview.html") {
         return serveIndex(res, "tourview.html");
     }
+    // The parallel-flow debugger: one cell's call schedule + why each zone's
+    // interior is or isn't released.
+    if (path === "/paralleldebug" || path === "/paralleldebug/" || path === "/paralleldebug.html") {
+        return serveIndex(res, "paralleldebug.html");
+    }
     // Splat asset catalogue for the playground picker.
     if (path === "/api/assets") return sendJson(res, { assets: listAssets() });
 

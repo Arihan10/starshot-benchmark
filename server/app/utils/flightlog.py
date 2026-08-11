@@ -285,6 +285,29 @@ def attach_prompt(*, system: str, user: str, output: Any, reasoning: str, schema
     last["has_prompt"] = True
 
 
+def timeline(scene: str) -> list[dict[str, Any]]:
+    """Every recorded call for a cell, oldest first, with just the columns a
+    schedule view needs. Powers `/parallel-debug`.
+
+    Rows land only once a call COMPLETES (`record` writes `t_request` and
+    `t_response` together), so a call still in flight — or one cancelled by a
+    spend cap or a teardown — is absent rather than open-ended. A gap in this
+    timeline therefore means "nothing finished here", which is not quite the
+    same as "nothing was running"."""
+    path = _scene_db(scene)
+    if not path.exists():
+        return []
+    with _connect(path) as con:
+        return [
+            dict(r)
+            for r in con.execute(
+                "SELECT step, node, model, t_request, t_response, flight_ms, ok, "
+                "       tokens_in, tokens_out, cost "
+                "FROM flights WHERE t_request IS NOT NULL ORDER BY t_request"
+            )
+        ]
+
+
 # --- live tail (SSE) ----------------------------------------------------------
 
 
@@ -505,20 +528,49 @@ def backfill_zone_ids(
             t_req = _row_treq(event)
             if t_req is not None:
                 events_by_treq[round(float(t_req), 3)] = zone_id
-    if not events_by_gid and not events_by_treq:
-        return
     con = _connect(path)
     try:
         _ensure_columns(con)
-        con.executemany(
-            "UPDATE flights SET zone_id=? WHERE zone_id IS NULL AND generation_id=?",
-            ((zone_id, gid) for gid, zone_id in events_by_gid.items()),
+        total = int(con.execute("SELECT COUNT(*) FROM flights").fetchone()[0])
+        before = int(
+            con.execute("SELECT COUNT(*) FROM flights WHERE zone_id IS NOT NULL").fetchone()[0]
         )
-        con.executemany(
-            "UPDATE flights SET zone_id=? WHERE zone_id IS NULL AND t_request=?",
-            ((zone_id, t_req) for t_req, zone_id in events_by_treq.items()),
-        )
-        con.commit()
+        if not dry_run:
+            con.executemany(
+                "UPDATE flights SET zone_id=? WHERE zone_id IS NULL AND generation_id=?",
+                ((zone_id, gid) for gid, zone_id in events_by_gid.items()),
+            )
+            con.executemany(
+                "UPDATE flights SET zone_id=? WHERE zone_id IS NULL AND generation_id IS NULL "
+                "AND t_request=?",
+                ((zone_id, t_req) for t_req, zone_id in events_by_treq.items()),
+            )
+            con.commit()
+            after = int(
+                con.execute("SELECT COUNT(*) FROM flights WHERE zone_id IS NOT NULL").fetchone()[0]
+            )
+        else:
+            mapped_gids = sum(
+                1 for gid in events_by_gid
+                if con.execute(
+                    "SELECT 1 FROM flights WHERE zone_id IS NULL AND generation_id=? LIMIT 1", (gid,)
+                ).fetchone()
+            )
+            mapped_times = sum(
+                1 for t_req in events_by_treq
+                if con.execute(
+                    "SELECT 1 FROM flights WHERE zone_id IS NULL AND generation_id IS NULL "
+                    "AND t_request=? LIMIT 1",
+                    (t_req,),
+                ).fetchone()
+            )
+            after = min(total, before + mapped_gids + mapped_times)
+        return {
+            "rows": total,
+            "mapped": after,
+            "updated": after - before,
+            "unresolved": total - after,
+        }
     finally:
         con.close()
 
@@ -534,7 +586,7 @@ def _ensure_ledger(scene: str) -> None:
                 reconstruct_flights(scene, list(cellsummary.iter_events(events_path)))
         if scene not in _zone_ids_hydrated:
             with contextlib.suppress(sqlite3.Error, OSError):
-                _backfill_zone_ids(scene, events_path)
+                backfill_zone_ids(scene)
             _zone_ids_hydrated.add(scene)
 
 

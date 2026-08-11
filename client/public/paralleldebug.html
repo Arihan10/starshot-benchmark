@@ -1,0 +1,146 @@
+<!doctype html>
+<!-- Parallel-flow debugger — what the overlapped walk actually did for one cell.
+     Two questions, one page: WHEN did every call run (so you can see what
+     overlapped, and where the run sat idle), and WHY is a zone's interior still
+     waiting (which neighbours hold its gate shut, and whether they are even
+     touching it). All logic lives in js/paralleldebug.js; the data comes from
+     the server's /slots/{slot}/{model}/parallel-debug. -->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="server-url" content="http://127.0.0.1:8765" />
+        <title>starshot · parallel debug</title>
+        <style>
+            :root {
+                --bg: #0c0d10;
+                --panel: #16181d;
+                --panel-2: #1c1e24;
+                --line: #2a2d35;
+                --text: #e6e6e6;
+                --text-dim: #b8bcc4;
+                --text-faint: #7a808c;
+                --accent: #9ad4ff;
+                --accent-line: #4a8fd8;
+                --green: #8bd17c;
+                --amber: #e8c07d;
+                --red: #ff8080;
+            }
+            * { box-sizing: border-box; }
+            html, body { height: 100%; margin: 0; }
+            body {
+                background: var(--bg); color: var(--text);
+                font: 12px/1.45 "SF Mono", ui-monospace, Menlo, monospace;
+                display: flex; flex-direction: column;
+            }
+            header {
+                display: flex; align-items: center; gap: 8px; flex: 0 0 auto; flex-wrap: wrap;
+                padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+            }
+            header h1 { margin: 0 6px 0 0; font-size: 13px; letter-spacing: 0.04em; }
+            header .spacer { flex: 1; }
+            header a { color: var(--accent); text-decoration: none; font-size: 10px; }
+            select, button {
+                font: inherit; color: var(--text-dim); background: var(--panel-2);
+                border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px;
+                cursor: pointer; max-width: 320px;
+            }
+            button:hover:not(:disabled), select:hover { border-color: var(--accent-line); color: #cfe3fb; }
+            button.on { background: #21344e; border-color: var(--accent-line); color: #cfe3fb; }
+            button:disabled { opacity: 0.45; cursor: default; }
+
+            #stats { display: flex; gap: 14px; flex-wrap: wrap; padding: 7px 14px;
+                     border-bottom: 1px solid var(--line); background: var(--panel-2); flex: 0 0 auto; }
+            #stats .s { display: flex; align-items: baseline; gap: 5px; }
+            #stats .s b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+            #stats .s span { color: var(--text-faint); font-size: 10px; }
+            #stats .s.warn b { color: var(--amber); }
+            #stats .s.bad b { color: var(--red); }
+            #stats .s.good b { color: var(--green); }
+
+            main { flex: 1; display: flex; min-height: 0; }
+            #chartwrap { flex: 1; min-width: 0; overflow: auto; padding: 10px 14px 20px; }
+            #gates {
+                flex: 0 0 460px; border-left: 1px solid var(--line); background: var(--panel);
+                overflow-y: auto; padding: 10px 12px 24px;
+            }
+            #gates h2 { margin: 0 0 4px; font-size: 11px; letter-spacing: 0.06em; color: var(--text-dim); }
+            #gates .hint { color: var(--text-faint); font-size: 10px; margin: 0 0 10px; }
+
+            .zone { border: 1px solid var(--line); border-radius: 5px; margin-bottom: 7px; background: var(--panel-2); }
+            .zone > .head {
+                display: flex; align-items: center; gap: 7px; padding: 6px 8px; cursor: pointer;
+            }
+            .zone > .head:hover { background: rgba(255,255,255,0.03); }
+            .zone .zid { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .chip {
+                font-size: 9px; padding: 1px 6px; border-radius: 9px; border: 1px solid var(--line);
+                color: var(--text-faint); white-space: nowrap;
+            }
+            .chip.built { color: var(--green); border-color: #2f5a2c; }
+            .chip.running { color: var(--accent); border-color: var(--accent-line); }
+            .chip.queued { color: var(--amber); border-color: #6a5324; }
+            .chip.dead { color: var(--red); border-color: #5a2a2a; }
+            .zone .body { display: none; padding: 2px 8px 8px; border-top: 1px solid var(--line); }
+            .zone.open .body { display: block; }
+            /* Two lines per region: the id must never be the thing that gets
+               truncated — it is what you are looking for — so the reason sits
+               under it rather than competing for the same row. */
+            .fr { padding: 3px 0 4px; border-bottom: 1px solid #20232a; }
+            .fr:last-child { border-bottom: 0; }
+            .fr .l1 { display: flex; gap: 7px; align-items: baseline; }
+            .fr .gap { color: var(--text-faint); font-variant-numeric: tabular-nums; width: 58px; flex: 0 0 auto; }
+            .fr .rid { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+            .fr .why { color: var(--text-faint); font-size: 10px; padding-left: 65px; }
+            .fr.ignored .rid, .fr.ignored .gap { color: var(--text-faint); text-decoration: line-through; }
+            .fr.block .rid { color: var(--amber); }
+            .fr.ok .rid { color: var(--text-dim); }
+
+            svg text { fill: var(--text-faint); font: 9px "SF Mono", ui-monospace, monospace; }
+            svg .lane { fill: var(--text-dim); font-size: 9.5px; }
+            svg .grid { stroke: #21242b; stroke-width: 1; }
+            svg .idle { fill: rgba(255,128,128,0.10); }
+            svg .idlelab { fill: var(--red); font-size: 9px; }
+            svg .bar:hover { stroke: #fff; stroke-width: 1; }
+            #tip {
+                position: fixed; pointer-events: none; z-index: 20; display: none;
+                background: rgba(8,10,14,0.95); border: 1px solid var(--line); border-radius: 4px;
+                padding: 5px 8px; font-size: 10px; color: var(--text-dim); white-space: pre;
+            }
+            #msg { padding: 14px; color: var(--text-faint); }
+            #msg.err { color: var(--red); }
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>parallel debug</h1>
+            <select id="run"><option>loading…</option></select>
+            <select id="cell"><option>—</option></select>
+            <button id="reload" title="re-read the cell">reload</button>
+            <button id="auto" title="re-read every 5s while a run is live">auto</button>
+            <span class="spacer"></span>
+            <button id="mode-step" class="on" title="one lane per pipeline step">by step</button>
+            <button id="mode-zone" title="one lane per zone — shows each zone's own chain">by zone</button>
+            <button id="structural" class="on" title="hide the secondary traffic (library match / image prompt) so the structural schedule is legible">structural only</button>
+            <a href="/">← board</a>
+        </header>
+
+        <div id="stats"></div>
+
+        <main>
+            <div id="chartwrap"><div id="msg">pick a cell…</div></div>
+            <div id="gates">
+                <h2>INTERIOR GATES</h2>
+                <p class="hint">
+                    A zone's anchor pass starts once every region TOUCHING it has
+                    settled. Regions the ray cast reached across open space are
+                    struck through — that space is negative space, which is a wall.
+                </p>
+                <div id="gatelist"></div>
+            </div>
+        </main>
+
+        <div id="tip"></div>
+        <script type="module" src="/js/paralleldebug.js"></script>
+    </body>
+</html>

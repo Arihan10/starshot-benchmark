@@ -14,7 +14,7 @@
 // rebuilt only when the focus changes (or its data streams in), so the mini
 // viewer's WebGL context survives the body's frequent rebuilds.
 
-import { el, foldedPre, fmtJson, shortBytes, callTimingTitle, fmtClockTime } from "./ui.js";
+import { el, foldedPre, fmtJson, shortBytes, callTimingTitle, fmtClockTime, fmtClockShort, fmtDurationMs } from "./ui.js";
 import { emittanceLineage, extractRelevantOutput } from "./events.js";
 import { createViewer } from "./scene3d.js";
 import { api } from "./api.js";
@@ -59,6 +59,10 @@ export function createTracePanel(
 		// whether it took. `mapProjectionOf` reads the viewer's live projection back.
 		onProjectMap = () => {},
 		mapProjectionOf = () => null,
+		// Fetch the interior-gate report for a focused ZONE — whether its anchor
+		// pass is cleared to start and, if not, which neighbours it is waiting on.
+		// Returns a promise, or null where the gate doesn't apply (branches).
+		gateFor = null,
 		actions = null,
 		meshUrlFor = (_id, node) => node.meshUrl ?? null,
 		rawMeshUrlFor = (_id, node) =>
@@ -304,6 +308,80 @@ export function createTracePanel(
 				? el("span", { class: "tp-prop-val", text: value })
 				: value,
 		);
+	}
+
+	// --- interior gate --------------------------------------------------------
+	//
+	// A zone's anchor pass waits until everything on its boundary has resolved to
+	// a framed atomic zone or to negative space. This shows that verdict and, when
+	// it fails, exactly which neighbours are outstanding — otherwise a zone that
+	// looks finished just sits there with no visible reason.
+	//
+	// The report is fetched live (it is a function of what has committed so far),
+	// so a finished cell reads as all-settled. Regions the adjacency ray only
+	// reached across open space are listed too, dimmed, with their measured
+	// separation: "why isn't that thing 7m away blocking me" is a question people
+	// ask, and the answer is that it isn't on the boundary at all.
+	function renderGate(id) {
+		const promise = gateFor?.(id);
+		if (!promise) return;
+		const body = el("div", { class: "tp-gate-body", text: "checking…" });
+		const group = fieldGroup("interior gate", body);
+		fieldsEl.appendChild(group);
+		promise
+			.then((rep) => {
+				if (focusId !== id || !body.isConnected) return;
+				if (!rep?.known) {
+					group.remove();
+					return;
+				}
+				body.textContent = "";
+				const touching = (rep.regions ?? []).filter((r) => r.touching);
+				const ignored = (rep.regions ?? []).filter((r) => !r.touching);
+				const blocked = rep.blocking?.length ?? 0;
+				body.appendChild(
+					el("div", {
+						class: `tp-gate-verdict ${rep.passed ? "ok" : "wait"}`,
+						text: rep.passed
+							? `cleared · ${touching.length} neighbour${touching.length === 1 ? "" : "s"} settled`
+							: `waiting on ${blocked} of ${touching.length}`,
+					}),
+				);
+				if (rep.atomic === false) {
+					body.appendChild(
+						el("div", {
+							class: "tp-gate-note",
+							text: "subdivided zone — its interstitial fill runs after every anchor, so this gate does not hold it",
+						}),
+					);
+				}
+				for (const r of touching) {
+					body.appendChild(
+						el(
+							"div",
+							{ class: `tp-gate-row ${r.settled ? "ok" : "wait"}` },
+							el("span", { class: "tp-gate-id", text: r.id, title: r.id }),
+							el("span", { class: "tp-gate-why", text: r.detail }),
+						),
+					);
+				}
+				for (const r of ignored) {
+					body.appendChild(
+						el(
+							"div",
+							{ class: "tp-gate-row far" },
+							el("span", { class: "tp-gate-id", text: r.id, title: r.id }),
+							el("span", {
+								class: "tp-gate-why",
+								text: `${r.gap_m.toFixed(2)} m away — across negative space, not a boundary`,
+							}),
+						),
+					);
+				}
+			})
+			.catch(() => {
+				if (focusId === id && body.isConnected) group.remove();
+			});
 	}
 
 	// Per-object generated-asset controls — shown in the info block only while the
@@ -1035,6 +1113,12 @@ export function createTracePanel(
 			}
 		}
 
+		// Zones only: whether this one's interior generation is cleared to start.
+		// Ahead of the prose deliberately — it is a compact status block, and a
+		// zone's plan runs to paragraphs, which would bury the thing you opened
+		// the panel to check.
+		if (n.kind === "zone") renderGate(id);
+
 		if (n.prompt) fieldsEl.appendChild(fieldGroup("prompt", n.prompt));
 		// A zone's plan (from zone_plan) characterizes the zone itself, so surface it
 		// right under the prompt — a selected zone reads as prompt → plan, not just
@@ -1342,7 +1426,19 @@ export function createTracePanel(
 				: null,
 			el("span", {
 				class: "muted",
-				text: `#${call.index ?? "?"} · ${call.tokens_out ?? "?"} tok`,
+				// Flight time plus when the call actually ran. The clock times were
+				// hover-only, which is no help when you are scanning the trace to see
+				// how a zone's steps interleaved with the rest of the walk.
+				text: [
+					`#${call.index ?? "?"}`,
+					`${call.tokens_out ?? "?"} tok`,
+					call.flight_ms != null ? fmtDurationMs(call.flight_ms) : null,
+					call.t_request != null
+						? `${fmtClockShort(call.t_request)} → ${fmtClockShort(call.t_response)}`
+						: null,
+				]
+					.filter(Boolean)
+					.join(" · "),
 			}),
 			onInquire
 				? el("button", {

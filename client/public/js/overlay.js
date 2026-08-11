@@ -24,6 +24,7 @@ import { createObsDock } from "./obstree.js";
 import { createTracePanel } from "./tracepanel.js";
 import { createInvestigator } from "./investigator.js";
 import { initGenFailPanel } from "./genfails.js";
+import { initReplay } from "./replay.js";
 
 const overlayEl = document.getElementById("overlay");
 const titleEl = document.getElementById("overlay-title");
@@ -33,15 +34,25 @@ const statusEl = document.getElementById("overlay-status");
 const actionBtn = document.getElementById("overlay-action");
 const resetBtn = document.getElementById("overlay-reset");
 const btnZoneLayers = document.getElementById("btn-zone-layers");
+const btnReplay = document.getElementById("btn-replay");
 const zoneLayersLegendEl = document.getElementById("zone-layers-legend");
 
 let viewer = null;
 let dock = null;
 let tracePanel = null;
+let replay = null; // structural-call stepper over the event log (replay.js)
 let stream = null;
 let obs = createObsModel();
 let renderQueued = false;
 let openSeq = 0; // monotonically increasing guard for async open races
+
+// The obs model every node-INSPECTION surface reads: the hover tooltip, the
+// emittance trace, the node tree. While replay owns the scene this is its
+// prefix-only model, so nothing describes a call that hasn't happened at the
+// current cut — a zone with no plan yet shows no plan. The streaming machinery
+// (`obs.feed`, `obs.model.maxIndex` for the SSE cursor) always uses the real
+// model; only what the user READS is cut back.
+const viewObs = () => (replay?.isActive() ? replay.model() : obs.model);
 let lastLayersSig = null; // skips rebuilding the layer legend when unchanged
 // Asset view: which mesh build the 3D view shows + the generate gate's polling.
 let assetMode = "library"; // "library" | "generated"
@@ -104,6 +115,12 @@ export function initOverlay(sceneViewer) {
 		onProjectMap: (id, desc) =>
 			desc ? viewer.setMapProjection(id, desc) : viewer.clearMapProjection(),
 		mapProjectionOf: (id) => viewer.getMapProjection(id),
+		// Interior gate for a focused zone. Source cells only — a branch has its
+		// own log and no gate endpoint of its own.
+		gateFor: (zoneId) =>
+			state.view && !state.view.branch
+				? api.gate(state.run, state.view.slot, state.view.model, zoneId)
+				: null,
 		// Per-object generated-asset controls, live only while viewing a source
 		// cell's generated build: regenerate on a chosen backend + symmetry ops +
 		// prefab link/unlink.
@@ -220,23 +237,23 @@ export function initOverlay(sceneViewer) {
 	// bbox (dimming the rest); a call click guarantees its node is focused
 	// without toggling it off. 3D-side picks highlight + reveal the tree row,
 	// and the hover tooltip reads seed/plan/image text from the obs model.
-	viewer.setNodeInfo((id) => obs.model.nodes.get(id) ?? null);
+	viewer.setNodeInfo((id) => viewObs().nodes.get(id) ?? null);
 	// Hovering a bbox in 3D lists the pipeline steps that ran on/for the node
 	// (its calls + the provenance that named/placed it) under its base info —
 	// read from the same folded obs model the tree uses.
-	viewer.setNodeSteps((id) => nodeStepsOf(obs.model, id));
+	viewer.setNodeSteps((id) => nodeStepsOf(viewObs(), id));
 	// Color objects in 3D by the decomposition step that emitted them (next_object
 	// purple, anchor green, negative_space brown) — read from the same provenance
 	// the tree shows as "via {step}". `recolorAll` (below) repaints once a load's
 	// history has folded, since the scene projection paints bboxes first.
-	viewer.setOriginOf((id) => emittedStep(obs.model, id));
+	viewer.setOriginOf((id) => emittedStep(viewObs(), id));
 	// A 3D pick (or any selection) reveals the dock row AND drives the left
 	// emittance-trace panel; deselecting hides it. The panel only opens while a
 	// scene is actually up (state.view set) — never on a stray selection event
 	// with no cell loaded.
 	viewer.onSelect((id) => {
 		dock.markSelected(id, { scroll: true });
-		if (id && state.view) tracePanel.show(obs.model, id);
+		if (id && state.view) tracePanel.show(viewObs(), id);
 		else tracePanel.hide();
 	});
 	dock.setOnNodeClick((id, { ensureSelected = false } = {}) => {
@@ -251,7 +268,7 @@ export function initOverlay(sceneViewer) {
 		isHidden: viewer.isHidden,
 		toggle: viewer.toggleHidden,
 	});
-	viewer.onHiddenChange(() => dock.renderTree(obs.model));
+	viewer.onHiddenChange(() => dock.renderTree(viewObs()));
 
 	// "why?" on any call row (dock OR the left emittance-trace panel) → open the
 	// investigator with that step attached. Reads the live view at click time, so
@@ -323,6 +340,31 @@ export function initOverlay(sceneViewer) {
 	btnZoneLayers.addEventListener("click", () => {
 		viewer.setZoneLayers(!viewer.getZoneLayers().enabled);
 		refreshZoneLayers();
+	});
+	// Replay: hands the scene over to a paced re-walk of the committed log.
+	// Leaving it repaints the cell the normal way, since replay tore the scene
+	// down to rebuild it and has no full-scene state of its own to restore.
+	replay = initReplay({
+		viewer,
+		host: document.getElementById("canvas-host"),
+		// Every time the cut moves, the panels have to be re-read against the
+		// prefix model — otherwise the tree and trace keep describing the finished
+		// run while the scene shows an earlier step. Recolor too: an object's colour
+		// comes from the decompose that emitted it, which may not have run yet.
+		onCut: () => {
+			viewer.recolorAll();
+			dock.renderTree(viewObs());
+			tracePanel.refresh(viewObs());
+			refreshZoneLayers();
+		},
+		onExit: () => {
+			btnReplay.classList.add("off");
+			const view = state.view;
+			if (view) openCell({ slot: view.slot, model: view.model, branch: view.branch });
+		},
+	});
+	btnReplay.addEventListener("click", () => {
+		btnReplay.classList.toggle("off", !replay.toggle());
 	});
 	document
 		.getElementById("btn-refit")
@@ -1226,7 +1268,7 @@ function focusNode(id) {
 		// Box-less ancestor: viewer.select isn't called, so end any projection here.
 		viewer.clearMapProjection();
 		dock.markSelected(id, { scroll: true });
-		tracePanel.show(obs.model, id);
+		tracePanel.show(viewObs(), id);
 	}
 }
 
@@ -1298,12 +1340,12 @@ function scheduleTreeRender() {
 	renderQueued = true;
 	requestAnimationFrame(() => {
 		renderQueued = false;
-		dock.renderTree(obs.model, { streamed: true });
+		dock.renderTree(viewObs(), { streamed: true });
 		// Fold any newly-streamed calls into the open emit trace too (no-ops
 		// when nothing the panel shows changed, or while the user is reading it).
-		tracePanel.refresh(obs.model, { streamed: true });
+		tracePanel.refresh(viewObs(), { streamed: true });
 		if (state.view?.branch && state.lab.simStep)
-			dock.renderPinned(obs.model);
+			dock.renderPinned(viewObs());
 		// New zones may have streamed in — refresh the legend so a new depth's
 		// swatch appears (no-ops when the depth set is unchanged).
 		refreshZoneLayers();
@@ -1336,6 +1378,11 @@ export async function openCell({
 	else if (!sameCell) cameFromLog = false;
 	stream?.close();
 	stream = null;
+	// Replay owns the scene while it is active and its scrub position is tied to
+	// one log, so any reopen — cell swap, revert reload, or its own exit — drops
+	// it. `stop` deliberately doesn't fire `onExit`; that would recurse in here.
+	replay?.stop();
+	btnReplay.classList.add("off");
 	// A fresh cell open always starts on the library build; the generated view
 	// is opt-in per open via the asset toggle.
 	assetMode = "library";
@@ -1393,16 +1440,18 @@ export async function openCell({
 		/* never-started cell */
 	}
 	if (seq !== openSeq) return;
+	// Replay walks this same array rather than re-reading the log.
+	replay.load(history);
 	for (const event of history) obs.feed(event);
 	// The scene projection painted bboxes before this history folded, so objects
 	// were colored the default green; repaint now that each node's emitting step
 	// is known. (Streamed bboxes color correctly on paint — their decompose call
 	// always precedes the bbox event.)
 	viewer.recolorAll();
-	dock.renderTree(obs.model);
+	dock.renderTree(viewObs());
 	// Depths are known now that history folded — (re)build the layer legend.
 	refreshZoneLayers();
-	if (branch && state.lab.simStep) dock.renderPinned(obs.model);
+	if (branch && state.lab.simStep) dock.renderPinned(viewObs());
 	renderHeader(); // error message comes from the just-loaded log
 	tryPendingFocus(); // a log→scene jump lands on its node once history folds
 
@@ -1424,7 +1473,10 @@ function subscribe(seq, since) {
 		onEvent: (event) => {
 			if (seq !== openSeq) return;
 			if (!obs.feed(event)) return;
-			dispatchSceneEvent(viewer, event);
+			// The tree keeps streaming, but the 3D scene belongs to replay while
+			// it is active — otherwise a running cell drops meshes in ahead of the
+			// scrub and the build order on screen stops being the real one.
+			if (!replay?.isActive()) dispatchSceneEvent(viewer, event);
 			scheduleTreeRender();
 		},
 		onTerminal: () => {
@@ -1879,6 +1931,8 @@ export function closeOverlay() {
 	stream?.close();
 	stream = null;
 	stopGenPoll();
+	replay?.stop();
+	btnReplay.classList.add("off");
 	assetMode = "library";
 	state.view = null;
 	cameFromLog = false;

@@ -231,12 +231,25 @@ def scenario_facets() -> None:
         }) + "\n",
         encoding="utf-8",
     )
-    flightlog._zone_ids_hydrated.discard(legacy_scene)
+    dry_result = flightlog.backfill_zone_ids(legacy_scene, dry_run=True)
+    check(
+        "legacy zone dry-run",
+        dry_result == {"rows": 1, "mapped": 1, "updated": 1, "unresolved": 0},
+        str(dry_result),
+    )
+    with sqlite3.connect(legacy_db) as con:
+        check(
+            "dry-run leaves ledger unchanged",
+            con.execute("SELECT zone_id FROM flights").fetchone()[0] is None,
+        )
+    result = flightlog.backfill_zone_ids(legacy_scene)
     legacy_rows = flightlog.page("legacy", cursor=None, limit=100, filters={})["rows"]
     check(
         "legacy zone backfill",
-        len(legacy_rows) == 1 and legacy_rows[0]["zone_id"] == "atrium",
-        str(legacy_rows),
+        result["updated"] == 1
+        and len(legacy_rows) == 1
+        and legacy_rows[0]["zone_id"] == "atrium",
+        f"{result} {legacy_rows}",
     )
 
     migration_scene = "migration/s/m"

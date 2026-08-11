@@ -6662,6 +6662,107 @@ def create_app() -> FastAPI:
             media_type="application/x-ndjson",
         )
 
+    @app.get("/slots/{slot_id}/{model_alias}/parallel-debug")
+    async def slot_parallel_debug(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None,
+    ) -> dict[str, Any]:
+        """Everything the parallel-debug page draws for one cell: the call
+        schedule, the idle stretches in it, and — for every zone that takes an
+        anchor pass — whether its gate is open and which neighbours are holding
+        it shut.
+
+        The gate half is evaluated live against the cell's committed log rather
+        than replayed from events, so it answers "why is this zone stuck RIGHT
+        NOW", which is the question you actually have while a run is in flight.
+        """
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        # `committed.*` reads the task-bound log; binding here is what lets the
+        # gate helpers below see this cell.
+        rlog.bind(slot_log)
+        events = slot_log.state["events"]
+        nodes = _scene_nodes_full(slot_log)
+
+        rows = flightlog.timeline(_run_id(run, slot_id, model_alias))
+        t0 = min((r["t_request"] for r in rows), default=0.0)
+        flights = [
+            {
+                "step": r["step"] or "?",
+                "node": r["node"],
+                "start": round((r["t_request"] or t0) - t0, 3),
+                "end": round((r["t_response"] or r["t_request"] or t0) - t0, 3),
+                "ok": bool(r["ok"]),
+                "tokens_in": r["tokens_in"],
+                "tokens_out": r["tokens_out"],
+            }
+            for r in rows
+        ]
+        wall = max((f["end"] for f in flights), default=0.0)
+
+        # Stretches where nothing was in flight. Rows only land on completion, so
+        # a gap is "nothing FINISHED here" — which is exactly how a hung call or a
+        # cancelled batch shows up, and why they are worth drawing.
+        merged: list[list[float]] = []
+        for f in sorted(flights, key=lambda f: f["start"]):
+            if merged and f["start"] <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], f["end"])
+            else:
+                merged.append([f["start"], f["end"]])
+        idle = [
+            {"start": merged[i][1], "end": merged[i + 1][0]}
+            for i in range(len(merged) - 1)
+            if merged[i + 1][0] - merged[i][1] > 1.0
+        ]
+
+        releases = {
+            e["zone"]: {
+                "index": e.get("index"),
+                "forced": bool(e.get("forced")),
+                "scene_nodes": e.get("scene_nodes"),
+                "still_waiting": e.get("still_waiting"),
+            }
+            for e in events
+            if e.get("kind") == "generation.anchor.release" and e.get("zone")
+        }
+        registered = {
+            e.get("node") for e in events
+            if e.get("kind") == "step" and e.get("phase") == "generating_anchor"
+        }
+        started = {f["node"] for f in flights if f["step"] == "anchor_decompose"}
+
+        zones = []
+        for n in nodes:
+            if not n.is_zone:
+                continue
+            plan = committed.zone_plan(n.id)
+            atomic = None if plan is None else bool(plan.is_atomic)
+            # The frontier is only meaningful for zones that take an anchor pass,
+            # and each one costs a 256-ray cast, so skip the rest.
+            wants_anchor = atomic is True or n.id in registered
+            zones.append({
+                "id": n.id,
+                "parent": n.parent_id,
+                "atomic": atomic,
+                "decomposed": generation._subregions_placed(n.id),
+                "shell": generation._shell_settled(n.id),
+                "registered": n.id in registered,
+                "released": releases.get(n.id),
+                "started": n.id in started,
+                "gate": generation.neighbours_framed(n.id, nodes) if wants_anchor else None,
+                "frontier": generation.frontier_report(n.id, nodes) if wants_anchor else [],
+            })
+
+        return {
+            "run": run, "slot": slot_id, "model": model_alias,
+            "wall_s": round(wall, 1),
+            "busy_s": round(sum(b - a for a, b in merged), 1),
+            "flight_s": round(sum(f["end"] - f["start"] for f in flights), 1),
+            "flights": flights,
+            "idle": idle,
+            "zones": zones,
+            "status": rlog.derive_status(events),
+        }
+
     @app.get("/slots/{slot_id}/{model_alias}/event-bytes")
     async def slot_event_bytes(slot_id: str, model_alias: str, index: int, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """The heavy bytes for ONE event, fetched on demand when a tree call row is
@@ -6686,6 +6787,24 @@ def create_app() -> FastAPI:
         if until_index is not None:
             events = events[:until_index]
         return _scene_projection(events)
+
+    @app.get("/slots/{slot_id}/{model_alias}/gate/{zone_id}")
+    async def slot_gate(slot_id: str, model_alias: str, zone_id: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # Why a zone's interior generation is (or isn't) cleared to start, region
+        # by region — the inspector's read of `generation.neighbours_framed`.
+        #
+        # Computed live rather than logged: the answer is a function of what has
+        # committed SO FAR, and logging it per pump would write a row per pending
+        # zone per shell. On a finished cell everything reads settled, which is
+        # correct — the question only has a live answer.
+        #
+        # `rlog.bind` scopes the slot log to this request's task, which is what
+        # `committed.*` reads; each request is its own task, so this can't leak
+        # into a running pipeline's context.
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        rlog.bind(slot_log)
+        return generation.gate_report(zone_id, _scene_nodes_full(slot_log))
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
     async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True, variant: str | None = None, version: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
