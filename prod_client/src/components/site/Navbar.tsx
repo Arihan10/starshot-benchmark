@@ -21,6 +21,9 @@ const READING: { label: string; href: string }[] = [
 	{ label: "FAQ", href: "/faq" },
 ];
 
+/** Offer-label face height in em — lockup mark tracks the same via `--nav-mark`. */
+const OFFER_FACE_EM = 1.65;
+
 /** Three steps: short, tall, medium — revealed beside Leaderboard on hover. */
 function PodiumMark({ className }: { className?: string }) {
 	return (
@@ -97,7 +100,10 @@ function ReadingLink({
  */
 function BoardLabel({ onBoard }: { onBoard: boolean }) {
 	return (
-		<span className="inline-grid place-items-center overflow-hidden">
+		<span
+			className="inline-grid place-items-center overflow-hidden"
+			style={{ minHeight: `${OFFER_FACE_EM}em` }}
+		>
 			<span
 				className={`col-start-1 row-start-1 transition-transform duration-settle ease-out ${
 					onBoard ? "" : "group-hover/btn:-translate-y-full"
@@ -108,7 +114,7 @@ function BoardLabel({ onBoard }: { onBoard: boolean }) {
 			{!onBoard && (
 				<span
 					aria-hidden
-					className="col-start-1 row-start-1 translate-y-full transition-transform duration-settle ease-out group-hover/btn:translate-y-0"
+					className="col-start-1 row-start-1 flex size-full items-center justify-center translate-y-full transition-transform duration-settle ease-out group-hover/btn:translate-y-0"
 				>
 					<PodiumMark className="size-[1.1em]" />
 				</span>
@@ -120,7 +126,10 @@ function BoardLabel({ onBoard }: { onBoard: boolean }) {
 /** Generate's label, and the sparkles it gives way to. */
 function GenerateLabel() {
 	return (
-		<span className="inline-grid place-items-center overflow-hidden">
+		<span
+			className="inline-grid place-items-center overflow-hidden"
+			style={{ minHeight: `${OFFER_FACE_EM}em` }}
+		>
 			<span className="col-start-1 row-start-1 transition-transform duration-settle ease-out group-hover/btn:-translate-y-full">
 				Generate
 			</span>
@@ -145,10 +154,11 @@ function GenerateLabel() {
  * it collapses to before the two can touch.
  *
  * `p-sm` IS THE WHOLE MARGIN, one value on all four sides, and nothing inside
- * corrects for it. That holds because every control's ink runs to its own box
- * edge — the mark is sized to the disc rather than to artwork with a transparent
- * border (see Lockup) — so there is no slack on one side of the bar to answer for
- * on the other, and the height is `p-sm` twice plus the tallest control.
+ * corrects for it. That holds because every control shares one height — the mark
+ * is `--nav-mark`, the offer labels are `OFFER_FACE_EM` of `text-sm`, both equal
+ * to `py-sm` × 2 of face — so there is no shorter slab for `items-center` to
+ * float in extra vertical air past the sides, and the height is `p-sm` twice
+ * plus that one control.
  *
  * THE BERTH IS ALSO THE PLATE'S. Masthead measures both clusters and opens the
  * trapezoid between them, so the plate clears the controls and the bar stays
@@ -173,7 +183,15 @@ export default function Navbar({
 	const onBoard = isHere("/leaderboard");
 
 	return (
-		<header className="flex items-center justify-between gap-lg p-sm">
+		<header
+			className="flex items-center justify-between gap-lg p-sm"
+			style={
+				{
+					// Match the offer face: py-sm × 2 + OFFER_FACE_EM of text-sm.
+					"--nav-mark": `calc(2 * var(--spacing-sm) + ${OFFER_FACE_EM} * var(--text-sm))`,
+				} as React.CSSProperties
+			}
+		>
 			<div ref={leftClusterRef} className="flex items-center gap-md">
 				<Lockup />
 				<nav

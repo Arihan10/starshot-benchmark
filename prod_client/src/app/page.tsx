@@ -30,7 +30,7 @@ export default function Page() {
     const [{ shown, target }, setRound] = useState({ shown: 0, target: 0 });
     const round = LOCAL_ROUNDS[shown % LOCAL_ROUNDS.length];
     const turning = shown !== target;
-    const promptText = "\u201c" + round.prompt + "\u201d";
+    const promptText = round.prompt;
     const captionWidth = useTitleWidth(promptText);
 
     useEffect(() => {
@@ -83,7 +83,7 @@ export default function Page() {
     const barRef = useRef<HTMLDivElement>(null);
     const stackRef = useRef<HTMLDivElement>(null);
     const headRef = useRef<HTMLDivElement>(null);
-    const [seam, setSeam] = useState({ half: 0, notch: 0, drop: 0, head: 0 });
+    const [seam, setSeam] = useState({ half: 0, notch: 0, drop: 0 });
     const resting = useRef(true);
     useLayoutEffect(() => {
         resting.current = vote === null;
@@ -99,7 +99,6 @@ export default function Page() {
                 half: b.height / 2,
                 notch: b.width / 2,
                 drop: shell.getBoundingClientRect().bottom - (b.top + b.height / 2),
-                head: headRef.current?.getBoundingClientRect().height ?? 0,
             };
             setSeam((prev) =>
                 (Object.keys(next) as (keyof typeof next)[]).every(
@@ -115,8 +114,6 @@ export default function Page() {
         observer.observe(shell);
         const stack = stackRef.current;
         if (stack) observer.observe(stack);
-        const head = headRef.current;
-        if (head) observer.observe(head);
         return () => observer.disconnect();
     }, []);
 
@@ -164,13 +161,13 @@ export default function Page() {
             <div
                 ref={headRef}
                 {...(toured !== null ? { "data-moon-idle": true } : {})}
-                className={`flex-none transition-opacity duration-500 ${
-                    toured !== null ? "pointer-events-none opacity-0" : "opacity-100"
+                className={`pointer-events-none absolute inset-x-0 top-0 z-20 transition-opacity duration-500 [&_a]:pointer-events-auto [&_button]:pointer-events-auto ${
+                    toured !== null ? "opacity-0" : "opacity-100"
                 }`}
             >
             <Masthead
                 label="Who built it better?"
-                placement="flow"
+                placement="overlay"
                 captionWidth={captionWidth}
             >
                 <h1
@@ -186,15 +183,7 @@ export default function Page() {
             </Masthead>
             </div>
 
-            <div
-                className="relative min-h-0 flex-1"
-                style={{
-                    marginTop: toured !== null ? `${-seam.head}px` : 0,
-                    transitionProperty: "margin",
-                    transitionDuration: `${SOLO_TRANSITION_MS}ms`,
-                    transitionTimingFunction: SOLO_EASING,
-                }}
-            >
+            <div className="relative min-h-0 flex-1">
 
                 <div
                     className={`absolute inset-0 flex flex-col md:flex-row ${

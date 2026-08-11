@@ -51,11 +51,9 @@ export default function Lockup({ className = "" }: { className?: string }) {
 			aria-label="SceneBench by Starshot Labs"
 			className={`group/mark flex flex-none cursor-pointer items-center gap-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent ${className}`}
 		>
-			{/* THE BOX IS THE DISC. logo.png draws the mark right to its own edges, so
-			    the mark's layout box is its ink — nothing here has to answer for a
-			    transparent border, and the bar's padding is the whole of the margin
-			    the eye reads on this side. */}
-			<LogoMark className="size-xl flex-none" />
+			{/* THE BOX IS THE DISC. Ink to the edges; height is `--nav-mark` so it
+			    matches the offer controls and the bar's `p-sm` reads equal on every side. */}
+			<LogoMark className="size-(--nav-mark) flex-none" />
 			<div className="flex flex-col justify-center gap-2xs">
 				{/* Type on the wrapper so both copies share one strut / baseline. */}
 				<span className={`relative inline-block ${WORDMARK_TYPE}`}>
