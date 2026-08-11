@@ -160,11 +160,10 @@
     --sweep-4: rgb(var(--sweep-4-rgb));
     --accent-sweep: linear-gradient(
         104deg,
-        var(--sweep-0) 0%,
-        var(--sweep-1) 24%,
-        var(--sweep-2) 46%,
-        var(--sweep-3) 68%,
-        var(--sweep-4) 88%,
+        var(--sweep-1) 0%,
+        var(--sweep-2) 36%,
+        var(--sweep-3) 50%,
+        var(--sweep-4) 72%,
         var(--sweep-0) 100%
     );
 

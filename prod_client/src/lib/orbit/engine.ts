@@ -3155,11 +3155,15 @@ export class OrbitEngine {
 		{
 			let manifest: TourManifest | null = null;
 			if (source.manifestUrl) {
-				const res = await fetch(source.manifestUrl, {
+				// A scene whose tour is missing still has a dollhouse and a
+				// splat to show; only the interior walkthrough goes with it.
+				manifest = await fetch(source.manifestUrl, {
 					cache: "no-store",
-				});
-				if (token !== this.loadToken || this.disposed) return null;
-				if (res.ok) manifest = (await res.json()) as TourManifest;
+				})
+					.then((res) =>
+						res.ok ? (res.json() as Promise<TourManifest>) : null,
+					)
+					.catch(() => null);
 			}
 			if (token !== this.loadToken || this.disposed) return null;
 

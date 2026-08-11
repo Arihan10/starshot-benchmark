@@ -439,51 +439,29 @@ export const FOOTINGS: { rank: number; from: number; count: number }[] = FOOT.ma
 // ---------------------------------------------------------------------------
 // ONE HEIGHT SCALE, FOR THE PODIUM AND FOR THE CHALLENGER ALIKE
 //
-// IDLE — the whole board. An absolute scale from a board-wide floor up to first
-// place, bent by a power curve because the top of a rating list is crowded:
-// first and second are 25 points apart in a few hundred, and a straight line
-// draws the podium as three posts of the same height.
-//
-// COMPARING — this race only. The scale zooms to the four models on screen, and
-// THE FRAME AROUND THEM IS A FIXED NUMBER OF ELO POINTS rather than a share of
-// the gap. That last part is the whole trick. Fit a set exactly to its frame and
-// the extremes are pinned by construction — the top of the scale IS first place
-// and the bottom IS the challenger, so both stand at the same height for every
-// selection and only the middle two carry information. Anchor one end and fix
-// the slope instead, and the other end is the one that freezes. Pad in absolute
-// Elo and NO model sits on an edge: every height is a function of the gap, so
-// walking the standings moves all four posts. Inside the window the map is
-// straight, so the space between two roofs is the points between two models, at
-// one rate for the whole picture.
-const FLOOR = 1000;
+// THE SCALE IS THE BOARD AND NOTHING ELSE: last place is a stub, first place is
+// `TALL`, and the line between them is straight. It does not answer to what is
+// being pointed at, so the podium's three posts are a fixed height and a
+// selection raises the fourth post against them rather than re-drawing all four.
+// And because the map is linear, the air between any two roofs is the points
+// between those two models, at one rate everywhere on the island.
 const STUB = 2.4;
 
 export const TALL = 31;
 
-const CURVE = 7;
-
-// The frame, in Elo: clear air above first place and below the challenger.
-const HEADROOM = 28;
-const FOOTROOM = 34;
-
 /**
- * Pillar height as a function of Elo.
- *
- * `best` is first place. Pass the challenger's Elo while comparing to zoom onto
- * that race; omit it for the idle board-wide scale.
+ * Pillar height as a function of Elo, against the board's own range: `worst` is
+ * last place, `best` is first.
  */
 export function heightScale(
+	worst: number,
 	best: number,
-	challenger?: number,
 ): (elo: number) => number {
-	const racing = challenger != null;
-	const lo = racing ? challenger - FOOTROOM : FLOOR;
-	const hi = racing ? best + HEADROOM : best;
-	const span = Math.max(1, hi - lo);
+	const span = Math.max(1, best - worst);
 
 	return (elo) => {
-		const u = Math.max(0, Math.min(1, (elo - lo) / span));
-		return STUB + (TALL - STUB) * (racing ? u : u ** CURVE);
+		const u = Math.max(0, Math.min(1, (elo - worst) / span));
+		return STUB + (TALL - STUB) * u;
 	};
 }
 

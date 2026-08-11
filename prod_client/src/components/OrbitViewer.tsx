@@ -1,10 +1,8 @@
 "use client";
 
 import {
-	useCallback,
 	useEffect,
 	useImperativeHandle,
-	useRef,
 	useState,
 	type Ref,
 } from "react";
@@ -12,7 +10,6 @@ import type { TourSource } from "@/lib/orbit/types";
 import type { Scene } from "@/lib/scenes";
 import ArrivalToast from "./orbit/ArrivalToast";
 import FloorRail from "./orbit/FloorRail";
-import ViewerControls from "./orbit/ViewerControls";
 import HoverCard from "./orbit/HoverCard";
 import InspectFrame from "./orbit/InspectFrame";
 import LoadingOverlay from "./orbit/LoadingOverlay";
@@ -20,7 +17,6 @@ import Minimap from "./orbit/Minimap";
 import ObjectMenu from "./orbit/ObjectMenu";
 import PlacesDrawer from "./orbit/PlacesDrawer";
 import ReachPreview from "./orbit/ReachPreview";
-import { useFullscreen } from "./orbit/useFullscreen";
 import { useOrbitEngine } from "./orbit/useOrbitEngine";
 
 export type OrbitViewerHandle = {
@@ -33,8 +29,6 @@ export default function OrbitViewer({
 	warm = null,
 	commitVia,
 	onFocusedChange,
-	align = "right",
-	controls = true,
 	ref,
 }: {
 	ref?: Ref<OrbitViewerHandle>;
@@ -43,22 +37,13 @@ export default function OrbitViewer({
 	warm?: TourSource | null;
 	commitVia?: (commit: () => void) => void;
 	onFocusedChange?: (focused: boolean) => void;
-	align?: "left" | "right";
-	controls?: boolean;
 }) {
-	const rootRef = useRef<HTMLDivElement>(null);
 	const { hostRef, engineRef, state, inside } = useOrbitEngine({
 		scene,
 		source,
 		warm,
 		commitVia,
 	});
-	const {
-		isFullscreen,
-		supported,
-		exit: exitFullscreen,
-		toggle,
-	} = useFullscreen(rootRef);
 
 	useImperativeHandle(
 		ref,
@@ -72,40 +57,9 @@ export default function OrbitViewer({
 	const { mode, minimap, overlay } = state;
 	const landed = mode === "interior";
 
-	const leftDeliberately = useRef(false);
-	const toggleFullscreen = useCallback(() => {
-		if (isFullscreen) leftDeliberately.current = true;
-		toggle();
-	}, [isFullscreen, toggle]);
-
-	const hadScreen = useRef(false);
 	useEffect(() => {
-		if (isFullscreen) {
-			hadScreen.current = true;
-			return;
-		}
-		if (!inside || !hadScreen.current) return;
-		hadScreen.current = false;
-		if (leftDeliberately.current) {
-			leftDeliberately.current = false;
-			return;
-		}
-		engineRef.current?.exit();
-	}, [isFullscreen, inside, engineRef]);
-
-	useEffect(() => {
-		if (inside) {
-			onFocusedChange?.(true);
-			return;
-		}
-		let live = true;
-		void exitFullscreen().then(() => {
-			if (live) onFocusedChange?.(false);
-		});
-		return () => {
-			live = false;
-		};
-	}, [inside, onFocusedChange, exitFullscreen]);
+		onFocusedChange?.(inside);
+	}, [inside, onFocusedChange]);
 
 	useEffect(() => {
 		if (!landed) return;
@@ -133,20 +87,9 @@ export default function OrbitViewer({
 	}
 
 	return (
-		<div ref={rootRef} className='relative h-full w-full'>
-			{controls && !inside && (
-				<ViewerControls
-					align={align}
-					zoom={state.zoom}
-					isFullscreen={isFullscreen}
-					fullscreen={supported}
-					onZoom={(step) => engineRef.current?.zoom(step)}
-					onFullscreen={toggleFullscreen}
-				/>
-			)}
-
-			<div className='group relative isolate h-full w-full pointer-events-auto'>
-			<div ref={hostRef} className='absolute inset-0' />
+		<div className="relative h-full w-full">
+			<div className="group relative isolate h-full w-full pointer-events-auto">
+			<div ref={hostRef} className="absolute inset-0" />
 
 			<div
 				className={`transition-opacity duration-300 ease-out ${
@@ -154,7 +97,7 @@ export default function OrbitViewer({
 				}`}
 			>
 				{(landed || mode === "peek") && minimap && (
-					<div className='absolute left-4 top-4 z-20'>
+					<div className="absolute left-4 top-4 z-20">
 						<Minimap
 							minimap={minimap}
 							currentIndex={state.currentIndex}

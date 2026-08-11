@@ -1,4 +1,3 @@
-import { TOURS_ENABLED } from "./flags";
 import type { TourSource } from "./orbit/types";
 import { assetUrl, cfImageUrl } from "./r2";
 
@@ -16,7 +15,7 @@ function cellSource(
 		splatUrl: dir
 			? `/scenes/${dir}/trained.web.sog`
 			: assetUrl(`${cell}/splat/trained.web.sog`),
-		manifestUrl: TOURS_ENABLED ? tour("tour.json") : null,
+		manifestUrl: tour("tour.json"),
 		resolvePano: (file) => ({
 			url: tour(file),
 			placeholderUrl: cfImageUrl(`${cell}/tour/${file}`, {
@@ -51,7 +50,7 @@ export type LocalRound = {
 export const LOCAL_ROUNDS: readonly LocalRound[] = [
 	{
 		id: "modern-house",
-		prompt: "A modern house",
+		prompt: "A modern house that contains hayson and anthony hihihi sd adsad asd sdi",
 		leftShare: 44,
 		cells: [
 			{

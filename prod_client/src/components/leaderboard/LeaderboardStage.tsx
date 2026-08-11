@@ -130,7 +130,7 @@ export default function LeaderboardStage({
 			>
 				{armed && (
 					<Fade enter={640} delay={120} className="absolute inset-0">
-						<Podium rows={top} compare={rival} foot={foot} />
+						<Podium rows={rows} compare={rival} foot={foot} />
 					</Fade>
 				)}
 

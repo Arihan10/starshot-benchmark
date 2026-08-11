@@ -90,8 +90,6 @@ export default function ScenePanel({
 						warm={warm}
 						commitVia={commitVia}
 						onFocusedChange={onFocusedChange}
-						align={align}
-						controls={!voted}
 					/>
 				</div>
 

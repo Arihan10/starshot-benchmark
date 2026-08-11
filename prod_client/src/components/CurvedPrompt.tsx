@@ -66,13 +66,16 @@ function gaugeCss(voice: Voice): string {
 		.join(";");
 }
 
-/** Flat advance of the caption at its voice size → chord the moon should open to. */
-export function measurePromptChord(
+/**
+ * Flat advance of the caption at its voice size — the words alone, with no air
+ * either side. Masthead adds the margin that turns it into the moon's chord.
+ */
+export function measureCaptionWidth(
 	text: string,
 	voice: Voice = "prompt",
 ): number {
 	if (typeof document === "undefined" || !text) return 0;
-	const id = `prompt-chord-gauge-${voice}`;
+	const id = `caption-gauge-${voice}`;
 	let gauge = document.getElementById(id) as HTMLSpanElement | null;
 	if (!gauge) {
 		gauge = document.createElement("span");
@@ -81,13 +84,11 @@ export function measurePromptChord(
 	}
 	gauge.style.cssText = gaugeCss(voice);
 	gauge.textContent = text;
-	const advance = gauge.getBoundingClientRect().width;
-	// Shallow arc length ≈ chord; FIT_MARGIN is the same headroom fit() keeps.
-	return advance > 0 ? advance / FIT_MARGIN : 0;
+	return gauge.getBoundingClientRect().width;
 }
 
-/** Live chord needed for `text` at the current viewport title size. */
-export function usePromptChord(
+/** Live width of `text` at the current viewport title size. */
+export function useCaptionWidth(
 	text: string,
 	voice: Voice = "prompt",
 ): number {
@@ -95,7 +96,7 @@ export function usePromptChord(
 
 	useLayoutEffect(() => {
 		const sync = () => {
-			const next = measurePromptChord(text, voice);
+			const next = measureCaptionWidth(text, voice);
 			setChord((prev) => (Math.abs(prev - next) < 0.5 ? prev : next));
 		};
 		sync();

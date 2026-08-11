@@ -16,7 +16,7 @@ import { PairGate } from "@/components/arena/pairGate";
 import { buildStep } from "@/components/arena/buildSequence";
 import Composer from "@/components/arena/Composer";
 import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
-import CurvedPrompt, { usePromptChord } from "@/components/CurvedPrompt";
+import CurvedPrompt, { useCaptionWidth } from "@/components/CurvedPrompt";
 import Masthead from "@/components/site/Masthead";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
@@ -32,8 +32,8 @@ export default function Page() {
     const round = LOCAL_ROUNDS[shown % LOCAL_ROUNDS.length];
     const turning = shown !== target;
     const promptText = "\u201c" + round.prompt + "\u201d";
-    // Moon chord tracks the prompt; Masthead clamps to the navbar max.
-    const promptChord = usePromptChord(promptText);
+    // Masthead lays its margin either side of this to strike the moon.
+    const captionWidth = useCaptionWidth(promptText);
 
     useEffect(() => {
         if (!turning) return;
@@ -173,13 +173,13 @@ export default function Page() {
             <Masthead
                 label="Who built it better?"
                 placement="flow"
-                chord={promptChord}
+                captionWidth={captionWidth}
             >
-                {({ moonRadius, rollOrigin, rollDeg }) => (
+                {({ promptRadius, rollOrigin, rollDeg }) => (
                     // THE PIVOT HAS TO BE ON THIS ELEMENT, not on anything around
                     // it: `transform-origin` applies to the box being transformed
-                    // and is not inherited. Origin is the moon disc's centre so
-                    // the caption rolls along the limb instead of sliding flat.
+                    // and is not inherited. Origin is the centre of the circle the
+                    // caption is set on, so it rolls along its own arc.
                     <h1
                         key={round.id}
                         style={{
@@ -192,7 +192,7 @@ export default function Page() {
                                 : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
                         }`}
                     >
-                        <CurvedPrompt text={promptText} radius={moonRadius} />
+                        <CurvedPrompt text={promptText} radius={promptRadius} />
                     </h1>
                 )}
             </Masthead>

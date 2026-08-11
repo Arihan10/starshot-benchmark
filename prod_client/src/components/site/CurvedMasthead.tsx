@@ -1,6 +1,6 @@
 "use client";
 
-import CurvedPrompt, { usePromptChord } from "@/components/CurvedPrompt";
+import CurvedPrompt, { useCaptionWidth } from "@/components/CurvedPrompt";
 import Masthead from "@/components/site/Masthead";
 
 /**
@@ -16,13 +16,17 @@ export default function CurvedMasthead({
 	title: string;
 	placement?: "overlay" | "flow";
 }) {
-	const chord = usePromptChord(title, "name");
+	const captionWidth = useCaptionWidth(title, "name");
 
 	return (
-		<Masthead label={label} placement={placement} chord={chord}>
-			{({ moonRadius }) => (
+		<Masthead
+			label={label}
+			placement={placement}
+			captionWidth={captionWidth}
+		>
+			{({ promptRadius }) => (
 				<h1 className="m-0 w-full min-w-0">
-					<CurvedPrompt text={title} radius={moonRadius} voice="name" />
+					<CurvedPrompt text={title} radius={promptRadius} voice="name" />
 				</h1>
 			)}
 		</Masthead>

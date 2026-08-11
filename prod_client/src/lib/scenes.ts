@@ -1,4 +1,3 @@
-import { TOURS_ENABLED } from "./flags";
 import type { TourSource } from "./orbit/types";
 import { assetUrl, cfImageUrl } from "./r2";
 
@@ -45,7 +44,7 @@ export const panoFiles = (s: Scene): string[] =>
 export function tourSource(s: Scene): TourSource {
 	return {
 		dollhouseUrl: previewUrl(s),
-		manifestUrl: TOURS_ENABLED && s.tourKey ? assetUrl(s.tourKey) : null,
+		manifestUrl: s.tourKey ? assetUrl(s.tourKey) : null,
 		splatUrl: splatUrl(s),
 		resolvePano: (file) => ({ url: panoUrl(s, file), placeholderUrl: panoPlaceholderUrl(s, file) }),
 		resolveProxy: () => assetUrl(s.proxyKey ?? ""),

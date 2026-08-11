@@ -338,17 +338,12 @@ function Stage({
 	const caster = useMemo(() => new THREE.Raycaster(), []);
 
 	// EVERY POST IS THE SAME FUNCTION OF THE SAME NUMBER — see `heightScale`. The
-	// scale zooms onto the model being pointed at, and because the frame it keeps
-	// around the four is a fixed span of Elo rather than a share of the gap, none
-	// of them is pinned to an edge: all four move as you walk the standings.
-	const best = useMemo(
-		() => rows.reduce((n, r) => Math.max(n, r.elo), 1),
-		[rows],
-	);
-	const scale = useMemo(
-		() => heightScale(best, compare?.elo),
-		[best, compare?.elo],
-	);
+	// scale is the board, last place to first, so the podium stands still and a
+	// selection only raises the challenger against it.
+	const scale = useMemo(() => {
+		const elos = rows.map((r) => r.elo);
+		return heightScale(Math.min(...elos), Math.max(...elos));
+	}, [rows]);
 	const heights = useMemo(
 		() =>
 			PILLARS.map((p) => {
@@ -399,8 +394,8 @@ function Stage({
 	const pillars = useRef<(THREE.Mesh | null)[]>([]);
 	const over = useRef(PILLARS.map(() => false));
 	const swell = useRef(PILLARS.map(() => 0));
-	// Live podium heights, damped toward `heights` so a rescale eases with the
-	// challenger instead of snapping the top three while the fourth rises.
+	// Live podium heights, damped toward `heights` so a change in the standings
+	// eases the posts to their new height instead of snapping them.
 	const risen = useRef(PILLARS.map(() => 0));
 	const labels = useRef<(HTMLDivElement | null)[]>([]);
 	const stones = useRef<(THREE.Group | null)[]>([]);
@@ -684,10 +679,8 @@ function Stage({
 
 			// THE LABEL RIG SITS ON THE ROOF AND RIDES THE DAMPED HEIGHT. Anchoring
 			// it to the target instead put the rank, the mark and the name plate at
-			// the new height on the frame the pointer moved, while the post they
-			// belong to was still easing there — the caption arriving before its
-			// building. Now that a selection moves all four posts, that is every
-			// label on the island.
+			// the new height a frame before the post they belong to got there — the
+			// caption arriving ahead of its building.
 			const rig = stones.current[i];
 			if (rig) {
 				rig.position.y = p.base + risen.current[i] * rise;
@@ -1081,6 +1074,9 @@ export default function Podium({
 	compare = null,
 	foot,
 }: {
+	// THE WHOLE BOARD, not the three it draws — those are picked out by rank. The
+	// height scale runs from last place to first, so a slice would put its own
+	// bottom row on the floor of the island and rescale everything above it.
 	rows: Row[];
 	compare?: Row | null;
 	foot: number;

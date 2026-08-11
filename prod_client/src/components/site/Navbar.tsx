@@ -44,6 +44,21 @@ function PodiumMark({ className }: { className?: string }) {
 	);
 }
 
+/** ✨ without the yellow — large + small, mass centred on the viewBox. */
+function SparklesMark({ className }: { className?: string }) {
+	return (
+		<svg
+			aria-hidden
+			viewBox="0 0 24 24"
+			fill="currentColor"
+			className={className}
+		>
+			<path d="M10.5 5c0 4.4 3.6 8 8 8-4.4 0-8 3.6-8 8 0-4.4-3.6-8-8-8 4.4 0 8-3.6 8-8z" />
+			<path d="M18 3.2c0 2 1.6 3.6 3.6 3.6-2 0-3.6 1.6-3.6 3.6 0-2-1.6-3.6-3.6-3.6 2 0 3.6-1.6 3.6-3.6z" />
+		</svg>
+	);
+}
+
 /**
  * A reading link, ruled underneath.
  *
@@ -105,6 +120,25 @@ function BoardLabel({ onBoard }: { onBoard: boolean }) {
 					<PodiumMark className="size-[1.1em]" />
 				</span>
 			)}
+		</span>
+	);
+}
+
+/** Generate's label, and the sparkles it gives way to. */
+function GenerateLabel() {
+	return (
+		<span className="inline-grid place-items-center overflow-hidden">
+			<span className="col-start-1 row-start-1 transition-transform duration-settle ease-out group-hover/btn:-translate-y-full">
+				Generate
+			</span>
+			{/* Wrapper matches the cell so translate-y-full clears the clip —
+			    sizing the icon alone left it peeking under the shorter glyph. */}
+			<span
+				aria-hidden
+				className="col-start-1 row-start-1 flex size-full items-center justify-center translate-y-full transition-transform duration-settle ease-out group-hover/btn:translate-y-0"
+			>
+				<SparklesMark className="size-[1.65em]" />
+			</span>
 		</span>
 	);
 }
@@ -179,8 +213,8 @@ export default function Navbar({
 				</nav>
 				{/* #TODO: no action yet. This should take a prompt from the visitor
 				    and queue a build on both models. */}
-				<Button variant="cta" sweep shape="upright-end">
-					Generate
+				<Button variant="cta" shape="upright-end">
+					<GenerateLabel />
 				</Button>
 			</div>
 		</header>

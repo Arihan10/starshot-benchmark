@@ -6,6 +6,3 @@ const debug = process.env.NEXT_PUBLIC_ENABLE_DEBUG;
  */
 export const DEBUG_ENABLED =
 	debug === "1" || (debug !== "0" && process.env.NODE_ENV === "development");
-
-/** #TODO temporary — interior pano tours are off until the captures are fixed. */
-export const TOURS_ENABLED: boolean = false;
