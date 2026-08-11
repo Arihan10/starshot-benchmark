@@ -50,7 +50,7 @@ export type LocalRound = {
 export const LOCAL_ROUNDS: readonly LocalRound[] = [
 	{
 		id: "modern-house",
-		prompt: "A modern house that contains hayson and anthony hihihi sd adsad asd sdi",
+		prompt: "A modern house",
 		leftShare: 44,
 		cells: [
 			{

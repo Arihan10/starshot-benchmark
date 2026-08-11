@@ -16,8 +16,7 @@ import { PairGate } from "@/components/arena/pairGate";
 import { buildStep } from "@/components/arena/buildSequence";
 import Composer from "@/components/arena/Composer";
 import VoteBar, { REVEAL_SETTLE_MS } from "@/components/arena/VoteBar";
-import CurvedPrompt, { useCaptionWidth } from "@/components/CurvedPrompt";
-import Masthead from "@/components/site/Masthead";
+import Masthead, { Title, useTitleWidth } from "@/components/site/Masthead";
 import { LOCAL_ROUNDS } from "@/lib/localScenes";
 
 type Side = "a" | "b";
@@ -32,8 +31,7 @@ export default function Page() {
     const round = LOCAL_ROUNDS[shown % LOCAL_ROUNDS.length];
     const turning = shown !== target;
     const promptText = "\u201c" + round.prompt + "\u201d";
-    // Masthead lays its margin either side of this to strike the moon.
-    const captionWidth = useCaptionWidth(promptText);
+    const captionWidth = useTitleWidth(promptText);
 
     useEffect(() => {
         if (!turning) return;
@@ -175,26 +173,16 @@ export default function Page() {
                 placement="flow"
                 captionWidth={captionWidth}
             >
-                {({ promptRadius, rollOrigin, rollDeg }) => (
-                    // THE PIVOT HAS TO BE ON THIS ELEMENT, not on anything around
-                    // it: `transform-origin` applies to the box being transformed
-                    // and is not inherited. Origin is the centre of the circle the
-                    // caption is set on, so it rolls along its own arc.
-                    <h1
-                        key={round.id}
-                        style={{
-                            transformOrigin: rollOrigin,
-                            ["--prompt-roll-deg" as string]: rollDeg,
-                        }}
-                        className={`m-0 w-full min-w-0 ${
-                            turning
-                                ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
-                                : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
-                        }`}
-                    >
-                        <CurvedPrompt text={promptText} radius={promptRadius} />
-                    </h1>
-                )}
+                <h1
+                    key={round.id}
+                    className={`m-0 w-full min-w-0 text-center ${
+                        turning
+                            ? "animate-[prompt-roll-out_420ms_cubic-bezier(0.5,0,0.85,0.4)_both]"
+                            : "animate-[prompt-settle_1000ms_cubic-bezier(0.12,0.78,0.18,1)_both]"
+                    }`}
+                >
+                    <Title>{promptText}</Title>
+                </h1>
             </Masthead>
             </div>
 

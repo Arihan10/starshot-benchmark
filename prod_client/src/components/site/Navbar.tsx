@@ -5,15 +5,8 @@ import { usePathname } from "next/navigation";
 import Button from "@/components/ui/Button";
 import Lockup from "@/components/site/Lockup";
 
-// THE BAR RUNS INVERTED, and it does it by flipping the three colour roles rather
-// than by recolouring anything. Every control up here is already written in terms
-// of `ground`, `ink` and `mark`; swap what those RESOLVE to for the subtree and
-// each variant re-derives on its own — solid comes out black-on-white, ghost keeps
-// its hairline but in ink, quiet's labels darken.
-//
-// `--color-surface` and `--color-accent` are literals in the theme rather than
-// built from the rgb triplets, so they have to be named here too: quiet's hover
-// ground and the active underline would otherwise stay tuned for a black bar.
+// Paper inversion for type that sits ON the white masthead plate (caption /
+// title). The bar itself stays on the page's black tokens — white ink, white mark.
 export const ON_PAPER = {
 	"--ground-rgb": "var(--paper-rgb)",
 	"--ink-rgb": "var(--paper-ink-rgb)",
@@ -157,17 +150,17 @@ function GenerateLabel() {
  * border (see Lockup) — so there is no slack on one side of the bar to answer for
  * on the other, and the height is `p-sm` twice plus the tallest control.
  *
- * THE BERTH IS ALSO THE MOON'S. Masthead measures both clusters and opens the lip
- * between them, so the curve clears the controls and the bar stays straight under
- * all of them.
+ * THE BERTH IS ALSO THE PLATE'S. Masthead measures both clusters and opens the
+ * trapezoid between them, so the plate clears the controls and the bar stays
+ * straight under all of them.
  */
 export default function Navbar({
 	leftClusterRef,
 	rightClusterRef,
 }: {
-	/** The reading cluster — Masthead reads its right edge for the moon's chord. */
+	/** The reading cluster — Masthead reads its right edge for the plate's chord. */
 	leftClusterRef?: Ref<HTMLDivElement>;
-	/** The offer cluster — Masthead reads its left edge for the moon's chord. */
+	/** The offer cluster — Masthead reads its left edge for the plate's chord. */
 	rightClusterRef?: Ref<HTMLDivElement>;
 }) {
 	const pathname = usePathname();
@@ -180,10 +173,7 @@ export default function Navbar({
 	const onBoard = isHere("/leaderboard");
 
 	return (
-		<header
-			style={ON_PAPER}
-			className="flex items-center justify-between gap-lg p-sm"
-		>
+		<header className="flex items-center justify-between gap-lg p-sm">
 			<div ref={leftClusterRef} className="flex items-center gap-md">
 				<Lockup />
 				<nav
@@ -205,7 +195,8 @@ export default function Navbar({
 					<Button
 						href="/leaderboard"
 						aria-current={onBoard ? "page" : undefined}
-						variant="outline"
+						variant="solid"
+						edge={false}
 						shape="upright-start"
 					>
 						<BoardLabel onBoard={onBoard} />
@@ -213,7 +204,7 @@ export default function Navbar({
 				</nav>
 				{/* #TODO: no action yet. This should take a prompt from the visitor
 				    and queue a build on both models. */}
-				<Button variant="cta" shape="upright-end">
+				<Button variant="outline" shape="upright-end">
 					<GenerateLabel />
 				</Button>
 			</div>

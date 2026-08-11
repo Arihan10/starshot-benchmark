@@ -1,11 +1,9 @@
 "use client";
 
-import CurvedPrompt, { useCaptionWidth } from "@/components/CurvedPrompt";
-import Masthead from "@/components/site/Masthead";
+import Masthead, { Title, useTitleWidth } from "@/components/site/Masthead";
 
 /**
- * Masthead whose moon chord tracks a name-voice title, with the title set on
- * the limb arc — same construction as the arena prompt.
+ * Named-page masthead: flat title on the white trapezoid plate.
  */
 export default function CurvedMasthead({
 	label,
@@ -16,7 +14,7 @@ export default function CurvedMasthead({
 	title: string;
 	placement?: "overlay" | "flow";
 }) {
-	const captionWidth = useCaptionWidth(title, "name");
+	const captionWidth = useTitleWidth(title, "name");
 
 	return (
 		<Masthead
@@ -24,11 +22,9 @@ export default function CurvedMasthead({
 			placement={placement}
 			captionWidth={captionWidth}
 		>
-			{({ promptRadius }) => (
-				<h1 className="m-0 w-full min-w-0">
-					<CurvedPrompt text={title} radius={promptRadius} voice="name" />
-				</h1>
-			)}
+			<h1 className="m-0 w-full min-w-0 text-center">
+				<Title voice="name">{title}</Title>
+			</h1>
 		</Masthead>
 	);
 }

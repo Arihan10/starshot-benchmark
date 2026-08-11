@@ -289,45 +289,32 @@ body {
     }
 }
 
-/* THE PROMPT ROLLS ALONG THE LIMB. It does not rise and fall — it ROTATES about
-   the moon disc's centre (transform-origin on the element; see MastheadPrompt).
-   So the caption travels on the moon's own surface, arriving from one side and
-   leaving by the other along the curve it is sitting on.
-
-   `--prompt-roll-deg` is the angle whose ARC LENGTH is constant across widths
-   (see rollDegrees in Masthead). Holding the angle still made the prompt hurl
-   off-screen on wide monitors; holding the distance keeps the motion the size
-   you can see.
-
-   THE TRANSLATE THIS REPLACES was the same beat played straight: the prompt slid
-   up 0.55em and the next slid in from 0.7em below. Perfectly reasonable motion for
-   a caption on a flat bar, and the reason the masthead never quite read as round —
-   everything else curved and the one moving thing on it travelled in a line. */
+/* Flat prompt handoff — out and up, in from below. */
 @keyframes prompt-roll-out {
     0% {
         opacity: 1;
-        transform: rotate(0deg);
+        transform: translateY(0);
     }
     70% {
         opacity: 0.45;
     }
     100% {
         opacity: 0;
-        transform: rotate(calc(var(--prompt-roll-deg, 1.7) * -1deg));
+        transform: translateY(-0.45em);
     }
 }
 
 @keyframes prompt-settle {
     0% {
         opacity: 0;
-        transform: rotate(calc(var(--prompt-roll-deg, 1.7) * 1deg));
+        transform: translateY(0.55em);
     }
     30% {
         opacity: 1;
     }
     100% {
         opacity: 1;
-        transform: rotate(0deg);
+        transform: translateY(0);
     }
 }
 
