@@ -225,6 +225,7 @@ Only needed if you run the corresponding model alias. On HTTP 429, keys in the
 | `STARSHOT_SPEND_CAP_USD` | `200` | Per-cell soft spend tripwire (pauses a cell that crosses it) |
 | `STARSHOT_NEXT_OBJECT_CAP` | unset (uncapped) | Cap the anchor completion loop to N rounds; `0` = none |
 | `DOWNGRADE_NOUN_PHRASE` | `true` | Run the cheap `image_prompt` distill on `gemini-flash-lite`, off the benchmark model |
+| `STARSHOT_STEP_REASONING` | `false` | Request a thinking level PER PIPELINE STEP (`slots.STEP_REASONING`) instead of one level per model (`slots.REASONING_LEVELS`) |
 | `STARSHOT_CULL_NEXT_OBJECT` | `false` | Trim `{SCENE_CONTEXT}` for huge scenes that overflow the model window |
 | `STARSHOT_CULL_EARLY_REGION_FRAC` | `0` | Extra cull lever (fraction of earliest regions to drop) |
 | `LIBRARY_ASSETS_SUBDIR` | `assets-optimized` | Which library asset dir to serve (`assets` = raw) |

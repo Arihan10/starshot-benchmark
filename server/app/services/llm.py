@@ -36,8 +36,8 @@ from app.core.slots import (
     NO_STRUCTURED_OUTPUT_LIST,
     OPENAI_COMPAT_MODELS,
     OpenAICompatModel,
+    call_reasoning,
     model_pricing,
-    model_reasoning,
     token_cost,
 )
 from app.utils import cache, flightlog, keypool, logging
@@ -274,6 +274,12 @@ async def call_llm(
                     validate(cached)
                 return cached
 
+    # The thinking effort this call asks for. Resolved AFTER the gate, so a
+    # re-aimed model brings its own level, and keyed on `template or step` — the
+    # step identity the log and dashboard already group calls on, which is what
+    # the per-step flow's `STEP_REASONING` is written against.
+    effort = call_reasoning(model, template or step)
+
     # Graceful pause: while a soft pause is active, DON'T start a new call — park
     # until the task is cancelled (the /pause-soft handler cancels once in-flight
     # calls have drained + committed). Parking (rather than raising) keeps sibling
@@ -291,16 +297,17 @@ async def call_llm(
             user=user,
             output_schema=output_schema,
             model=model,
+            reasoning_effort=effort,
             validate=validate,
             step=step,
             node_id=node_id,
             zone_id=zone_id,
         )
         # cache.llm carries everything needed for the LLM-call cache (key +
-        # output), the observability view (node + step + model + system + user +
-        # reasoning), and the prompt lab (template + variables). Older log lines
-        # that lack the newer fields still replay correctly — the client treats
-        # them as unattributed / not re-renderable.
+        # output), the observability view (node + step + model + reasoning_effort +
+        # system + user + reasoning), and the prompt lab (template + variables).
+        # Older log lines that lack the newer fields still replay correctly — the
+        # client treats them as unattributed / not re-renderable.
         #
         # `generation_id` ties this call to OpenRouter's billing record. Its settled
         # USD cost lags the completion (and a live lookup would die with a restart),
@@ -328,6 +335,9 @@ async def call_llm(
             step=step,
             template=template,
             model=model,
+            # The level actually requested — the per-step flow's audit trail, and
+            # the only record of it, since the cache key doesn't bind the effort.
+            reasoning_effort=effort,
             schema=schema_name,
             system=system,
             user=user,
@@ -563,12 +573,22 @@ async def _send_openai_compatible(
 
 
 async def _send_structured(
-    *, model: str, system: str, user: str, output_schema: type[BaseModel],
+    *,
+    model: str,
+    system: str,
+    user: str,
+    output_schema: type[BaseModel],
+    reasoning_effort: str,
 ) -> _Completion:
     """Issue ONE structured request for `model`, dispatching by transport: an id
     registered in `OPENAI_COMPAT_MODELS` goes straight to its OpenAI-compatible
     `base_url`; every other id routes through the OpenRouter SDK (unchanged).
-    Both return a normalized `_Completion`."""
+    Both return a normalized `_Completion`.
+
+    `reasoning_effort` is the thinking level to request, already resolved by the
+    caller (per-step under that flow, else the model's own level). It applies to
+    the OpenRouter path only: a compat backend spells thinking its own way in its
+    config's `extra`, which `_send_openai_compatible` sends verbatim."""
     schema_name = output_schema.__name__
     wire_schema = _normalize_schema(output_schema.model_json_schema())
     cfg = OPENAI_COMPAT_MODELS.get(model)
@@ -588,7 +608,7 @@ async def _send_structured(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "reasoning": {"effort": model_reasoning(model)},
+                "reasoning": {"effort": reasoning_effort},
                 # Force routing to a provider that actually honors the parameters we
                 # send. Omitted, OpenRouter silently strips any param the chosen
                 # provider lacks — so a model whose provider can't do
@@ -649,6 +669,7 @@ async def call_llm_once(
     user: str,
     output_schema: type[T],
     model: str,
+    reasoning_effort: str | None = None,
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
     node_id: str | None = None,
@@ -667,7 +688,12 @@ async def call_llm_once(
     rendered transiently and discarded. `call_llm` is the cached, logged
     pipeline path. `log_retries=False` (the sandbox runs outside any cell's
     SlotLog binding) skips the per-attempt diagnostic events so no `logging`
-    ContextVar is required."""
+    ContextVar is required.
+
+    `reasoning_effort` is the thinking level to request. `call_llm` resolves it
+    from the call's template; a direct caller may pass its own, and omitting it
+    resolves from `model` + `step` the same way (so a step the per-step flow names
+    gets its level here too)."""
 
     def _retry_log(kind: str, **data: object) -> None:
         if log_retries:
@@ -677,6 +703,8 @@ async def call_llm_once(
     # stamped with this logical call's id + step/node, so a retry storm groups
     # back to the one pipeline call that caused it.
     flightlog.begin_call(step=step, node=node_id, zone_id=zone_id)
+
+    effort = reasoning_effort or call_reasoning(model, step)
 
     # Independent retry budgets, one per failure class:
     #   * `parse_attempt` — JSON-decode / Pydantic-validation failures.
@@ -714,6 +742,7 @@ async def call_llm_once(
         try:
             comp = await _send_structured(
                 model=model, system=system, user=user, output_schema=output_schema,
+                reasoning_effort=effort,
             )
             # Recorded before parsing: an OpenRouter generation was billed
             # regardless of whether its output survives validation below.

@@ -5002,6 +5002,9 @@ def create_app() -> FastAPI:
                 user=user,
                 output_schema=schema_cls,
                 model=model_id,
+                # Names the step so the test asks for the same thinking level the
+                # real step does under the per-step reasoning flow.
+                step=req.step,
                 log_retries=False,
             )
         except Exception as e:

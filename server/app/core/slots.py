@@ -8,6 +8,7 @@ llm service feeds straight into chat.send_async.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 
@@ -219,21 +220,25 @@ DEFAULT_MODEL_ALIAS = "gemini-flash-lite"
 
 DEFAULT_MODEL = MODELS[DEFAULT_MODEL_ALIAS]
 
+# Every effort level a call may request.
+REASONING_EFFORTS: frozenset[str] = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh"}
+)
+
 # Effort requested from any model that names no level of its own below.
 DEFAULT_REASONING = "xhigh"
 
 # Per-model reasoning effort, keyed by the SAME OpenRouter id MODELS maps to.
-# Each model carries its OWN level ("none", "minimal", "low", "medium", "high",
-# "xhigh"), so one that's slow or costly at `xhigh` — and whose reasoning depth
-# isn't what the run measures — sits exactly where it should instead of sharing a
-# single downgrade preset. Ids absent here request `DEFAULT_REASONING`.
+# Each model carries its OWN level (one of `REASONING_EFFORTS`), so one that's
+# slow or costly at `xhigh` — and whose reasoning depth isn't what the run
+# measures — sits exactly where it should instead of sharing a single downgrade
+# preset. Ids absent here request `DEFAULT_REASONING`.
 #
 # Only the OpenRouter transport reads this. `OPENAI_COMPAT_MODELS` backends spell
 # thinking their own way (`reasoning_effort`, `thinking`, `enable_thinking`), so
 # their level belongs in that config's `extra`.
 REASONING_LEVELS: dict[str, str] = {
     "openai/gpt-5.5": "medium",
-    "anthropic/claude-opus-5": "none",
 }
 
 
@@ -241,6 +246,56 @@ def model_reasoning(model_id: str | None) -> str:
     """The reasoning effort to request for `model_id` — its own entry in
     `REASONING_LEVELS`, else `DEFAULT_REASONING`."""
     return REASONING_LEVELS.get(model_id or "", DEFAULT_REASONING)
+
+
+
+STEP_REASONING_ENV = "STARSHOT_STEP_REASONING"
+
+STEP_REASONING: dict[str, str] = {
+    # Prose planning. The root plan seeds the entire scene, so it stays at the
+    "zone_plan_root": "xhigh",
+    "zone_plan": "minimal",
+    "overall_bbox": "medium",
+    "zone_decompose_root": "medium",
+    "zone_decompose": "none",
+    "child_bbox_batch": "low",
+    "object_bbox_batch": "low",
+    "anchor_decompose": "minimal",
+    "encapsulating_decompose": "none",
+    "negative_space_decompose": "none",
+    "object_decomp": "none",
+    "next_object": "none",
+    "image_prompt": "none",
+}
+
+_invalid_step_levels = {
+    step: level
+    for step, level in STEP_REASONING.items()
+    if level not in REASONING_EFFORTS
+}
+if _invalid_step_levels:
+    # A level outside the vocabulary is rejected by the provider, so catch the
+    # typo at import rather than on every call of a paid run.
+    raise ValueError(
+        f"STEP_REASONING levels outside {sorted(REASONING_EFFORTS)}: "
+        f"{_invalid_step_levels}"
+    )
+
+
+def step_reasoning_enabled() -> bool:
+    """Whether the per-step reasoning flow is on. Read at call time so a cell can
+    be launched under it, or without it, with no server restart."""
+    return os.environ.get(STEP_REASONING_ENV, "false").strip().lower() == "true"
+
+
+def call_reasoning(model_id: str | None, step: str | None) -> str:
+    """The effort ONE call requests: its step's level when the per-step flow is on
+    and `STEP_REASONING` names `step`, else `model_reasoning(model_id)`."""
+    if step is not None and step_reasoning_enabled():
+        level = STEP_REASONING.get(step)
+        if level is not None:
+            return level
+    return model_reasoning(model_id)
 
 
 # OpenRouter model ids whose only provider can't honor structured outputs

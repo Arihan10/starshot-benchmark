@@ -11,9 +11,10 @@ plans, decomposes and FRAMES the whole tree first, then every zone's interior is
 built concurrently instead of one zone at a time. Use it to A/B wall-clock and
 scene quality against run_request.py on the same prompt + model.
 
-Two knobs in `server/.env` shape how much that wins, both echoed at boot:
+Three knobs in `server/.env` shape how much that wins, all echoed at boot:
   STARSHOT_NEXT_OBJECT_CAP  caps the anchor completion loop (2 = the tuned value)
   USE_ASSET_LIBRARY         library matching vs. generating every mesh
+  STARSHOT_STEP_REASONING   per-step thinking levels (slots.STEP_REASONING)
 
 Usage: uv run scripts/run_parallel.py [--run NAME]
 """
@@ -151,9 +152,13 @@ def _settings_banner() -> str:
         "STARSHOT_NEXT_OBJECT_CAP"
     )
     library = os.environ.get("USE_ASSET_LIBRARY") or server_env_value("USE_ASSET_LIBRARY")
+    per_step = os.environ.get("STARSHOT_STEP_REASONING") or server_env_value(
+        "STARSHOT_STEP_REASONING"
+    )
     return (
         f"next_object cap={cap or 'UNCAPPED'}, "
-        f"asset library={'on' if (library or 'true').lower() != 'false' else 'off (from scratch)'}"
+        f"asset library={'on' if (library or 'true').lower() != 'false' else 'off (from scratch)'}, "
+        f"thinking={'per-step' if (per_step or 'false').lower() == 'true' else 'per-model'}"
     )
 
 
