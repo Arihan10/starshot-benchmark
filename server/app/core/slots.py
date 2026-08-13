@@ -121,6 +121,8 @@ MODELS: dict[str, str] = {
     "muse-spark-contributor": "meta/muse-spark-1.2-contributor",
     "qwen-small": "qwen/qwen3.5-35b-a3b",
     "gemma-small": "google/gemma-4-26b-a4b-it",
+    "new-gemini-flash-new": "google/gemini-3.7-flash",
+    "deepseek-pro-new": "deepseek/deepseek-v4-pro-0813",
 }
 
 # Model ids from MODELS that are actually served by a third-party
@@ -239,6 +241,7 @@ DEFAULT_REASONING = "xhigh"
 # their level belongs in that config's `extra`.
 REASONING_LEVELS: dict[str, str] = {
     "openai/gpt-5.5": "medium",
+    "anthropic/claude-opus-5": "none",
 }
 
 
@@ -309,4 +312,5 @@ NO_STRUCTURED_OUTPUT_LIST = [
     "poolside/laguna-s-2.1",
     "qwen/qwen3.5-35b-a3b",
     "google/gemma-4-26b-a4b-it",
+    "deepseek/deepseek-v4-pro-0813",
 ]

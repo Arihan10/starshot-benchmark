@@ -2482,6 +2482,53 @@ def _region_settled(region: Node) -> bool:
     return _subregions_placed(region.id) and _shell_settled(region.id)
 
 
+def _frame_ids(zone_id: str) -> list[str]:
+    """Ids of the objects a zone's encapsulating pass emitted — its shell, walls,
+    ground. Empty when the pass never ran, or ran and decided the zone needed no
+    bounding geometry at all."""
+    specs = committed.object_specs(zone_id, "encapsulating")
+    return [s.id for s in specs] if specs else []
+
+
+def _walled_off(target: Node, region: Node, by_id: dict[str, Node]) -> bool:
+    """Whether a committed frame stands between `target` and `region`, so what
+    faces us on that side is a wall rather than the region behind it.
+
+    This is the third way a frontier region can stop mattering, alongside being
+    negative space and being a framed atomic zone. A front yard borders the house
+    volume; the house's first floor may be unplanned, or planned and mid
+    decomposition, and none of that reaches the yard — the house's OUTER shell is
+    already standing between them. Waiting on the rooms inside would be waiting
+    on something the yard can neither see nor touch.
+
+    A frame qualifies when it belongs to the region or to one of its ancestors —
+    so a zone's own walls count, and so does the enclosing volume's outer shell,
+    which is the case that matters — AND it spans the interface, touching both us
+    and the region. That last test is what stops an unrelated wall on the far side
+    of a neighbour from being read as cover: a frame only shields the region it
+    actually sits in front of.
+
+    Only frames with a resolved bbox count; `by_id` is built from placed nodes, so
+    a frame that was decomposed but never positioned simply isn't found.
+    """
+    chain: list[str] = [region.id]
+    cur = region.parent_id
+    while cur is not None and cur in by_id:
+        chain.append(cur)
+        cur = by_id[cur].parent_id
+    for owner in chain:
+        for fid in _frame_ids(owner):
+            frame = by_id.get(fid)
+            if frame is None:
+                continue
+            if (
+                _aabb_gap(target.bbox, frame.bbox) <= _CONTACT_TOLERANCE_M
+                and _aabb_gap(frame.bbox, region.bbox) <= _CONTACT_TOLERANCE_M
+            ):
+                return True
+    return False
+
+
 # A frontier region has to be TOUCHING the zone. `util.adjacent_zones` casts rays
 # of UNCAPPED length — deliberately, because scene context wants a zone to know
 # what sits across the yard — so it also returns the first region a ray reaches
@@ -2512,9 +2559,13 @@ def _aabb_gap(a: BoundingBox, b: BoundingBox) -> float:
 
 
 def neighbours_framed(zone_id: str, nodes: list[Node]) -> bool:
-    """True when everything on `zone_id`'s boundary has resolved to negative
-    space, or to an atomic zone whose framing is done — the gate for starting
-    one zone's interior without waiting for the whole tree to be framed.
+    """True when every side of `zone_id` has resolved to one of three things —
+    negative space, an atomic zone whose framing is done, or a standing frame —
+    the gate for starting one zone's interior without waiting for the whole tree.
+
+    The third is what lets a zone start beside a volume that is nowhere near
+    finished: once the enclosing shell is up, the rooms behind it are sealed off
+    and irrelevant, whether or not they have even been planned (`_walled_off`).
 
     One cast of `util.adjacent_zones`, filtered to what is actually in contact,
     answers this outright: 256 rays from the zone's centre, keeping the FIRST
@@ -2550,8 +2601,9 @@ def neighbours_framed(zone_id: str, nodes: list[Node]) -> bool:
     target = next((n for n in nodes if n.id == zone_id), None)
     if target is None:
         return True
+    by_id = {n.id: n for n in nodes}
     return all(
-        _region_settled(r)
+        _region_settled(r) or _walled_off(target, r, by_id)
         for r in util.adjacent_zones(zone_id, nodes)
         if _aabb_gap(target.bbox, r.bbox) <= _CONTACT_TOLERANCE_M
     )
@@ -2751,13 +2803,17 @@ def frontier_report(zone_id: str, nodes: list[Node]) -> list[dict[str, Any]]:
     target = next((n for n in nodes if n.id == zone_id), None)
     if target is None:
         return []
+    by_id = {n.id: n for n in nodes}
     out: list[dict[str, Any]] = []
     for region in util.adjacent_zones(zone_id, nodes):
         gap = _aabb_gap(target.bbox, region.bbox)
         counts = gap <= _CONTACT_TOLERANCE_M
+        walled = counts and _walled_off(target, region, by_id)
         plan = committed.zone_plan(region.id)
         if not counts:
             why = "across negative space — not our boundary"
+        elif walled:
+            why = "settled: a frame stands between us — what is behind it is sealed off"
         elif plan is None:
             why = "waiting: placed but not yet planned"
         elif plan.is_atomic:
@@ -2780,7 +2836,8 @@ def frontier_report(zone_id: str, nodes: list[Node]) -> list[dict[str, Any]]:
             "id": region.id,
             "gap_m": round(gap, 3),
             "counts": counts,
-            "settled": bool(counts and _region_settled(region)),
+            "settled": bool(counts and (walled or _region_settled(region))),
+            "walled": bool(walled),
             "why": why,
         })
     return out

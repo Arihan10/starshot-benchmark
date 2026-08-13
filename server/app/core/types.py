@@ -13,7 +13,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 Vec3Tuple = tuple[float, float, float]
 
@@ -59,14 +59,7 @@ class BoundingBox(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    # `min_corner` is accepted as an input spelling of `origin`: every bbox prompt
-    # describes the box as "its own minimum corner and its dimensions" and never
-    # names the JSON field, so `origin` is the one field a model can only get from
-    # the schema — and a provider that stops enforcing `response_format` (observed
-    # on anthropic/claude-opus-5) lands on `min_corner` every time. The advertised
-    # wire schema is unchanged (AliasChoices names `origin` first), and every
-    # LLM-authored bbox is canonicalized to min-corner origin, so they agree.
-    origin: Vec3Cm = Field(validation_alias=AliasChoices("origin", "min_corner"))
+    origin: Vec3Cm
     dimensions: Vec3Cm
 
     @classmethod

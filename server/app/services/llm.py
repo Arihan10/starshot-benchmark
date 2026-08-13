@@ -615,9 +615,13 @@ async def _send_structured(
                 # `response_format: json_schema` (GLM) falls back to a free-form
                 # completion and emits fenced / prose / null content instead of
                 # schema-conformant JSON.
+                # No `sort: "latency"`: require_parameters only checks what an
+                # endpoint ADVERTISES, and enforcement belongs to the endpoint, not
+                # the model — claude-opus-5's fastest "Amazon Bedrock" sibling
+                # advertises response_format then ignores it, so a latency-sorted
+                # route free-forms the JSON (`min_corner` instead of `origin`).
                 "provider": {
                     "require_parameters": True,
-                    "sort": "latency",
                     "ignore": ["decart"],
                 },
             }

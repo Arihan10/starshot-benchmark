@@ -77,5 +77,52 @@ wire(
 print("frontier of A:", [n.id for n in util.adjacent_zones("A", nodes3)])
 check("inset child behind a gap, unframed", generation.neighbours_framed("A", nodes3), True)
 
+
+# --- a standing frame seals off whatever is behind it -------------------------
+# The front-yard case: the yard borders the house volume, whose rooms are not
+# planned yet — but the house's outer shell is already up between them.
+def house_scene(*, decomposed, wall_box, ground_planned=False):
+    root2 = Z("root", None, (0, 0, 0), (20, 5, 10))
+    yard = Z("front_yard", "root", (0, 0, 0), (5, 5, 10))
+    house = Z("house", "root", (5, 0, 0), (15, 5, 10))
+    ground = Z("ground_floor", "house", (5, 0, 0), (15, 5, 10))
+    wall = Node(
+        id="house_west_wall", prompt="wall",
+        bbox=BoundingBox(origin=wall_box[0], dimensions=wall_box[1]),
+        parent_id="house", is_zone=False,
+    )
+    nodes = [root2, yard, house] + ([ground] if decomposed else []) + [wall]
+    plan = {"front_yard": NS(is_atomic=True), "house": NS(is_atomic=False)}
+    if ground_planned:
+        plan["ground_floor"] = NS(is_atomic=False)
+    wire(
+        plan,
+        {"house": NS(subregions=[NS(id="ground_floor")])} if decomposed else {},
+        {"house": [NS(id="house_west_wall")], "front_yard": []},
+        {"root": 1, "front_yard": 1, "house": 1, "ground_floor": 1, "house_west_wall": 1},
+    )
+    return nodes
+
+
+# Wall on the house's west face: touches the yard AND the volume behind it.
+SEALS = ((5.0, 0, 0), (0.2, 5, 10))
+# Wall on the far east face: standing, but not between the yard and anything.
+FAR = ((19.8, 0, 0), (0.2, 5, 10))
+
+n = house_scene(decomposed=False, wall_box=SEALS)
+print("frontier of front_yard:", [x.id for x in util.adjacent_zones("front_yard", n)])
+check("undecomposed volume, outer shell up", generation.neighbours_framed("front_yard", n), True)
+
+n = house_scene(decomposed=True, wall_box=SEALS)
+print("frontier of front_yard:", [x.id for x in util.adjacent_zones("front_yard", n)])
+check("unplanned room behind that shell", generation.neighbours_framed("front_yard", n), True)
+
+n = house_scene(decomposed=True, wall_box=FAR)
+check("shell exists but not between us", generation.neighbours_framed("front_yard", n), False)
+
+n = house_scene(decomposed=False, wall_box=SEALS)
+check("the volume itself is still unsettled", generation._region_settled(
+    next(x for x in n if x.id == "house")), False)
+
 print()
 print("ALL PASS" if all(results) else "FAILURES PRESENT")
