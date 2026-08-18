@@ -68,11 +68,11 @@ export const LOCAL_ROUNDS: readonly LocalRound[] = [
 				slot: "modern-house",
 				model: "Claude Opus",
 				elo: 2108,
+				// #TODO temporary — both sides render the Gemini Flash scene until
+				// the opus-new SOG encode is fixed.
 				source: cellSource(
-					"ahhhhhhhh/modern-house/opus-new",
-					"modern-house-opus-new",
-					// #TODO temporary — delete once the SOG encode is fixed.
-					{ position: [55.6, -52.4, -16.9], rotation: [0, 0, 0], scale: 1 },
+					"ahhhhhhhh/modern-house/gemini-flash",
+					"modern-house-gemini-flash",
 				),
 			},
 		],

@@ -21,6 +21,7 @@
     --band-h: clamp(46px, 4.5vw, 62px);
     --ballot-h: clamp(44px, 4vw, 56px);
     --stack-gap: clamp(11px, 1.15vw, 18px);
+    --lift: clamp(6px, 0.6vw, 10px);
 
     --t-2xs: clamp(8px, 0.7vw, 11px);
     --t-xs: clamp(10px, 0.9vw, 13px);
@@ -262,11 +263,11 @@
         #ff4d9e,
         #ff4d4d
     );
-    filter: blur(var(--glow-blur, 9px));
+    filter: blur(var(--glow-blur, 10px));
 }
 
 .arena-glow:hover::before {
-    opacity: 1;
+    opacity: var(--glow-peak, 0.72);
 }
 
 .arena-glow > * {
@@ -276,7 +277,8 @@
 
 .arena-glow--key {
     --glow-spread: -4px;
-    --glow-blur: 11px;
+    --glow-blur: 12px;
+    --glow-peak: 0.66;
 }
 
 /* ── Prompt ─────────────────────────────────────────────────────────────── */
@@ -351,7 +353,13 @@
     overflow: hidden;
     transition:
         flex-grow 1000ms var(--ease-solo),
-        opacity 620ms var(--ease-solo);
+        opacity 620ms var(--ease-solo),
+        transform 620ms var(--ease-solo);
+}
+
+/* The winner steps forward off the row. */
+.arena-panel[data-outcome="won"] {
+    transform: translateY(calc(-1 * var(--lift)));
 }
 
 .arena-panel[data-role="pushed"] {
@@ -378,6 +386,8 @@
     background-color: rgb(0 0 0 / 0.6);
 }
 
+/* Light banked against the inside of the frame: a hard edge, a tight bloom that
+   hugs it, and a wide one that carries into the scene. */
 .arena-panel__glow {
     position: absolute;
     inset: 0;
@@ -386,7 +396,9 @@
     opacity: 0;
     box-shadow:
         inset 0 0 0 1px #fff,
-        inset 0 0 34px rgb(242 242 242 / 0.28);
+        inset 0 0 12px rgb(242 242 242 / 0.45),
+        inset 0 0 34px rgb(242 242 242 / 0.3),
+        inset 0 0 92px rgb(242 242 242 / 0.16);
     transition: opacity 520ms var(--ease-solo);
 }
 
@@ -500,42 +512,13 @@
     animation: arena-band-contents-in 320ms ease 640ms both;
 }
 
-/* The idle line sets the label's width; the call to action overlays it, so the
-   swap can never shove the field sideways. */
 .arena-composer__label {
-    position: relative;
-    display: grid;
     flex: none;
     font-size: var(--t-2xs);
     font-weight: 800;
     letter-spacing: 0.16em;
     white-space: nowrap;
     cursor: pointer;
-}
-
-.arena-composer__label > span {
-    white-space: nowrap;
-    transition: opacity 180ms ease;
-}
-
-.arena-composer__label > span:last-child {
-    position: absolute;
-    top: 0;
-    left: 0;
-    opacity: 0;
-}
-
-.arena-composer:not([data-draft="true"]) .arena-composer__label > span:first-child {
-    transition-delay: 140ms;
-}
-
-.arena-composer[data-draft="true"] .arena-composer__label > span:first-child {
-    opacity: 0;
-}
-
-.arena-composer[data-draft="true"] .arena-composer__label > span:last-child {
-    opacity: 1;
-    transition-delay: 140ms;
 }
 
 .arena-composer__divider {
@@ -564,8 +547,9 @@
     font-size: var(--t-xs);
     color: var(--ink);
     outline: none;
-    /* The hint reads fainter than its own rule until you are actually in it. */
-    opacity: 0.3;
+    /* The hint stays a step below the band's solid labels, but has to survive
+       being set at 400 against black — anything under this reads as disabled. */
+    opacity: 0.6;
     transition: opacity 180ms ease;
 }
 
@@ -585,37 +569,63 @@
     right: 0;
     bottom: 0;
     height: var(--rule);
-    background: #fff;
+    background: rgb(242 242 242 / 0.25);
 }
 
-/* ↵ only exists once there is something to submit. */
-.arena-composer__submit {
+/* The white rule belongs to the focused field, and grows out of its centre. */
+.arena-composer__rule--lit {
+    background: #fff;
+    transform: scaleX(0);
+    transition: transform 320ms var(--ease-open);
+}
+
+.arena-composer__field:focus-within .arena-composer__rule--lit {
+    transform: scaleX(1);
+}
+
+/* GO! keeps out of the way while the hint is being read: collapsed it hands its
+   slot, and the row's gap, back to the field. Focus or a draft brings it in —
+   and since focus is one of the triggers, tabbing to it always reveals it. */
+.arena-composer__go {
     flex: none;
-    border: 0;
-    background: transparent;
-    padding: 0;
-    font: inherit;
-    font-size: var(--t-2xs);
-    font-weight: 800;
-    letter-spacing: 0.14em;
-    color: var(--ink);
-    cursor: pointer;
+    align-self: center;
+    margin-left: -9px;
     opacity: 0;
-    transform: translateX(6px);
     pointer-events: none;
     transition:
-        opacity 180ms ease,
-        transform 180ms cubic-bezier(0.2, 0.8, 0.3, 1);
+        margin-left 320ms var(--ease-open),
+        opacity 180ms ease;
 }
 
-.arena-composer[data-draft="true"] .arena-composer__submit {
+.arena-composer:focus-within .arena-composer__go,
+.arena-composer[data-draft="true"] .arena-composer__go {
+    margin-left: 0;
     opacity: 1;
-    transform: translateX(0);
     pointer-events: auto;
 }
 
-.arena-composer[data-draft="true"] .arena-composer__submit:hover {
-    opacity: 0.6;
+/* Padding collapses with the width: under border-box a padded zero-width box
+   would still occupy its padding. */
+.arena-composer__submit {
+    width: 0;
+    height: clamp(22px, 2.1vw, 30px);
+    padding: 0;
+    overflow: hidden;
+    justify-content: center;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    /* Tracking hangs a blank unit off the last glyph; pull the run back by half
+       of it so the word sits on the key's true centre. */
+    text-indent: 0.07em;
+    transition:
+        width 320ms var(--ease-open),
+        padding 320ms var(--ease-open);
+}
+
+.arena-composer:focus-within .arena-composer__submit,
+.arena-composer[data-draft="true"] .arena-composer__submit {
+    width: clamp(42px, 4vw, 56px);
+    padding: 0 clamp(8px, 0.85vw, 12px);
 }
 
 /* ── Ballot ─────────────────────────────────────────────────────────────── */
@@ -744,9 +754,20 @@
 
 .arena-reveal__elo {
     flex: none;
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
     font-size: var(--t-2xs);
     font-weight: 600;
     letter-spacing: 0.12em;
+}
+
+/* Opacity rather than a colour, so it holds on both the white and black key. */
+.arena-reveal__elo-label {
+    opacity: 0.55;
+}
+
+.arena-reveal__elo-value {
     font-variant-numeric: tabular-nums;
 }
 

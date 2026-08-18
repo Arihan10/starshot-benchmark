@@ -39,7 +39,10 @@ function Reveal({
 				<span className="arena-reveal__slot">{slot}</span>
 				<span className="arena-reveal__model">{cell.model}</span>
 			</span>
-			<span className="arena-reveal__elo">{cell.elo}</span>
+			<span className="arena-reveal__elo">
+				<span className="arena-reveal__elo-label">ELO</span>
+				<span className="arena-reveal__elo-value">{cell.elo}</span>
+			</span>
 		</span>
 	);
 }

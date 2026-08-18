@@ -8,7 +8,7 @@ const STEPS = [
 	["TWO MODELS RACE —", "YOU JUDGE THEM"],
 ] as const;
 
-const HINT = "describe any scene (e.g. a modern house)";
+const HINT = "describe any scene…";
 
 export default function ManifestBand({
 	inputRef,
@@ -26,8 +26,7 @@ export default function ManifestBand({
 				onSubmit={(event) => event.preventDefault()}
 			>
 				<label htmlFor="arena-composer" className="arena-composer__label">
-					<span>0 · PROMPT</span>
-					<span aria-hidden={!filled}>PRESS ENTER ↵</span>
+					0 · PROMPT
 				</label>
 
 				<span aria-hidden className="arena-composer__divider" />
@@ -43,16 +42,17 @@ export default function ManifestBand({
 						onChange={(event) => setDraft(event.target.value)}
 					/>
 					<span aria-hidden className="arena-composer__rule" />
+					<span aria-hidden className="arena-composer__rule arena-composer__rule--lit" />
 				</span>
 
-				<button
-					type="submit"
-					className="arena-composer__submit"
-					aria-hidden={!filled}
-					tabIndex={filled ? 0 : -1}
-				>
-					↵
-				</button>
+				<span className="arena-glow arena-composer__go">
+					<button
+						type="submit"
+						className="arena-key arena-key--solid arena-composer__submit"
+					>
+						GO!
+					</button>
+				</span>
 			</form>
 
 			{STEPS.map(([head, tail], index) => (
