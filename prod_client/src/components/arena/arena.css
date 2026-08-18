@@ -1,0 +1,944 @@
+/* The arena owns its own scale. Every token below is declared on the arena root
+   rather than :root, so the rest of the site keeps the scale it was built on. */
+
+.arena {
+    position: relative;
+    height: 100dvh;
+    overflow: hidden;
+    background: #000;
+    color: var(--ink);
+    font-family: var(--font-anybody), system-ui, sans-serif;
+
+    --ink: #f2f2f2;
+    --edge: #fff;
+    --rule: 1.5px;
+    --danger: #e5232c;
+
+    --pad: clamp(16px, 1.8vw, 28px);
+    /* The canvases and the band sit further in than the nav's own margin. */
+    --scene-inset: calc(var(--pad) + clamp(10px, 1.2vw, 22px));
+    --nav-h: clamp(26px, 2.4vw, 34px);
+    --band-h: clamp(46px, 4.5vw, 62px);
+    --ballot-h: clamp(44px, 4vw, 56px);
+    --stack-gap: clamp(11px, 1.15vw, 18px);
+
+    --t-2xs: clamp(8px, 0.7vw, 11px);
+    --t-xs: clamp(10px, 0.9vw, 13px);
+    --t-sm: clamp(11px, 1vw, 15px);
+    --t-md: clamp(14px, 1.4vw, 20px);
+    --t-lg: clamp(28px, 3.4vw, 56px);
+
+    /* Ink trims are re-measured from the live font metrics so the header's
+       optical gaps stay equal; these are Anybody's, used for the first paint. */
+    --prompt-trim-top: calc(var(--t-lg) * 0.095);
+    --prompt-trim-bot: calc(var(--t-lg) * 0.217);
+    --eyebrow-trim-bot: calc(var(--t-2xs) * 0.267);
+    --eyebrow-half: calc(var(--t-2xs) / 2);
+    --eyebrow-bottom: calc(
+        var(--pad) + var(--nav-h) / 2 + var(--eyebrow-half) -
+            var(--eyebrow-trim-bot)
+    );
+    --prompt-gap: var(--stack-gap);
+    --prompt-ink: calc(
+        var(--t-lg) - var(--prompt-trim-top) - var(--prompt-trim-bot)
+    );
+
+    /* The canvas's top gap can't be borrowed from the bottom: down there the
+       ballot straddles the edge and visually annexes the space, so the same
+       number reads much larger up here. Its own token, tuned optically. */
+    --canvas-gap: clamp(22px, 2.3vw, 36px);
+    --head-h: calc(
+        var(--eyebrow-bottom) + var(--prompt-gap) + var(--prompt-ink) +
+            var(--canvas-gap)
+    );
+
+    /* One --edge-gap governs the three lower breathers: canvas → ballot,
+       ballot → band, band → page bottom. */
+    --edge-gap: clamp(14px, 1.45vw, 24px);
+    --frame-bot: calc(
+        var(--edge-gap) + var(--band-h) + var(--edge-gap) + var(--ballot-h) / 2
+    );
+
+    --ease-solo: cubic-bezier(0.25, 0.8, 0.3, 1);
+    --ease-open: cubic-bezier(0.22, 0.9, 0.24, 1);
+    --ease-key: cubic-bezier(0.3, 0.85, 0.25, 1);
+}
+
+.arena a {
+    color: inherit;
+    text-decoration: none;
+}
+
+/* Every piece of chrome stands down while a scene is being walked. */
+.arena-chrome {
+    transition: opacity 500ms ease;
+}
+
+.arena[data-solo="true"] .arena-chrome {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* ── Sky ────────────────────────────────────────────────────────────────── */
+
+.arena-sky {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+.arena-head {
+    position: absolute;
+    top: var(--pad);
+    left: var(--pad);
+    right: var(--pad);
+    height: var(--nav-h);
+    z-index: 20;
+    display: flex;
+    align-items: stretch;
+    justify-content: space-between;
+    gap: clamp(14px, 1.6vw, 24px);
+}
+
+.arena-head__group {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: stretch;
+}
+
+.arena-head__group--left {
+    gap: clamp(11px, 1.2vw, 18px);
+}
+
+.arena-head__group--right {
+    justify-content: flex-end;
+    gap: clamp(8px, 0.9vw, 13px);
+}
+
+.arena-brand {
+    display: flex;
+    flex: none;
+    align-items: stretch;
+    gap: 8px;
+}
+
+.arena-brand__mark {
+    display: block;
+    align-self: center;
+    width: var(--nav-h);
+    height: var(--nav-h);
+    background: var(--ink);
+    mask: url("/starshot-mark-trim.png") center / contain no-repeat;
+    -webkit-mask: url("/starshot-mark-trim.png") center / contain no-repeat;
+}
+
+.arena-brand__stack {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 1px 0;
+}
+
+/* Tracked out at runtime until its right edge lands on the sub-line's. */
+.arena-brand__name {
+    font-weight: 800;
+    font-size: var(--t-sm);
+    line-height: 1;
+    letter-spacing: var(--brand-track, 0);
+}
+
+.arena-brand__sub {
+    font-size: clamp(6.5px, 0.55vw, 9px);
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: 0.24em;
+    margin-right: -0.24em;
+    color: rgb(242 242 242 / 0.45);
+}
+
+.arena-divider {
+    flex: none;
+    align-self: center;
+    width: var(--rule);
+    height: clamp(16px, 1.5vw, 23px);
+    background: rgb(242 242 242 / 0.3);
+}
+
+.arena-nav {
+    display: flex;
+    align-items: center;
+    gap: clamp(10px, 1vw, 15px);
+    font-size: var(--t-2xs);
+    font-weight: 600;
+    letter-spacing: 0.18em;
+}
+
+.arena-nav a {
+    color: #fff;
+    transition: opacity 120ms ease;
+}
+
+.arena-nav a:hover {
+    opacity: 0.7;
+}
+
+.arena-eyebrow {
+    flex: none;
+    align-self: center;
+    font-size: var(--t-2xs);
+    font-weight: 600;
+    letter-spacing: 0.32em;
+    color: rgb(242 242 242 / 0.5);
+    white-space: nowrap;
+}
+
+.arena-key {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 clamp(9px, 1vw, 14px);
+    outline: var(--rule) solid var(--edge);
+    background: transparent;
+    color: var(--ink);
+    border: 0;
+    font: inherit;
+    font-size: var(--t-2xs);
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+        background 130ms ease,
+        color 130ms ease;
+}
+
+.arena-key:hover {
+    background: var(--edge);
+    color: #000;
+}
+
+.arena-key__glyph {
+    font-size: 1.1em;
+    opacity: 0.6;
+}
+
+.arena-key--solid {
+    background: var(--edge);
+    color: #000;
+}
+
+.arena-key--solid .arena-key__glyph {
+    opacity: 0.5;
+}
+
+/* Spectrum bloom behind a key, lit on hover. */
+.arena-glow {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+}
+
+.arena-glow::before {
+    content: "";
+    position: absolute;
+    inset: var(--glow-spread, -3px);
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 240ms ease;
+    background: conic-gradient(
+        from 180deg,
+        #ff4d4d,
+        #ffa64d,
+        #ffe94d,
+        #4dff88,
+        #4dd2ff,
+        #a64dff,
+        #ff4d9e,
+        #ff4d4d
+    );
+    filter: blur(var(--glow-blur, 9px));
+}
+
+.arena-glow:hover::before {
+    opacity: 1;
+}
+
+.arena-glow > * {
+    position: relative;
+    z-index: 1;
+}
+
+.arena-glow--key {
+    --glow-spread: -4px;
+    --glow-blur: 11px;
+}
+
+/* ── Prompt ─────────────────────────────────────────────────────────────── */
+
+.arena-title-slot {
+    position: absolute;
+    top: calc(var(--eyebrow-bottom) + var(--prompt-gap));
+    left: 0;
+    right: 0;
+    z-index: 15;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 var(--pad);
+    box-sizing: border-box;
+}
+
+/* Negative margins trim the box down to its ink, so the gaps above and below
+   are measured from the glyphs rather than from the line box. */
+.arena-title {
+    margin: calc(-1 * var(--prompt-trim-top)) 0 calc(-1 * var(--prompt-trim-bot));
+    font-weight: 800;
+    font-size: var(--prompt-size, var(--t-lg));
+    line-height: 1;
+    letter-spacing: -0.005em;
+    text-transform: uppercase;
+    white-space: var(--prompt-wrap, nowrap);
+    max-width: var(--prompt-max, 100%);
+    text-align: center;
+    animation: arena-title-in 620ms cubic-bezier(0.12, 0.78, 0.18, 1) both;
+}
+
+.arena-title[data-leaving="true"] {
+    animation: arena-title-out 300ms cubic-bezier(0.5, 0, 0.85, 0.4) both;
+}
+
+/* ── Scene region ───────────────────────────────────────────────────────── */
+
+.arena-region {
+    position: absolute;
+    top: var(--head-h);
+    bottom: var(--frame-bot);
+    left: var(--scene-inset);
+    right: var(--scene-inset);
+    z-index: 10;
+    display: flex;
+    align-items: stretch;
+    gap: var(--pad);
+    animation: arena-window-in 700ms var(--ease-solo) both;
+    transition:
+        top 1000ms var(--ease-solo),
+        bottom 1000ms var(--ease-solo),
+        left 1000ms var(--ease-solo),
+        right 1000ms var(--ease-solo),
+        gap 1000ms var(--ease-solo);
+}
+
+.arena[data-solo="true"] .arena-region {
+    top: var(--pad);
+    bottom: var(--pad);
+    left: var(--pad);
+    right: var(--pad);
+    gap: 0;
+}
+
+.arena-panel {
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+    background: #050505;
+    outline: var(--rule) solid var(--edge);
+    overflow: hidden;
+    transition:
+        flex-grow 1000ms var(--ease-solo),
+        opacity 620ms var(--ease-solo);
+}
+
+.arena-panel[data-role="pushed"] {
+    flex-grow: 0;
+    opacity: 0;
+}
+
+.arena-panel__view {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+}
+
+.arena-panel__dim {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    pointer-events: none;
+    background-color: rgb(0 0 0 / 0);
+    transition: background-color 540ms ease;
+}
+
+.arena-panel[data-outcome="lost"] .arena-panel__dim {
+    background-color: rgb(0 0 0 / 0.6);
+}
+
+.arena-panel__glow {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    pointer-events: none;
+    opacity: 0;
+    box-shadow:
+        inset 0 0 0 1px #fff,
+        inset 0 0 34px rgb(242 242 242 / 0.28);
+    transition: opacity 520ms var(--ease-solo);
+}
+
+.arena-panel[data-outcome="won"] .arena-panel__glow {
+    opacity: 1;
+}
+
+.arena-panel__fx {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    overflow: hidden;
+    pointer-events: none;
+    /* The shatter's sweep and shards read this; point it at the arena's ink. */
+    --mark-rgb: 242 242 242;
+}
+
+.arena-pct {
+    position: absolute;
+    bottom: clamp(10px, 1.1vw, 16px);
+    z-index: 22;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    pointer-events: none;
+    animation: arena-result-rise 520ms var(--ease-solo) both;
+}
+
+.arena-pct--left {
+    left: clamp(12px, 1.3vw, 20px);
+}
+
+.arena-pct--right {
+    right: clamp(12px, 1.3vw, 20px);
+    align-items: flex-end;
+}
+
+.arena-pct__label {
+    font-size: var(--t-2xs);
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    color: rgb(242 242 242 / 0.5);
+}
+
+.arena-pct__value {
+    font-weight: 800;
+    font-size: clamp(38px, 4.6vw, 72px);
+    line-height: 0.95;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── Manifest band ──────────────────────────────────────────────────────── */
+
+/* No box of its own: a framed band would wear the scenes' own 1.5px rule and
+   read as their peer. Alignment and two hairlines hold it together instead. */
+.arena-band {
+    position: absolute;
+    bottom: var(--edge-gap);
+    left: var(--scene-inset);
+    right: var(--scene-inset);
+    height: var(--band-h);
+    box-sizing: border-box;
+    z-index: 25;
+    display: flex;
+    align-items: stretch;
+    /* `backwards`, not `both`: the last frame is the band's resting state
+       anyway, and holding it forwards would pin the opacity the walkthrough
+       fade needs to move. */
+    animation: arena-band-open 620ms var(--ease-open) 180ms backwards;
+}
+
+.arena-band__cell {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    padding: 0 clamp(10px, 1.1vw, 16px);
+}
+
+.arena-band__cell + .arena-band__cell {
+    border-left: var(--rule) solid rgb(242 242 242 / 0.25);
+}
+
+.arena-band__step {
+    gap: clamp(8px, 0.9vw, 13px);
+    animation: arena-band-contents-in 320ms ease 640ms both;
+}
+
+.arena-band__number {
+    font-weight: 800;
+    font-size: var(--t-md);
+}
+
+.arena-band__line {
+    font-size: var(--t-2xs);
+    font-weight: 700;
+    letter-spacing: 0.13em;
+    line-height: 1.5;
+}
+
+/* ── Composer, the band's step zero ─────────────────────────────────────── */
+
+.arena-composer {
+    gap: 9px;
+    cursor: text;
+}
+
+.arena-composer__label,
+.arena-composer__divider,
+.arena-composer__field {
+    animation: arena-band-contents-in 320ms ease 640ms both;
+}
+
+/* The idle line sets the label's width; the call to action overlays it, so the
+   swap can never shove the field sideways. */
+.arena-composer__label {
+    position: relative;
+    display: grid;
+    flex: none;
+    font-size: var(--t-2xs);
+    font-weight: 800;
+    letter-spacing: 0.16em;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.arena-composer__label > span {
+    white-space: nowrap;
+    transition: opacity 180ms ease;
+}
+
+.arena-composer__label > span:last-child {
+    position: absolute;
+    top: 0;
+    left: 0;
+    opacity: 0;
+}
+
+.arena-composer:not([data-draft="true"]) .arena-composer__label > span:first-child {
+    transition-delay: 140ms;
+}
+
+.arena-composer[data-draft="true"] .arena-composer__label > span:first-child {
+    opacity: 0;
+}
+
+.arena-composer[data-draft="true"] .arena-composer__label > span:last-child {
+    opacity: 1;
+    transition-delay: 140ms;
+}
+
+.arena-composer__divider {
+    flex: none;
+    width: var(--rule);
+    height: clamp(12px, 1.1vw, 16px);
+    background: rgb(242 242 242 / 0.25);
+}
+
+.arena-composer__field {
+    position: relative;
+    flex: 1;
+    min-width: 9ch;
+    display: flex;
+    align-items: center;
+}
+
+.arena-composer__input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    padding: 0 0 6px;
+    font: inherit;
+    font-weight: 400;
+    font-size: var(--t-xs);
+    color: var(--ink);
+    outline: none;
+    /* The hint reads fainter than its own rule until you are actually in it. */
+    opacity: 0.3;
+    transition: opacity 180ms ease;
+}
+
+.arena-composer__input:focus,
+.arena-composer__input:not(:placeholder-shown) {
+    opacity: 1;
+}
+
+/* The hint clears the moment you click in, rather than sitting under the caret. */
+.arena-composer__input:focus::placeholder {
+    color: transparent;
+}
+
+.arena-composer__rule {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: var(--rule);
+    background: #fff;
+}
+
+/* ↵ only exists once there is something to submit. */
+.arena-composer__submit {
+    flex: none;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    font-size: var(--t-2xs);
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    color: var(--ink);
+    cursor: pointer;
+    opacity: 0;
+    transform: translateX(6px);
+    pointer-events: none;
+    transition:
+        opacity 180ms ease,
+        transform 180ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+.arena-composer[data-draft="true"] .arena-composer__submit {
+    opacity: 1;
+    transform: translateX(0);
+    pointer-events: auto;
+}
+
+.arena-composer[data-draft="true"] .arena-composer__submit:hover {
+    opacity: 0.6;
+}
+
+/* ── Ballot ─────────────────────────────────────────────────────────────── */
+
+.arena-ballot {
+    position: absolute;
+    bottom: var(--frame-bot);
+    left: 50%;
+    transform: translate(-50%, 50%);
+    z-index: 25;
+}
+
+.arena-ballot__row {
+    display: flex;
+    align-items: stretch;
+    height: var(--ballot-h);
+    background: #000;
+    outline: var(--rule) solid var(--edge);
+    animation: arena-bridge-in 380ms ease both;
+}
+
+.arena-vote {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    width: clamp(132px, 14.4vw, 200px);
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    border: 0;
+    background: var(--edge);
+    color: #000;
+    font: inherit;
+    font-weight: 800;
+    font-size: var(--t-md);
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: width 460ms var(--ease-key);
+}
+
+/* The keys widen for the reveal so a model name can never truncate. */
+.arena-ballot[data-voted="true"] .arena-vote {
+    width: clamp(184px, 18.6vw, 250px);
+    cursor: default;
+}
+
+/* Nothing left to choose once the round is called. */
+.arena-ballot[data-voted="true"] .arena-glow:hover::before {
+    opacity: 0;
+}
+
+.arena-vote__label {
+    transition: opacity 240ms ease 260ms;
+}
+
+.arena-vote__arrow {
+    flex: none;
+    opacity: 0.45;
+    transition:
+        transform 200ms ease,
+        opacity 240ms ease 260ms;
+}
+
+.arena-vote:hover .arena-vote__arrow--back {
+    transform: translateX(-4px);
+}
+
+.arena-vote:hover .arena-vote__arrow--forward {
+    transform: translateX(4px);
+}
+
+.arena-ballot[data-voted="true"] .arena-vote__label,
+.arena-ballot[data-voted="true"] .arena-vote__arrow {
+    opacity: 0;
+    transition-delay: 0ms;
+}
+
+/* The ballot never unmounts: the reveal wipes across the same keys. */
+.arena-reveal {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 clamp(9px, 1vw, 13px);
+    background: #000;
+    color: var(--ink);
+    opacity: 0;
+    pointer-events: none;
+    transition:
+        opacity 320ms ease,
+        background 420ms ease;
+}
+
+.arena-reveal[data-won="true"] {
+    background: var(--edge);
+    color: #000;
+}
+
+.arena-ballot[data-voted="true"] .arena-reveal {
+    opacity: 1;
+    transition-delay: 200ms;
+}
+
+.arena-reveal__who {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.arena-reveal__slot {
+    flex: none;
+    font-size: var(--t-xs);
+    font-weight: 800;
+}
+
+.arena-reveal__model {
+    font-size: var(--t-xs);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    white-space: nowrap;
+}
+
+.arena-reveal__elo {
+    flex: none;
+    font-size: var(--t-2xs);
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    font-variant-numeric: tabular-nums;
+}
+
+.arena-skip {
+    position: relative;
+    overflow: hidden;
+    z-index: 2;
+    display: flex;
+    width: clamp(74px, 7.6vw, 104px);
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-left: var(--rule) solid var(--edge);
+    border-right: var(--rule) solid var(--edge);
+    background: #000;
+    color: rgb(242 242 242 / 0.55);
+    font: inherit;
+    font-size: var(--t-2xs);
+    font-weight: 500;
+    letter-spacing: 0.22em;
+    cursor: pointer;
+    transition:
+        width 460ms var(--ease-key),
+        background 130ms ease,
+        color 130ms ease,
+        border-color 130ms ease;
+}
+
+.arena-skip:hover {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+}
+
+/* Only the SKIP cell grows for the reveal; the keys carry their own width. */
+.arena-ballot[data-voted="true"] .arena-skip {
+    width: clamp(88px, 9vw, 122px);
+}
+
+.arena-ballot[data-voted="true"] .arena-skip:hover {
+    background: #000;
+    border-color: var(--edge);
+    color: #fff;
+}
+
+.arena-skip__label {
+    color: #fff;
+    transition: opacity 200ms ease 260ms;
+}
+
+.arena-ballot[data-voted="true"] .arena-skip__label {
+    opacity: 0;
+    transition-delay: 0ms;
+}
+
+.arena-next {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 5px;
+    padding: 0 clamp(8px, 0.9vw, 12px);
+    opacity: 0;
+    transition: opacity 240ms ease;
+}
+
+.arena-ballot[data-voted="true"] .arena-next {
+    opacity: 1;
+    transition-delay: 200ms;
+}
+
+.arena-next__label {
+    font-size: var(--t-2xs);
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    color: #fff;
+    text-align: center;
+}
+
+.arena-next__track {
+    display: block;
+    height: var(--rule);
+    width: 100%;
+    overflow: hidden;
+    background: rgb(242 242 242 / 0.25);
+}
+
+.arena-next__fill {
+    display: block;
+    height: 100%;
+    width: 100%;
+    transform: scaleX(0);
+    transform-origin: left;
+    background: #fff;
+}
+
+.arena-ballot[data-voted="true"] .arena-next__fill {
+    animation: arena-next-fill 3400ms linear both;
+}
+
+/* ── Motion ─────────────────────────────────────────────────────────────── */
+
+@keyframes arena-band-open {
+    from {
+        transform: scaleX(0.02);
+        opacity: 0;
+    }
+    60% {
+        opacity: 1;
+    }
+    to {
+        transform: scaleX(1);
+        opacity: 1;
+    }
+}
+
+@keyframes arena-band-contents-in {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes arena-title-in {
+    from {
+        opacity: 0;
+        translate: 0 9px;
+    }
+    to {
+        opacity: 1;
+        translate: 0 0;
+    }
+}
+
+@keyframes arena-title-out {
+    from {
+        opacity: 1;
+        translate: 0 0;
+    }
+    to {
+        opacity: 0;
+        translate: 0 -8px;
+    }
+}
+
+@keyframes arena-window-in {
+    from {
+        opacity: 0;
+        transform: scale(0.985);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+@keyframes arena-bridge-in {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes arena-next-fill {
+    from {
+        transform: scaleX(0);
+    }
+    to {
+        transform: scaleX(1);
+    }
+}
+
+@keyframes arena-result-rise {
+    from {
+        opacity: 0;
+        translate: 0 8px;
+    }
+    to {
+        opacity: 1;
+        translate: 0 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .arena *,
+    .arena {
+        animation: none !important;
+    }
+}

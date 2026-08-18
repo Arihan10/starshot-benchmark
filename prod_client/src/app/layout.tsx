@@ -1,8 +1,15 @@
 import type { Metadata } from "next";
-import { Instrument_Serif, Manrope, Public_Sans } from "next/font/google";
+import { Anybody, Instrument_Serif, Manrope, Public_Sans } from "next/font/google";
 import MoonStage from "@/components/site/MoonStage";
 import PageTransition from "@/components/site/PageTransition";
 import "./globals.css";
+
+// The arena's whole voice — display and interface both, across 400–900.
+const anybody = Anybody({
+	variable: "--font-anybody",
+	subsets: ["latin"],
+	display: "swap",
+});
 
 const manrope = Manrope({
 	variable: "--font-manrope",
@@ -45,7 +52,7 @@ export default function RootLayout({
 	return (
 		<html
 			lang="en"
-			className={`${manrope.variable} ${publicSans.variable} ${instrumentSerif.variable} h-full antialiased`}
+			className={`${anybody.variable} ${manrope.variable} ${publicSans.variable} ${instrumentSerif.variable} h-full antialiased`}
 		>
 			<body className="min-h-full font-sans">
 				<MoonStage />

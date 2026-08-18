@@ -1,10 +1,10 @@
 "use client";
 
-import { easeOutCubic, useProgress } from "./useProgress";
+import { useEffect, useState } from "react";
 
-const DELAY_MS = 0;
 const COUNT_MS = 950;
 
+/** Owns its own frame loop, so the count-up never re-renders the scenes. */
 export default function PctReadout({
 	share,
 	align,
@@ -12,29 +12,24 @@ export default function PctReadout({
 	share: number;
 	align: "left" | "right";
 }) {
-	const t = useProgress(COUNT_MS, DELAY_MS, easeOutCubic);
+	const [value, setValue] = useState(0);
+
+	useEffect(() => {
+		let frame = 0;
+		const start = performance.now();
+		const step = (now: number) => {
+			const t = Math.min(1, (now - start) / COUNT_MS);
+			setValue(Math.round(share * (1 - (1 - t) ** 3)));
+			if (t < 1) frame = requestAnimationFrame(step);
+		};
+		frame = requestAnimationFrame(step);
+		return () => cancelAnimationFrame(frame);
+	}, [share]);
 
 	return (
-		<div
-			className={`pointer-events-none absolute bottom-lg z-20 flex flex-col gap-0.5 ${
-				align === "left"
-					? "left-lg items-start"
-					: "right-lg items-end"
-			}`}
-			style={{ animation: "arena-rise 520ms cubic-bezier(0.25,0.8,0.3,1) both" }}
-		>
-			<span className="font-label text-2xs text-ink-40">
-				VOTERS PICKED THIS
-			</span>
-			<span
-				className="font-sans font-black leading-[0.86] tracking-[-0.045em] text-foreground tabular-nums"
-				style={{
-					fontSize: "var(--arena-pct, 64px)",
-					textShadow: "0 4px 26px rgb(var(--ground-rgb) / 0.55)",
-				}}
-			>
-				{Math.round(share * t)}%
-			</span>
+		<div className={`arena-pct arena-pct--${align}`}>
+			<span className="arena-pct__label">VOTERS PICKED THIS</span>
+			<span className="arena-pct__value">{value}%</span>
 		</div>
 	);
 }
