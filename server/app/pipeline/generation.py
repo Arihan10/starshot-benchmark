@@ -2193,6 +2193,7 @@ def cancel_pending(run_id: str) -> None:
     _admitted_ids.pop(run_id, None)
     _deferred_interiors.pop(run_id, None)
     _pending_anchors.pop(run_id, None)
+    _zone_twins.pop(run_id, None)
     for anchor in _anchor_tasks.pop(run_id, []):
         anchor.cancel()
     while tasks := _pending.pop(run_id, []):
@@ -2480,6 +2481,119 @@ def _region_settled(region: Node) -> bool:
     if plan.is_atomic:
         return _shell_settled(region.id)
     return _subregions_placed(region.id) and _shell_settled(region.id)
+
+
+# --- focus scope: whose contents a zone's prompts actually spell out -----------
+#
+# Twins found per zone, per run. Populated by `ensure_twins` before a zone's
+# interior work and read synchronously while rendering, because the renderers are
+# sync and an LLM call cannot happen inside them.
+_zone_twins: dict[str, dict[str, set[str]]] = {}
+
+_TWIN_SYSTEM = (
+    "You identify TWIN regions in a 3D scene: regions that are the same KIND of "
+    "place as each other, playing the same role, differing mainly by position or "
+    "index. A castle's east tower and west tower are twins. Two guest bedrooms "
+    "are twins. A kitchen and a bathroom are not, and neither is a room and the "
+    "building that contains it.\n\n"
+    "You are given only region NAMES — no geometry, no descriptions. Judge from "
+    "the names alone. Most regions have no twin; returning an empty list is the "
+    "common and correct answer. Never include the target region itself."
+)
+
+
+async def _twins_of(zone_id: str, nodes: list[Node]) -> set[str]:
+    """The zones semantically twinned with this one — a castle's other tower.
+
+    One cheap gemini-flash-lite call given nothing but region names, kept off the
+    benchmark model surface like every other helper step. Content-addressed and
+    replayed from the log, so it bills once per zone per scene shape.
+
+    Scoped context hides the contents of everywhere a zone doesn't touch, and for
+    most zones that is right. Twins are the exception worth paying for: two wings
+    of the same building should be furnished consistently, and the tree can put
+    them arbitrarily far apart.
+
+    The relation is deliberately ONE-SIDED, and asked against the zones that exist
+    at the moment it runs. A zone conceived later sees the ones that came before
+    it and matches them; the earlier zone is never told about the newer one, and
+    does not need to be — it was authored first, so consistency flows forward
+    rather than being negotiated.
+    """
+    names = sorted(n.id for n in nodes if n.is_zone and n.id != zone_id)
+    if not names:
+        return set()
+    ps_names = "\n".join(names)
+    token = llm._current_model.set(MODELS["gemini-flash-lite"])
+    try:
+        out = await llm.call_llm(
+            system=_TWIN_SYSTEM,
+            user=f"TARGET REGION:\n{zone_id}\n\nEVERY OTHER REGION:\n{ps_names}",
+            output_schema=schemas.ZoneTwinsOutput,
+            node_id=zone_id,
+            zone_id=zone_id,
+            step="zone_twins",
+        )
+    finally:
+        if token is not None:
+            llm._current_model.reset(token)
+    known = {n.id for n in nodes if n.is_zone}
+    return {t for t in out.twins if t in known and t != zone_id}
+
+
+async def ensure_twins(zone_id: str, nodes: list[Node], run_id: str) -> None:
+    """Resolve and cache a zone's twins, once. `focus_scope_for` reads the cache
+    synchronously, so this has to have run before the zone renders any prompt.
+
+    A failure here is not worth failing a run over — the zone simply falls back to
+    neighbours-only context, which is a slightly narrower view, not a wrong one."""
+    cache = _zone_twins.setdefault(run_id, {})
+    if zone_id in cache:
+        return
+    try:
+        cache[zone_id] = await _twins_of(zone_id, nodes)
+    except Exception as e:  # noqa: BLE001
+        cache[zone_id] = set()
+        logging.log("generation.zone_twins.error", zone=zone_id, message=f"{type(e).__name__}: {e}")
+
+
+def plan_hook_for(run_id: str) -> Callable[[Node, list[Node]], Awaitable[None]]:
+    """The `before_plan` hook the overlapped divider installs: settle a zone's
+    twins the moment it is placed, before its plan is authored.
+
+    That is the earliest the question can be asked — the zone and all its siblings
+    have names and boxes by then — and it means every prompt the zone ever renders,
+    starting with its own plan, already knows which other regions it is a variant
+    of. Re-running it on a resumed walk is free: the call is content-addressed, so
+    an unchanged zone list replays from the LLM cache while repopulating the
+    in-memory map the renderer reads.
+    """
+
+    async def before_plan(zone: Node, nodes: list[Node]) -> None:
+        await ensure_twins(zone.id, nodes, run_id)
+
+    return before_plan
+
+
+def focus_scope_for(run_id: str) -> scene_context.FocusScope:
+    """The context-narrowing rule the overlapped pipeline binds.
+
+    A step targeting a zone spells out that zone, everything physically touching
+    it, and its twins. Everywhere else in the scene still appears — name, prompt,
+    description, placement — but without its contents, because a room across the
+    building cannot constrain where a chair goes.
+
+    Contact rather than line of sight (`util.touching_zones`), so this includes
+    the ancestors that contain the zone and the children it contains, and does not
+    include something merely visible across an empty yard.
+    """
+
+    def resolve(zone_id: str, nodes: list[Node]) -> set[str]:
+        detail = {zone_id} | util.touching_zones(zone_id, nodes)
+        detail |= _zone_twins.get(run_id, {}).get(zone_id, set())
+        return detail
+
+    return resolve
 
 
 def _frame_ids(zone_id: str) -> list[str]:

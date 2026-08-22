@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.core import scene_context
 from app.core.types import Node
 from app.pipeline import generation
 from app.pipeline.divider import _build, _pick_overall_bbox, _plan_zone
@@ -69,6 +70,12 @@ async def run(
     runs_dir: Path,
 ) -> Node:
     llm.set_model(model)
+    # Narrow every prompt this walk renders to the zones that actually bear on
+    # the one in focus — itself, whatever touches it, and its twins. Bound here
+    # rather than in `generation` because it is a property of THIS pipeline: the
+    # serial divider shares all the same helpers and must keep sending the whole
+    # scene. It is a ContextVar, so the anchor tasks the pump spawns inherit it.
+    scene_context.bind_focus_scope(generation.focus_scope_for(run_id))
     logging.emit_step("root", "planning")
     plan_out = await _plan_zone(
         zone_id="root",
@@ -104,6 +111,7 @@ async def run(
         all_nodes=all_nodes,
         is_atomic=plan_out.is_atomic,
         gen_run=generation.run_parallel,
+        before_plan=generation.plan_hook_for(run_id),
     )
 
     # Join the anchors and fold what they placed back into the scene. Anything

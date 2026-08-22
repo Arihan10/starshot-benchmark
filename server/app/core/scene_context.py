@@ -20,6 +20,8 @@ produced here:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Literal
 
@@ -33,6 +35,34 @@ from app.core.types import (
     Relationship,
     RelationshipKind,
 )
+
+# --- focus scope --------------------------------------------------------------
+#
+# Which regions a step's scene context spells out in full. Unbound (the default)
+# every region is rendered whole, which is what the serial pipeline sends and
+# what every existing run was built against.
+#
+# The overlapped pipeline binds a resolver that narrows it to the target zone,
+# the zones physically touching it, and its semantic twins. This is injected
+# rather than computed here because the answer needs committed run state — the
+# twin lookups — which belongs to the pipeline layer, not to a renderer in
+# `app.core`. Task-local, so a scoped run and an unscoped one can share a process
+# without either seeing the other's setting.
+FocusScope = Callable[[str, list[Node]], set[str] | None]
+_focus_scope: ContextVar[FocusScope | None] = ContextVar("focus_scope", default=None)
+
+
+def bind_focus_scope(resolver: FocusScope | None) -> None:
+    """Bind (or clear, with None) the current task's context-narrowing rule."""
+    _focus_scope.set(resolver)
+
+
+def focus_detail(zone_id: str, nodes: list[Node]) -> set[str] | None:
+    """The regions to render in full for a step targeting `zone_id`, or None for
+    "all of them" when nothing is bound."""
+    resolver = _focus_scope.get()
+    return resolver(zone_id, nodes) if resolver is not None else None
+
 
 _NO_NODES_MESSAGE = "(no regions or objects have been placed yet — this is the very start of the run)"
 _NO_SUBREGIONS_MESSAGE = "{(none - no other subregions have been planned yet)}"
@@ -129,11 +159,21 @@ def _region_embedded_entry(
     target_text: str = "",
     *,
     compact: bool = False,
+    detail: set[str] | None = None,
 ) -> str:
     """Subregion tree (embedded form): a subregion's fields, then a FLAT list of the objects placed directly inside it, then (recursively) its nested subregions. Objects are never nested under one another — a peer-anchored object names its anchor in its own `parent` block rather than nesting beneath it. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one region.
 
-    With `compact=True` (the `{SCENE_CONTEXT_COMPACT}` variant) a subregion shows only its name, prompt, description, and placement — its relationships, proxy, dimensions, world/local origin corners, and parent block are dropped. Its inline objects and nested subregions recurse in the same compact form."""
+    With `compact=True` (the `{SCENE_CONTEXT_COMPACT}` variant) a subregion shows only its name, prompt, description, and placement — its relationships, proxy, dimensions, world/local origin corners, and parent block are dropped. Its inline objects and nested subregions recurse in the same compact form.
+
+    `detail` narrows the block to the regions whose CONTENTS the reader needs. A region in the set renders in full with its objects listed; every other region collapses to the compact form and drops its objects entirely, so the scene still shows what exists and where, without the interior of somewhere across the map. `None` (the default) keeps every region in full — the whole-scene view the serial pipeline sends."""
+    detailed = detail is None or region.id in detail
+    # Scoped down for THIS region only. The recursion below still passes the
+    # caller's `compact`, so a collapsed container can still hold a region the
+    # reader does need in full — a neighbour nested inside somewhere distant.
+    region_compact = compact or not detailed
     objects, subregions = util.split_region_members_owned(region.id, idx, obj_idx)
+    if not detailed:
+        objects = []
     name_line = f"Subregion name: {region.id}"
     if target_id is not None and region.id == target_id:
         name_line += f"   {_TARGET_MARKER} {target_text}".rstrip()
@@ -145,7 +185,7 @@ def _region_embedded_entry(
         lines.append(f'description: "{region.plan}"')
     if region.placement is not None:
         lines.append(f'placement: "{region.placement}"')
-    if not compact:
+    if not region_compact:
         if region.referenced_ids:
             refs = ", ".join(f"{r.target}: {r.kind.value}" for r in region.referenced_ids)
             lines.append(f"relationships: [{refs}]")
@@ -172,7 +212,7 @@ def _region_embedded_entry(
             "",
             f'Objects placed directly within "{region.id}" (a flat list — an object anchored to a peer object names that peer in its `parent` block rather than nesting beneath it):',
             "",
-            util.brace_group([_object_entry(o, by_id, parent_zone=region.id, compact=compact) for o in objects]),
+            util.brace_group([_object_entry(o, by_id, parent_zone=region.id, compact=region_compact) for o in objects]),
         ]
     if subregions:
         lines += [
@@ -180,7 +220,7 @@ def _region_embedded_entry(
             f'Here\'s the list of subregions that are present within "{region.id}".',
             "",
             util.brace_group(
-                [_region_embedded_entry(s, idx, obj_idx, by_id, target_id, target_text, compact=compact) for s in subregions]
+                [_region_embedded_entry(s, idx, obj_idx, by_id, target_id, target_text, compact=compact, detail=detail) for s in subregions]
             ),
         ]
     return util.braces("\n".join(lines))
@@ -323,10 +363,13 @@ def render_embedded_block(
     node_id: str | None = None,
     text: str = "",
     compact: bool = False,
+    detail: set[str] | None = None,
 ) -> str:
     """Scene context in EMBEDDED form: the subregion tree where each subregion lists the objects placed directly inside it inline as a FLAT list — objects are never nested under one another, a peer-anchored object just names its anchor in its own `parent` block — and then recurses into its nested subregions. Objects anchored directly to the scene root (the shell/ground meshes from the root's encapsulating pass) are NOT included here — they are global geometry, rendered separately by `render_root_objects`. Renders the single-region placeholder when the scene has no subregions yet.
 
-    Pass `node_id` to point the LLM at one specific region: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the embedded tree. With `node_id` unset (the default) no marker is drawn."""
+    Pass `node_id` to point the LLM at one specific region: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the embedded tree. With `node_id` unset (the default) no marker is drawn.
+
+    Pass `detail` to render only those regions' CONTENTS in full; every other region collapses to name / prompt / description / placement with its objects omitted. The tree keeps its full shape either way, so nothing disappears — a distant region still shows what it is and where it sits, just not what is inside it. `None` renders everything in full."""
     root = util.find_root(nodes)
     if root is None:
         return _NO_SUBREGIONS_MESSAGE
@@ -337,7 +380,7 @@ def render_embedded_block(
     if not subregions:
         return _NO_SUBREGIONS_MESSAGE
     return util.brace_group(
-        [_region_embedded_entry(s, idx, oidx, by_id, node_id, text, compact=compact) for s in subregions]
+        [_region_embedded_entry(s, idx, oidx, by_id, node_id, text, compact=compact, detail=detail) for s in subregions]
     )
 
 
@@ -597,6 +640,7 @@ def zone_vars(
     zone_bbox = focus.bbox if focus is not None else root.bbox
     parent_zone_id = focus.parent_id if focus is not None and focus.parent_id is not None else ""
     parent = next((n for n in nodes if n.id == parent_zone_id), None) if parent_zone_id else None
+    detail = focus_detail(zone_id, nodes)
     out = base_vars()
     out.update({
         "ROOT_PROMPT": root.prompt,
@@ -605,8 +649,8 @@ def zone_vars(
         "ROOT_ORIGIN": util.format_global_origin(root.bbox),
         "ROOT_HEADER": _root_scene_header(root),
         "ROOT_OBJECTS": render_root_objects(nodes),
-        "SCENE_CONTEXT": render_embedded_block(nodes, node_id=zone_id, text=target_text),
-        "SCENE_CONTEXT_COMPACT": render_embedded_block(nodes, node_id=zone_id, text=target_text, compact=True),
+        "SCENE_CONTEXT": render_embedded_block(nodes, node_id=zone_id, text=target_text, detail=detail),
+        "SCENE_CONTEXT_COMPACT": render_embedded_block(nodes, node_id=zone_id, text=target_text, compact=True, detail=detail),
         "ADJACENT_ZONES": render_adjacent_zones_block(zone_id, nodes),
         "ZONE_ID": zone_id,
         "ZONE_PROMPT": zone_prompt,

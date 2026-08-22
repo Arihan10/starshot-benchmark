@@ -54,6 +54,13 @@ from app.utils.topology import uniquify_ids, validate_subregions
 # rebinds the attribute is still honoured.
 GenRun = Callable[..., Awaitable[None]]
 
+# Called on a freshly placed zone just before its plan is authored, with the
+# scene as it stands. The overlapped pipeline uses it to settle a zone's twins at
+# the earliest moment they can be known — the zone has a name and a box, and so
+# does everything conceived before it. Unset on the serial path, which does no
+# such lookup.
+BeforePlan = Callable[[Node, list[Node]], Awaitable[None]]
+
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
     hit = committed.bbox("root")
@@ -229,6 +236,7 @@ async def _build(
     all_nodes: list[Node],
     is_atomic: bool,
     gen_run: GenRun | None = None,
+    before_plan: BeforePlan | None = None,
 ) -> None:
     assert node.plan is not None, "node.plan must be set by caller"
     gen = gen_run or generation.run
@@ -322,6 +330,11 @@ async def _build(
 
     for child in placed:
         logging.emit_step(child.id, "planning")
+        # Earliest point a zone can be reasoned about by name: it and all its
+        # siblings were placed above, and everything conceived before them is
+        # already in `all_nodes`.
+        if before_plan is not None:
+            await before_plan(child, all_nodes)
         plan_out = await _plan_zone(
             zone_id=child.id,
             zone_prompt=child.prompt,
@@ -347,6 +360,7 @@ async def _build(
             all_nodes=all_nodes,
             is_atomic=plan_out.is_atomic,
             gen_run=gen,
+            before_plan=before_plan,
         )
 
     # Every NON-root non-atomic zone gets a negative-space pass once its whole

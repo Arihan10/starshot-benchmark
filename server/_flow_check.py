@@ -48,6 +48,15 @@ async def fake_run(*, zone, runs_dir, run_id, scenario, all_nodes):
 
 
 generation.run = fake_run
+
+
+# Twin lookup is a real LLM call needing a bound slot log; this harness is
+# testing the scheduler, so stub it out.
+async def no_twins(zone_id, nodes, run_id):
+    return None
+
+
+generation.ensure_twins = no_twins
 committed.zone_plan = lambda i: NS(is_atomic=PLANNED[i], plan="p") if i in PLANNED else None
 committed.object_specs = lambda z, s: ([] if z in SHELL else None) if s == "encapsulating" else None
 committed.bbox = lambda i: BOXES.get(i)

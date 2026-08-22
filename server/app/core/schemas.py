@@ -227,3 +227,12 @@ class GatedObjectDecompOutput(ObjectDecompOutput):
 
 class ImagePromptOutput(BaseModel):
     prompt: str
+
+
+class ZoneTwinsOutput(BaseModel):
+    """Zones that are semantically the SAME KIND of place as the one asked about
+    — a castle's east and west towers, two guest bedrooms — regardless of where
+    they sit in the tree. Empty when the zone is one of a kind. Ids only; the
+    step is given nothing but names, so it can be answered by a cheap model."""
+
+    twins: list[str] = []

@@ -123,6 +123,8 @@ MODELS: dict[str, str] = {
     "gemma-small": "google/gemma-4-26b-a4b-it",
     "new-gemini-flash-new": "google/gemini-3.7-flash",
     "deepseek-pro-new": "deepseek/deepseek-v4-pro-0813",
+    "glm-zai": "zai/glm-5.3",
+    "ox-alpha": "stealth/ox-alpha"
 }
 
 # Model ids from MODELS that are actually served by a third-party
@@ -183,6 +185,22 @@ OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
         # prices at the full input rate (spend reads high, never low).
         price_in=0.10,
         price_out=0.20,
+    ),
+    "zai/glm-5.3": OpenAICompatModel(
+        # glm-5.3 is Coding-Plan-only for now: 403/1220 on both endpoints, and
+        # absent from this account's GET /models. Bump when it opens up.
+        model="glm-5.3",
+        base_url="https://api.z.ai/api/paas/v4",
+        api_key_env="ZAI_API_KEY",
+        # Reasoning tokens count against this budget, so leave room for both.
+        max_tokens=131072,
+        extra={
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+            "response_format": {"type": "json_object"},
+        },
+        price_in=1.40,
+        price_out=4.40,
     ),
 }
 
@@ -313,4 +331,5 @@ NO_STRUCTURED_OUTPUT_LIST = [
     "qwen/qwen3.5-35b-a3b",
     "google/gemma-4-26b-a4b-it",
     "deepseek/deepseek-v4-pro-0813",
+    "stealth/ox-alpha",
 ]

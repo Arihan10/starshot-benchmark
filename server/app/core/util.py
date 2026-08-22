@@ -91,6 +91,48 @@ def split_region_members_owned(
     return objects, subregions
 
 
+# --- zone contact -------------------------------------------------------------
+
+# Zone boxes tile their parent exactly, so genuine neighbours measure 0.00m and
+# this only has to absorb authoring slop.
+CONTACT_TOLERANCE_M = 0.05
+
+
+def aabb_gap(a: BoundingBox, b: BoundingBox) -> float:
+    """Widest per-axis separation between two boxes; 0.0 when they touch or
+    overlap. Two boxes are apart by the LARGEST axis gap, not the smallest —
+    daylight on any one axis is enough to keep them from touching."""
+    return max(
+        max(a.min_corner[i] - b.max_corner[i], b.min_corner[i] - a.max_corner[i], 0.0)
+        for i in range(3)
+    )
+
+
+def touching_zones(zone_id: str, nodes: list[Node]) -> set[str]:
+    """Every region whose box meets `zone_id`'s — contact, not line of sight.
+
+    Deliberately NOT `adjacent_zones`. That casts rays and keeps the first region
+    each one enters, which answers "what can this zone SEE": it occludes whatever
+    sits behind something nearer, and its rays are uncapped so they reach across
+    open space to find something far away. For deciding whose contents a zone
+    needs to reason about, the question is just what abuts it.
+
+    Overlap counts as contact, so a zone's ancestors (which contain it) and its
+    own children (which it contains) come back as neighbours. That is intended —
+    their objects occupy the very volume being authored into.
+    """
+    target = next((n for n in nodes if n.id == zone_id), None)
+    if target is None:
+        return set()
+    return {
+        n.id
+        for n in nodes
+        if n.id != zone_id
+        and is_region(n)
+        and aabb_gap(target.bbox, n.bbox) <= CONTACT_TOLERANCE_M
+    }
+
+
 # --- zone adjacency ----------------------------------------------------------
 
 # Adjacency is computed by ray-casting: from the target zone's centre we shoot a
